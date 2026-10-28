@@ -752,7 +752,8 @@ var AUTORESUME_ENV_FLAG = "DSH_AUTORESUME_DISABLE";
 var AUTORESUME_STATE_DIR = "F:\\DSBOT\\state";
 var AUTORESUME_PENDING_FILE = join2(AUTORESUME_STATE_DIR, "restart-pending.json");
 var AUTORESUME_ACK_FILE = join2(AUTORESUME_STATE_DIR, "restart-pending.ack.json");
-var AUTORESUME_DELAY_MS = 6000;
+var AUTORESUME_RETRY_DELAYS_MS = [6000, 12000, 20000];
+var AUTORESUME_DELAY_MS = AUTORESUME_RETRY_DELAYS_MS[0];
 var AUTORESUME_TIMEOUT_MS = 1e4;
 function reasonOf2(error) {
   return error instanceof Error ? error.message : String(error);
@@ -772,8 +773,28 @@ function isStrictlyNewer(candidate, acked) {
   return candidate > acked;
 }
 function wakeupText(pointer, pendingFile) {
-  const pid = typeof pointer?.host_pid === "number" || typeof pointer?.host_pid === "string" ? String(pointer.host_pid) : "unknown";
-  return `[重启自检] 宿主已重启（pid ${pid}）。盘上有接手指针：${pendingFile} —— 先读它再动手，不要凭记忆。`;
+  const raw = pointer?.host_pid;
+  const pid = typeof raw === "number" || typeof raw === "string" ? String(raw) : "未知";
+  return `[重启自检] 宿主已重启（上一个宿主 pid ${pid}）。盘上有接手指针：${pendingFile} —— 先读它再动手，不要凭记忆。`;
+}
+async function recordFailure(input) {
+  const record = {
+    result: "send-failed",
+    attempts: input.attempts,
+    reason: input.reason,
+    attempted_at: new Date(input.now()).toISOString()
+  };
+  if (input.sessionId !== undefined && input.sessionId !== "")
+    record.session_id = input.sessionId;
+  try {
+    await input.writeAtomic(input.ackFile, `${JSON.stringify(record, null, 2)}
+`);
+    return;
+  } catch (error) {
+    const ackError = reasonOf2(error);
+    input.log(`startup self-check: the failure record could not be written to ${input.ackFile} (${ackError}); the next start will still try again.`);
+    return ackError;
+  }
 }
 async function readAckedWrittenAt(ackFile, readText, log) {
   let text;
@@ -794,7 +815,7 @@ async function readAckedWrittenAt(ackFile, readText, log) {
   }
   const writtenAt = parsed?.written_at;
   if (typeof writtenAt !== "string" || writtenAt === "") {
-    log(`startup self-check: ${ackFile} has no written_at, so this pointer is treated as not yet confirmed.`);
+    log(`startup self-check: ${ackFile} has no written_at (a failure record, or an old format), so this pointer is treated as not yet confirmed.`);
     return;
   }
   return writtenAt;
@@ -802,6 +823,7 @@ async function readAckedWrittenAt(ackFile, readText, log) {
 async function runAutoResume(deps = {}) {
   const env = deps.env ?? process.env;
   const log = deps.log ?? ((line) => console.warn(`[dsh-session-create] ${line}`));
+  const attempts = Number.isFinite(deps.attempt) && deps.attempt >= 1 ? Math.trunc(deps.attempt) : 1;
   if (env[AUTORESUME_ENV_FLAG] === "1") {
     const reason = `${AUTORESUME_ENV_FLAG}=1`;
     log(`startup self-check skipped (${reason}); no pointer was read.`);
@@ -845,12 +867,15 @@ async function runAutoResume(deps = {}) {
     log(`startup self-check: ${reason}; nothing was sent.`);
     return { status: "no-target", reason };
   }
+  const fail = async (reason) => {
+    log(`startup self-check: attempt ${attempts} did not wake Session "${sessionId}" (${reason}); the pointer stays unconfirmed.`);
+    const ackError2 = await recordFailure({ ackFile, writeAtomic, log, reason, attempts, sessionId, now });
+    return { status: "send-failed", writtenAt, sessionId, reason, attempts, ...ackError2 === undefined ? {} : { ackError: ackError2 } };
+  };
   const controller = deps.controllerOf?.();
   const text = wakeupText(pointer, pendingFile);
   if (typeof controller?.prompt !== "function") {
-    const reason = "this harness has no sessionController.prompt";
-    log(`startup self-check: ${reason}; nothing was sent (the pointer stays unconfirmed).`);
-    return { status: "send-failed", writtenAt, sessionId, reason };
+    return await fail("this harness has no sessionController.prompt");
   }
   try {
     const outcome = await controller.prompt({
@@ -860,14 +885,10 @@ async function runAutoResume(deps = {}) {
       content: [{ type: "text", text }]
     }, deps.signal ?? AbortSignal.timeout(AUTORESUME_TIMEOUT_MS));
     if (outcome === false) {
-      const reason = `the harness refused the message for Session "${sessionId}"`;
-      log(`startup self-check: ${reason}; nothing was delivered (the pointer stays unconfirmed).`);
-      return { status: "send-failed", writtenAt, sessionId, reason };
+      return await fail(`the harness refused the message for Session "${sessionId}"`);
     }
   } catch (error) {
-    const reason = reasonOf2(error);
-    log(`startup self-check: the wake-up message did not go into Session "${sessionId}" (${reason}); the pointer stays unconfirmed, so the next start will try again.`);
-    return { status: "send-failed", writtenAt, sessionId, reason };
+    return await fail(reasonOf2(error));
   }
   const deliveredAt = now();
   const ack = {
@@ -876,6 +897,7 @@ async function runAutoResume(deps = {}) {
     host_start: pointer.host_start ?? null,
     session_id: sessionId,
     result: "delivered",
+    attempts,
     delivered_at: new Date(deliveredAt).toISOString(),
     pending_file: pendingFile,
     message: text
@@ -888,8 +910,8 @@ async function runAutoResume(deps = {}) {
     ackError = reasonOf2(error);
     log(`startup self-check: delivered to ${sessionId}, but the ack could not be written to ${ackFile} (${ackError}); the next start will deliver once more.`);
   }
-  log(`startup self-check: the pointer written at ${writtenAt} woke Session ${sessionId}.`);
-  return { status: "delivered", writtenAt, sessionId, ...ackError === undefined ? {} : { ackError } };
+  log(`startup self-check: the pointer written at ${writtenAt} woke Session ${sessionId} (attempt ${attempts}).`);
+  return { status: "delivered", writtenAt, sessionId, attempts, ...ackError === undefined ? {} : { ackError } };
 }
 function defaultSchedule(fn, ms) {
   const handle = setTimeout(() => {
@@ -905,9 +927,14 @@ function installAutoResume(ctx, opts = {}) {
     log(`startup self-check is off (${AUTORESUME_ENV_FLAG}=1); no pointer will be read.`);
     return;
   }
-  const delayMs = opts.delayMs ?? AUTORESUME_DELAY_MS;
   const schedule = opts.schedule ?? defaultSchedule;
-  const deps = {
+  const configured = opts.retryDelaysMs ?? AUTORESUME_RETRY_DELAYS_MS;
+  const delays = configured.filter((ms) => Number.isFinite(ms) && ms >= 0);
+  if (delays.length === 0)
+    delays.push(AUTORESUME_DELAY_MS);
+  if (opts.delayMs !== undefined)
+    delays[0] = opts.delayMs;
+  const baseDeps = {
     pendingFile: opts.pendingFile,
     ackFile: opts.ackFile,
     env,
@@ -918,15 +945,27 @@ function installAutoResume(ctx, opts = {}) {
     now: opts.now,
     controllerOf: opts.controllerOf ?? (() => resolveServices(ctx).sessionController)
   };
-  try {
-    schedule(() => {
-      return runAutoResume(deps).catch((error) => {
-        log(`startup self-check crashed (${reasonOf2(error)}); the host is unaffected.`);
-      });
-    }, delayMs);
-  } catch (error) {
-    log(`startup self-check could not be scheduled (${reasonOf2(error)}); nothing will be sent.`);
-  }
+  const attempt = (index) => {
+    if (index >= delays.length) {
+      log(`startup self-check gave up after ${delays.length} attempt(s); the pointer stays unconfirmed, so the next host start will try again.`);
+      return;
+    }
+    try {
+      schedule(() => {
+        return runAutoResume({ ...baseDeps, attempt: index + 1 }).then((outcome) => {
+          if (outcome.status === "send-failed")
+            attempt(index + 1);
+          return outcome;
+        }).catch((error) => {
+          log(`startup self-check crashed (${reasonOf2(error)}); the host is unaffected.`);
+          attempt(index + 1);
+        });
+      }, delays[index]);
+    } catch (error) {
+      log(`startup self-check could not be scheduled (${reasonOf2(error)}); nothing will be sent.`);
+    }
+  };
+  attempt(0);
 }
 
 // src/index.ts

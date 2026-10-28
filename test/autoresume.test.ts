@@ -9,6 +9,7 @@ import {
   AUTORESUME_DELAY_MS,
   AUTORESUME_ENV_FLAG,
   AUTORESUME_PENDING_FILE,
+  AUTORESUME_RETRY_DELAYS_MS,
   AUTORESUME_STATE_DIR,
   installAutoResume,
   isStrictlyNewer,
@@ -99,13 +100,17 @@ describe('路径口径', () => {
     expect(ACK.includes('C:')).toBe(false)
   })
 
-  test('唤醒正文只带 pid 与指针绝对路径，不抄指针正文', () => {
+  test('唤醒正文只带「上一个宿主 pid」与指针绝对路径，不抄指针正文，也不让人误认成当前 pid', () => {
     const text = wakeupText(POINTER, PENDING)
-    expect(text).toContain('pid 12340')
+    expect(text).toContain('上一个宿主 pid 12340')
+    // 不能写成「（pid 12340）」这种会被当成当前宿主 pid 的说法。
+    expect(text.includes('（pid')).toBe(false)
     expect(text).toContain(PENDING)
     expect(text).toContain('不要凭记忆')
     expect(text.includes('Pocket 三笔')).toBe(false)
     expect(text.includes('16:06 那次重启已验完')).toBe(false)
+    // pid 缺失时不能编一个出来。
+    expect(wakeupText({}, PENDING)).toContain('上一个宿主 pid 未知')
   })
 })
 
@@ -128,6 +133,7 @@ describe('runAutoResume', () => {
     expect(ack.host_pid).toBe(12340)
     expect(ack.session_id).toBe(POINTER.notify_session_id)
     expect(ack.result).toBe('delivered')
+    expect(ack.attempts).toBe(1)
     expect(ack.delivered_at).toBe('2026-10-28T08:40:00.000Z')
     expect(f.logs.some(line => line.includes('woke Session'))).toBe(true)
   })
@@ -195,24 +201,37 @@ describe('runAutoResume', () => {
     }
   })
 
-  test('投递失败（prompt 抛错）⇒ 不抛出、日志有记录、不写「已确认」，下次启动还能重试', async () => {
+  test('投递失败（prompt 抛错）⇒ 不抛出、日志有记录、ack 只记失败且**不带 written_at**，下次启动确实重投', async () => {
     const f = fake({ pointer: POINTER })
     f.failPrompts(1)
     const first = await runAutoResume(f.deps)
 
     expect(first.status).toBe('send-failed')
-    expect(f.writes).toHaveLength(0)
-    expect(f.files.has(ACK)).toBe(false)
-    expect(f.logs.some(line => line.includes('did not go into Session') && line.includes('next start will try again'))).toBe(true)
+    if (first.status === 'send-failed') expect(first.attempts).toBe(1)
+    expect(f.logs.some(line => line.includes('did not wake Session') && line.includes('stays unconfirmed'))).toBe(true)
 
-    // 同一份指针、同一份盘：下一次启动必须真的还能投。
+    // 必改②：失败也落盘，但那份记录只是证据，不参与幂等判断。
+    expect(f.writes).toHaveLength(1)
+    expect(f.writes[0].path).toBe(ACK)
+    const failure = JSON.parse(f.writes[0].text) as Record<string, unknown>
+    expect(failure.result).toBe('send-failed')
+    expect(failure.attempts).toBe(1)
+    expect(failure.reason).toContain('the host queue write failed')
+    expect(failure.session_id).toBe(POINTER.notify_session_id)
+    expect(failure.attempted_at).toBe('2026-10-28T08:40:00.000Z')
+    // 这条是整条重试链的命门：写了 written_at 就会被下次启动当「已确认」而永久漏掉。
+    expect('written_at' in failure).toBe(false)
+
+    // 同一份指针、盘上已有失败记录 ⇒ 下一次启动必须真的还能投。
     const second = await runAutoResume(f.deps)
     expect(second.status).toBe('delivered')
+    if (second.status === 'delivered') expect(second.attempts).toBe(1)
     expect(f.prompts).toHaveLength(2)
-    expect(f.writes).toHaveLength(1)
+    expect(f.writes).toHaveLength(2)
+    expect((JSON.parse(f.writes[1].text) as Record<string, unknown>).written_at).toBe(POINTER.written_at)
   })
 
-  test('宿主明确拒收（prompt 回 false）⇒ 视为未投递，不写 ack', async () => {
+  test('宿主明确拒收（prompt 回 false）⇒ 视为未投递：写失败记录，不写「已确认」', async () => {
     const f = fake({ pointer: POINTER })
     // 用替换 controller 的方式模拟 false。
     const refusing: AutoResumeDeps = {
@@ -221,15 +240,33 @@ describe('runAutoResume', () => {
     }
     const outcome = await runAutoResume(refusing)
     expect(outcome.status).toBe('send-failed')
-    expect(f.writes).toHaveLength(0)
+    expect(f.writes).toHaveLength(1)
+    const failure = JSON.parse(f.writes[0].text) as Record<string, unknown>
+    expect(failure.result).toBe('send-failed')
+    expect(failure.reason).toContain('refused')
+    expect('written_at' in failure).toBe(false)
   })
 
-  test('宿主没有 sessionController.prompt ⇒ 跳过，不抛', async () => {
+  test('宿主没有 sessionController.prompt ⇒ 跳过，不抛，并在盘上留下失败记录', async () => {
     const f = fake({ pointer: POINTER, noPrompt: true })
     const outcome = await runAutoResume(f.deps)
     expect(outcome.status).toBe('send-failed')
     if (outcome.status === 'send-failed') expect(outcome.reason).toContain('prompt')
-    expect(f.writes).toHaveLength(0)
+    expect(f.prompts).toHaveLength(0)
+    expect(f.writes).toHaveLength(1)
+    const failure = JSON.parse(f.writes[0].text) as Record<string, unknown>
+    expect(failure.result).toBe('send-failed')
+    expect(failure.session_id).toBe(POINTER.notify_session_id)
+    expect('written_at' in failure).toBe(false)
+  })
+
+  test('盘上是一条失败记录（无 written_at）⇒ 当作没确认过，照投', async () => {
+    const failure = { result: 'send-failed', attempts: 3, reason: 'the host queue write failed', attempted_at: '2026-10-28T08:40:00.000Z', session_id: POINTER.notify_session_id }
+    const f = fake({ pointer: POINTER, ack: failure })
+    const outcome = await runAutoResume(f.deps)
+    expect(outcome.status).toBe('delivered')
+    expect(f.prompts).toHaveLength(1)
+    expect(f.logs.some(line => line.includes('has no written_at') && line.includes('not yet confirmed'))).toBe(true)
   })
 
   test(`${AUTORESUME_ENV_FLAG}=1 ⇒ 连指针都不读，直接跳过`, async () => {
@@ -251,7 +288,7 @@ describe('runAutoResume', () => {
 })
 
 describe('installAutoResume', () => {
-  test('注册一次性延迟检查：延迟 AUTORESUME_DELAY_MS，到点才投，且不阻塞 apply', async () => {
+  test('注册延迟检查：首跳延迟 AUTORESUME_DELAY_MS，到点才投，且不阻塞 apply', async () => {
     const f = fake({ pointer: POINTER })
     const scheduled: { ms: number; fn: () => void | Promise<unknown> }[] = []
     const options: AutoResumeInstallOptions = {
@@ -271,6 +308,105 @@ describe('installAutoResume', () => {
     await scheduled[0].fn()
     expect(f.prompts).toHaveLength(1)
     expect(f.writes).toHaveLength(1)
+    expect(scheduled).toHaveLength(1) // 投成功了，不该再排第二跳
+  })
+
+  test('必改①：投不进去就按 6s / 12s / 20s 重试三次，第三次仍失败才落 send-failed', async () => {
+    const f = fake({ pointer: POINTER })
+    f.failPrompts(3)
+    const scheduled: { ms: number; fn: () => void | Promise<unknown> }[] = []
+    installAutoResume({} as never, {
+      ...f.deps,
+      schedule: (fn, ms) => {
+        scheduled.push({ ms, fn })
+        return 1
+      },
+    })
+
+    expect(scheduled.map(item => item.ms)).toEqual([6_000]) // 首跳先注册，后面每次失败才排下一跳
+    await scheduled[0].fn()
+    expect(scheduled.map(item => item.ms)).toEqual([6_000, 12_000])
+    await scheduled[1].fn()
+    expect(scheduled.map(item => item.ms)).toEqual([6_000, 12_000, 20_000])
+    await scheduled[2].fn()
+
+    expect(scheduled).toHaveLength(3) // 没有第四跳
+    expect(scheduled.map(item => item.ms)).toEqual([...AUTORESUME_RETRY_DELAYS_MS])
+    expect(f.prompts).toHaveLength(3)
+    expect(f.writes).toHaveLength(3)
+    const last = JSON.parse(f.writes[f.writes.length - 1].text) as Record<string, unknown>
+    expect(last.result).toBe('send-failed')
+    expect(last.attempts).toBe(3)
+    expect('written_at' in last).toBe(false) // 三轮全失败也不写「已确认」
+    expect(f.logs.some(line => line.includes('gave up after 3 attempt'))).toBe(true)
+  })
+
+  test('必改①：中途投进去了就立刻停，不再排后续尝试（attempts 记进 ack）', async () => {
+    const f = fake({ pointer: POINTER })
+    f.failPrompts(1) // 第一次失败，第二次成功
+    const scheduled: { ms: number; fn: () => void | Promise<unknown> }[] = []
+    installAutoResume({} as never, {
+      ...f.deps,
+      schedule: (fn, ms) => {
+        scheduled.push({ ms, fn })
+        return 1
+      },
+    })
+
+    await scheduled[0].fn()
+    expect(scheduled).toHaveLength(2)
+    await scheduled[1].fn()
+    expect(scheduled).toHaveLength(2) // 成功即终态，不再排第三跳
+    expect(f.prompts).toHaveLength(2)
+    const last = JSON.parse(f.writes[f.writes.length - 1].text) as Record<string, unknown>
+    expect(last.result).toBe('delivered')
+    expect(last.attempts).toBe(2)
+    expect(last.written_at).toBe(POINTER.written_at)
+  })
+
+  test('必改①：已确认 / 没指针 / 没目标都是终态，不重试（只投一次的机会都不给第二次）', async () => {
+    const cases: Parameters<typeof fake>[0][] = [
+      { pointer: POINTER, ack: { written_at: POINTER.written_at, result: 'delivered' } },
+      {}, // 盘上没有指针
+      { pointer: { written_at: POINTER.written_at, host_pid: 12340 } }, // 没有 notify_session_id
+      { pointer: { host_pid: 12340, notify_session_id: POINTER.notify_session_id } }, // 没有 written_at
+    ]
+    for (const options of cases) {
+      const f = fake(options)
+      const scheduled: { ms: number; fn: () => void | Promise<unknown> }[] = []
+      installAutoResume({} as never, {
+        ...f.deps,
+        schedule: (fn, ms) => {
+          scheduled.push({ ms, fn })
+          return 1
+        },
+      })
+      expect(scheduled).toHaveLength(1)
+      await scheduled[0].fn()
+      expect(scheduled).toHaveLength(1)
+      expect(f.prompts).toHaveLength(0)
+    }
+  })
+
+  test('间隔表可注入（retryDelaysMs），delayMs 只覆盖首跳', async () => {
+    const f = fake({ pointer: POINTER })
+    f.failPrompts(3)
+    const scheduled: { ms: number; fn: () => void | Promise<unknown> }[] = []
+    installAutoResume({} as never, {
+      ...f.deps,
+      retryDelaysMs: [10, 20, 30],
+      delayMs: 0,
+      schedule: (fn, ms) => {
+        scheduled.push({ ms, fn })
+        return 1
+      },
+    })
+    expect(scheduled[0].ms).toBe(0)
+    await scheduled[0].fn()
+    await scheduled[1].fn()
+    expect(scheduled.map(item => item.ms)).toEqual([0, 20, 30])
+    await scheduled[2].fn()
+    expect(f.prompts).toHaveLength(3)
   })
 
   test('定时器注册本身抛错 ⇒ installAutoResume 不抛，只记日志', () => {
@@ -354,5 +490,66 @@ describe('真写盘（默认原子写）', () => {
     // 原子写不留 tmp 残件：目录里只有指针与 ack 两个文件。
     const entries = (await readdir(dir)).sort()
     expect(entries).toEqual(['restart-pending.ack.json', 'restart-pending.json'])
+  })
+
+  test('真盘自查：投递失败把失败记录写进真文件后，下一次启动确实会重投，成功后才写「已确认」', async () => {
+    const dir2 = join(TMP_ROOT, 'autoresume-retry-real')
+    await mkdir(dir2, { recursive: true })
+    try {
+      const pendingFile = join(dir2, 'restart-pending.json')
+      const ackFile = join(dir2, 'restart-pending.ack.json')
+      await writeFileReal(pendingFile, JSON.stringify(POINTER), 'utf8')
+
+      const failing = await runAutoResume({
+        pendingFile,
+        ackFile,
+        env: {},
+        log: () => {},
+        attempt: 1,
+        controllerOf: () => ({ async prompt() { throw new Error('the host queue write failed') } }) as never,
+      })
+      expect(failing.status).toBe('send-failed')
+
+      const rawFailure = await readFileReal(ackFile, 'utf8')
+      expect(rawFailure.charCodeAt(0)).not.toBe(0xfeff)
+      const failure = JSON.parse(rawFailure) as Record<string, unknown>
+      expect(failure.result).toBe('send-failed')
+      expect(failure.attempts).toBe(1)
+      expect('written_at' in failure).toBe(false)
+
+      // 同一份真盘：下一次启动（第 2 次尝试）必须真的再投一次，而不是被失败记录挡在 already-acked。
+      const prompts: Record<string, unknown>[] = []
+      const second = await runAutoResume({
+        pendingFile,
+        ackFile,
+        env: {},
+        log: () => {},
+        attempt: 2,
+        controllerOf: () => ({ async prompt(call: Record<string, unknown>) { prompts.push(call); return true } }) as never,
+      })
+      expect(second.status).toBe('delivered')
+      if (second.status === 'delivered') expect(second.attempts).toBe(2)
+      expect(prompts).toHaveLength(1)
+
+      const delivered = JSON.parse(await readFileReal(ackFile, 'utf8')) as Record<string, unknown>
+      expect(delivered.result).toBe('delivered')
+      expect(delivered.written_at).toBe(POINTER.written_at)
+      expect(delivered.attempts).toBe(2)
+
+      // 第三次启动：这次该被「已确认」挡住，不再投。
+      const third = await runAutoResume({
+        pendingFile,
+        ackFile,
+        env: {},
+        log: () => {},
+        attempt: 1,
+        controllerOf: () => ({ async prompt() { throw new Error('should not be called') } }) as never,
+      })
+      expect(third.status).toBe('already-acked')
+      // 失败记录与成功记录都走原子写，目录里不许留 tmp 残件。
+      expect((await readdir(dir2)).sort()).toEqual(['restart-pending.ack.json', 'restart-pending.json'])
+    } finally {
+      await rm(dir2, { recursive: true, force: true })
+    }
   })
 })
