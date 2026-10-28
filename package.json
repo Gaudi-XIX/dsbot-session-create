@@ -1,0 +1,37 @@
+{
+  "name": "dsh-session-create",
+  "version": "0.1.0",
+  "description": "A DSH plugin that gives a Session the create_session tool: start a new Session in a named workspace or working folder and deliver one prompt into it.",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "session",
+    "workspace"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --target=node --format=esm --outfile=index.js --external @deepseek-ai/dsh-tools",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

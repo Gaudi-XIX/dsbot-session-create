@@ -1,0 +1,4 @@
+# Mounts the host half of this plugin: one tool named create_session.
+- insert:
+    - id: session-create
+      name: dsh-session-create

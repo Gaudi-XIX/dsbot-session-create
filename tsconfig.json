@@ -1,0 +1,18 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "typeRoots": ["node_modules/@types", "F:/AgentData/dsh-agy-cli/node_modules/@types"],
+    "baseUrl": ".",
+    "paths": {
+      "@deepseek-ai/dsh-tools": ["./test/stubs/dsh-tools.ts"]
+    }
+  },
+  "include": ["src"]
+}
