@@ -10,7 +10,9 @@ import {
   dispatcherSessionOf,
   installDispatchNotify,
   listDispatchedIn,
+  messageSessionIn,
   preflight,
+  preflightMessage,
   preflightOptions,
   preflightRead,
   readSessionIn,
@@ -18,6 +20,8 @@ import {
   stamp,
   type CreateArgs,
   type HostCtx,
+  type MessageArgs,
+  type MessageResult,
   type ReadArgs,
   type Transcript,
 } from './core'
@@ -43,6 +47,14 @@ const CREATE_DESCRIPTION = [
   '② 只有 Main Bot 能派吗？（值不值得做／范围多大／谁收口提交——三条不全就别派，交清单给 Main Bot）',
   '③ 派出去就管到底：prompt 写清终点（改完→测过→本地 commit），不许写「先别提交」。',
 ].join('\n')
+
+const MESSAGE_DESCRIPTION = [
+  'Send one more message into a Session that already exists, by its session id. No new Session is created.',
+  'This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.',
+  'The message is queued: it does not interrupt the turn that is running, it is picked up after it (or when the Session starts one).',
+  'A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.',
+  'Read what the Session did with it afterwards using read_session_transcript.',
+].join(' ')
 
 const READ_DESCRIPTION = [
   'Read back what a Session has said and where it stands, by session id: its latest messages (oldest first) and whether its current turn has already ended.',
@@ -85,6 +97,21 @@ function formatTranscript(transcript: Transcript): string {
   return [...head, ...(body.length === 0 ? [] : body), ...tail].join('\n')
 }
 
+// 补话的回执：只陈述「宿主已收下并排进队列」，不替会话说它看过（那要读回才成立）。
+function formatMessage(result: MessageResult): string {
+  const head = `Queued a message into Session ${result.sessionId}${result.title === undefined ? '' : ` · "${result.title}"`}.`
+  const place = result.placement === undefined ? '' : `place: ${result.placement}`
+  const ledger = result.ledgerError === undefined
+    ? ''
+    : `(the dispatch ledger could not be read, so this Session was not matched to a dispatch: ${result.ledgerError})`
+  return [
+    head,
+    ...(place === '' ? [] : [place]),
+    'The host took it into the Session\'s queue (mode "queue"): it does not interrupt the turn that is running, and the Session picks it up after it. Nothing yet proves the Session has read it — read_session_transcript shows that.',
+    ...(ledger === '' ? [] : [ledger]),
+  ].join('\n')
+}
+
 export function apply(ctx: HostCtx): void {
   // 启动日志只报「加载那一刻看到了什么」——纯诊断信息。
   // 工具执行路径**不**复用这里的结果：本插件只 inject `tools`，宿主不会为另外几个服务等待就绪
@@ -94,6 +121,7 @@ export function apply(ctx: HostCtx): void {
   const services = resolveServices(ctx)
   const seen = preflight(services)
   const seenRead = preflightRead(services)
+  const seenMessage = preflightMessage(services)
   const seenOptions = preflightOptions(services)
   console.log(
     seen.length === 0
@@ -104,6 +132,12 @@ export function apply(ctx: HostCtx): void {
     seenRead.length === 0
       ? '[dsh-session-create] loaded; the host services the read-back tools need were all present at load.'
       : `[dsh-session-create] loaded; at load MISSING for read-back: ${seenRead.join(', ')} (the tools re-check on every call)`,
+  )
+  // 补话只需要 resolveAgent + prompt：单独报，不混进上面两条。
+  console.log(
+    seenMessage.length === 0
+      ? '[dsh-session-create] loaded; the host services session_message needs were all present at load.'
+      : `[dsh-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(', ')} (the tool re-checks on every call)`,
   )
   // 选项是可选能力：缺了只影响带 preset/permission 的派活，不影响其余调用 —— 单独报，不混进上面两条。
   console.log(
@@ -216,6 +250,27 @@ export function apply(ctx: HostCtx): void {
           return `${head}\n   - ${state} · head seq ${line.headSeq}${fresh} · ${when}`
         })
         return [header, ...lines].join('\n')
+      },
+    }),
+  )
+
+  register?.(
+    defineTool({
+      name: 'session_message',
+      description: MESSAGE_DESCRIPTION,
+      parameters: {
+        sessionId: { type: 'string', required: true, description: 'The Session to send into: an id this harness already knows. No new Session is made; an unknown id is refused.' },
+        message: { type: 'string', required: true, description: 'The message to deliver into that Session. It is queued, so it lands after the turn that is running.' },
+      },
+      output,
+      async execute(args: MessageArgs) {
+        try {
+          return formatMessage(await messageSessionIn(resolveServices(ctx), args))
+        } catch (error) {
+          if (error instanceof SessionCreateError) return `Could not send into the Session: ${error.message}`
+          const reason = error instanceof Error ? error.message : String(error)
+          return `Could not send into the Session: ${reason}`
+        }
       },
     }),
   )

@@ -9,6 +9,7 @@ import { dirname, join } from "node:path";
 var PROMPT_TIMEOUT_MS = 30000;
 var HISTORY_TIMEOUT_MS = 20000;
 var SESSION_OPTION_TIMEOUT_MS = 1e4;
+var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
@@ -505,6 +506,61 @@ async function readSessionIn(ctx, args = {}, opts = {}) {
     ...ledgerError === undefined ? {} : { ledgerError }
   };
 }
+function preflightMessage(ctx) {
+  const missing = [];
+  if (typeof ctx?.sessionController?.resolveAgent !== "function")
+    missing.push("sessionController.resolveAgent");
+  if (typeof ctx?.sessionController?.prompt !== "function")
+    missing.push("sessionController.prompt");
+  return missing;
+}
+function validateMessage(args) {
+  const sessionId = (args?.sessionId ?? "").trim();
+  const message = (args?.message ?? "").trim();
+  if (sessionId === "")
+    throw new SessionCreateError("missing-session-id", "a sessionId is required; nothing was sent.");
+  if (message === "")
+    throw new SessionCreateError("missing-message", "a message is required; nothing was sent.");
+  return { sessionId, message };
+}
+async function messageSessionIn(ctx, args = {}, opts = {}) {
+  const missing = preflightMessage(ctx);
+  if (missing.length > 0) {
+    throw new SessionCreateError("host-missing", `this harness cannot send into a Session: it is missing ${missing.join(", ")}. Nothing was sent.`);
+  }
+  const { sessionId, message } = validateMessage(args);
+  const controller = ctx.sessionController;
+  const ledgerPath = opts.ledger ?? defaultLedgerPath();
+  let title;
+  let placement;
+  let ledgerError;
+  try {
+    const record = (await readLedger(ledgerPath)).find((entry) => entry.sessionId === sessionId);
+    title = record?.title;
+    placement = record?.placement;
+  } catch (error) {
+    ledgerError = reasonOf(error);
+  }
+  const resolved = await controller.resolveAgent?.(sessionId);
+  if (!resolved || "error" in resolved || resolved.agent?.session === undefined || resolved.agent.session === null) {
+    throw new SessionCreateError("session-unknown", `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ""}; nothing was sent.`);
+  }
+  let outcome;
+  try {
+    outcome = await controller.prompt?.({
+      requestId: randomUUID(),
+      sessionId,
+      mode: "queue",
+      content: [{ type: "text", text: message }]
+    }, opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS));
+  } catch (error) {
+    throw new SessionCreateError("message-failed", `the message did not go into Session "${sessionId}" (${reasonOf(error)}); nothing was delivered.`);
+  }
+  if (outcome === false) {
+    throw new SessionCreateError("message-refused", `the harness refused the message for Session "${sessionId}"; nothing was delivered.`);
+  }
+  return { sessionId, ...title === undefined ? {} : { title }, ...placement === undefined ? {} : { placement }, ...ledgerError === undefined ? {} : { ledgerError } };
+}
 async function listDispatchedIn(ctx, args = {}, opts = {}) {
   const ledgerPath = opts.ledger ?? defaultLedgerPath();
   const limit = clamp(args.limit ?? 5, 1, 20);
@@ -708,6 +764,13 @@ var CREATE_DESCRIPTION = [
   "③ 派出去就管到底：prompt 写清终点（改完→测过→本地 commit），不许写「先别提交」。"
 ].join(`
 `);
+var MESSAGE_DESCRIPTION = [
+  "Send one more message into a Session that already exists, by its session id. No new Session is created.",
+  "This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.",
+  "The message is queued: it does not interrupt the turn that is running, it is picked up after it (or when the Session starts one).",
+  "A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.",
+  "Read what the Session did with it afterwards using read_session_transcript."
+].join(" ");
 var READ_DESCRIPTION = [
   "Read back what a Session has said and where it stands, by session id: its latest messages (oldest first) and whether its current turn has already ended.",
   "This is how a dispatched Session's result is collected without opening it by hand. Omit `sessionId` to read the most recent dispatch from the ledger.",
@@ -745,13 +808,27 @@ function formatTranscript(transcript) {
   return [...head, ...body.length === 0 ? [] : body, ...tail].join(`
 `);
 }
+function formatMessage(result) {
+  const head = `Queued a message into Session ${result.sessionId}${result.title === undefined ? "" : ` · "${result.title}"`}.`;
+  const place = result.placement === undefined ? "" : `place: ${result.placement}`;
+  const ledger = result.ledgerError === undefined ? "" : `(the dispatch ledger could not be read, so this Session was not matched to a dispatch: ${result.ledgerError})`;
+  return [
+    head,
+    ...place === "" ? [] : [place],
+    `The host took it into the Session's queue (mode "queue"): it does not interrupt the turn that is running, and the Session picks it up after it. Nothing yet proves the Session has read it — read_session_transcript shows that.`,
+    ...ledger === "" ? [] : [ledger]
+  ].join(`
+`);
+}
 function apply(ctx) {
   const services = resolveServices(ctx);
   const seen = preflight(services);
   const seenRead = preflightRead(services);
+  const seenMessage = preflightMessage(services);
   const seenOptions = preflightOptions(services);
   console.log(seen.length === 0 ? "[dsh-session-create] loaded; the host services create_session needs were all present at load." : `[dsh-session-create] loaded; at load MISSING: ${seen.join(", ")} (the tool re-checks on every call)`);
   console.log(seenRead.length === 0 ? "[dsh-session-create] loaded; the host services the read-back tools need were all present at load." : `[dsh-session-create] loaded; at load MISSING for read-back: ${seenRead.join(", ")} (the tools re-check on every call)`);
+  console.log(seenMessage.length === 0 ? "[dsh-session-create] loaded; the host services session_message needs were all present at load." : `[dsh-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(", ")} (the tool re-checks on every call)`);
   console.log(seenOptions.length === 0 ? "[dsh-session-create] loaded; the host services the session options need were all present at load." : `[dsh-session-create] loaded; at load MISSING for session options: ${seenOptions.join(", ")} (create_session re-checks on every call)`);
   const register = services.tools?.register?.bind(services.tools);
   register?.(defineTool({
@@ -844,6 +921,25 @@ function apply(ctx) {
       });
       return [header, ...lines].join(`
 `);
+    }
+  }));
+  register?.(defineTool({
+    name: "session_message",
+    description: MESSAGE_DESCRIPTION,
+    parameters: {
+      sessionId: { type: "string", required: true, description: "The Session to send into: an id this harness already knows. No new Session is made; an unknown id is refused." },
+      message: { type: "string", required: true, description: "The message to deliver into that Session. It is queued, so it lands after the turn that is running." }
+    },
+    output,
+    async execute(args) {
+      try {
+        return formatMessage(await messageSessionIn(resolveServices(ctx), args));
+      } catch (error) {
+        if (error instanceof SessionCreateError)
+          return `Could not send into the Session: ${error.message}`;
+        const reason = error instanceof Error ? error.message : String(error);
+        return `Could not send into the Session: ${reason}`;
+      }
     }
   }));
   installDispatchNotify(ctx);

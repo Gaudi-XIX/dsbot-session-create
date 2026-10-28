@@ -76,9 +76,9 @@ describe('插件清单', () => {
     expect(inject).toEqual(['tools'])
   })
 
-  test('注册三个工具：派送、读回、台账一览', () => {
+  test('注册四个工具：派送、读回、台账一览、给已存在会话补话', () => {
     const { tools } = load()
-    expect([...tools.keys()].sort()).toEqual(['create_session', 'list_dispatched_sessions', 'read_session_transcript'])
+    expect([...tools.keys()].sort()).toEqual(['create_session', 'list_dispatched_sessions', 'read_session_transcript', 'session_message'])
   })
 
   test('create_session 参数齐全且必填项正确', () => {
@@ -192,6 +192,98 @@ describe('端到端（构建产物）', () => {
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'w' })
     expect(text).toContain('Could not start the Session')
     expect(archived).toEqual([['orphan-1', { stopActivity: true }]])
+  })
+})
+
+describe('给已存在的会话补一条消息（构建产物）', () => {
+  test('正常投递：只投一条 prompt，不建会话，回执只说「已排队」不说「它看过」', async () => {
+    const { tools, calls } = load()
+    const text = await (tools.get('session_message') as Spec).execute({ sessionId: 'sess-live', message: '别把契约文件漏掉' })
+    expect(calls.create).toHaveLength(0)
+    expect(calls.prompt).toHaveLength(1)
+    expect(calls.prompt[0]).toMatchObject({ sessionId: 'sess-live', mode: 'queue', content: [{ type: 'text', text: '别把契约文件漏掉' }] })
+    expect(text).toContain('Queued a message into Session sess-live')
+    expect(text).toContain('The host took it into the Session\'s queue')
+    expect(text).toContain('Nothing yet proves the Session has read it')
+  })
+
+  test('参数齐全且必填项正确', () => {
+    const { tools } = load()
+    const spec = tools.get('session_message') as Spec
+    expect(Object.keys(spec.parameters).sort()).toEqual(['message', 'sessionId'])
+    expect(spec.parameters.sessionId.required).toBe(true)
+    expect(spec.parameters.message.required).toBe(true)
+  })
+
+  test('缺 sessionId / 缺 message → 可读错误且一条都没投', async () => {
+    const { tools, calls } = load()
+    const spec = tools.get('session_message') as Spec
+    expect(await spec.execute({ message: 'x' })).toContain('a sessionId is required')
+    expect(await spec.execute({ sessionId: 'sess-1' })).toContain('a message is required')
+    expect(calls.prompt).toHaveLength(0)
+  })
+
+  test('宿主认不出的会话 id → 拒绝，且一条都没投', async () => {
+    const tools = new Map<string, Spec>()
+    const calls: Calls = { create: [], prompt: [], rename: [], archive: [], page: [] }
+    const ctx = {
+      tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
+      sessionController: {
+        async prompt(o: Record<string, unknown>) { calls.prompt.push(o); return true },
+        async resolveAgent() { return { error: { message: 'no such session' } } },
+      },
+    }
+    apply(ctx as never)
+    const spec = tools.get('session_message') as Spec
+    const text = await spec.execute({ sessionId: 'ghost', message: 'hi' })
+    expect(text).toContain('Could not send into the Session')
+    expect(text).toContain('no Session "ghost"')
+    expect(calls.prompt).toHaveLength(0)
+  })
+
+  test('宿主投递抛错 → 如实报错', async () => {
+    const tools = new Map<string, Spec>()
+    const ctx = {
+      tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
+      sessionController: {
+        async prompt() { throw new Error('agent gone') },
+        async resolveAgent(id: string) { return { agent: { session: { id, seq: 1 } } } },
+      },
+    }
+    apply(ctx as never)
+    const spec = tools.get('session_message') as Spec
+    const text = await spec.execute({ sessionId: 'sess-1', message: 'hi' })
+    expect(text).toContain('Could not send into the Session')
+    expect(text).toContain('agent gone')
+  })
+
+  test('宿主回 false（拒收）→ 如实报错，不说投好了', async () => {
+    const tools = new Map<string, Spec>()
+    const ctx = {
+      tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
+      sessionController: {
+        async prompt() { return false },
+        async resolveAgent(id: string) { return { agent: { session: { id, seq: 1 } } } },
+      },
+    }
+    apply(ctx as never)
+    const spec = tools.get('session_message') as Spec
+    const text = await spec.execute({ sessionId: 'sess-1', message: 'hi' })
+    expect(text).toContain('Could not send into the Session')
+    expect(text).toContain('refused')
+  })
+
+  test('宿主没有 prompt 能力 → 说明缺什么，不为凑数假装成功', async () => {
+    const tools = new Map<string, Spec>()
+    const ctx = {
+      tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
+      sessionController: { async resolveAgent() { return { agent: { session: {} } } } },
+    }
+    apply(ctx as never)
+    const spec = tools.get('session_message') as Spec
+    const text = await spec.execute({ sessionId: 'sess-1', message: 'hi' })
+    expect(text).toContain('Could not send into the Session')
+    expect(text).toContain('sessionController.prompt')
   })
 })
 

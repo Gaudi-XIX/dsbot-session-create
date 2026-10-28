@@ -12,6 +12,8 @@ export const PROMPT_TIMEOUT_MS = 30_000
 export const HISTORY_TIMEOUT_MS = 20_000
 // 设会话选项（preset / permission）都是本地的一次服务调用，10 秒是上限而非预期耗时。
 export const SESSION_OPTION_TIMEOUT_MS = 10_000
+// 往已存在的会话里补一条消息：同样是本地一次调用，10 秒是上限而非预期耗时。
+export const MESSAGE_TIMEOUT_MS = 10_000
 // 单条消息在工具输出里的上限：够看清结论，又不至于把一整篇文档灌进上下文。
 export const MESSAGE_CLIP = 2_000
 // 一次最多取多少条消息（宿主 page 的 maxMessages）。
@@ -792,6 +794,102 @@ export async function readSessionIn(
     ...(newEvents === undefined ? {} : { newEvents }),
     ...(ledgerError === undefined ? {} : { ledgerError }),
   }
+}
+
+// ---------------------------------------------------------------------------
+// 给已存在的会话补一条消息（2026-10-28 加，用户要求）
+//
+// 通道就是**派送与完成回执已经在用的那一条**：宿主 `sessionController.prompt`
+// （`{ requestId, sessionId, mode:'queue', content }`，排队投递、不打断当前轮）。
+// 两处生产先例：①本插件 createSessionIn 用它开新会话投第一条；②createDispatchNotifier
+// 把回执投给**已经在跑的**派活人会话（core.ts 的 deliver）；③ds-bot 0.2.3
+// `src/host/channel.js:422` 的 'send' 分支对**已存在**的 Bot 会话调的也是同一个方法。
+// 所以这里不新造旁路，只把这条现成通道开成一个工具。
+// ---------------------------------------------------------------------------
+
+export type MessageArgs = { sessionId?: string; message?: string }
+export type MessageResult = {
+  sessionId: string
+  /** 台账里记过的标题 / 落位，便于认人；台账里没有这一单就没有。 */
+  title?: string
+  placement?: string
+  /** 台账读不出来时的原因；不影响投递，但要如实带出去。 */
+  ledgerError?: string
+}
+
+// 补话只需要两项能力，不该被建会话所需的其余服务连坐。
+export function preflightMessage(ctx: HostCtx): string[] {
+  const missing: string[] = []
+  if (typeof ctx?.sessionController?.resolveAgent !== 'function') missing.push('sessionController.resolveAgent')
+  if (typeof ctx?.sessionController?.prompt !== 'function') missing.push('sessionController.prompt')
+  return missing
+}
+
+export function validateMessage(args: MessageArgs): { sessionId: string; message: string } {
+  const sessionId = (args?.sessionId ?? '').trim()
+  const message = (args?.message ?? '').trim()
+  if (sessionId === '') throw new SessionCreateError('missing-session-id', 'a sessionId is required; nothing was sent.')
+  if (message === '') throw new SessionCreateError('missing-message', 'a message is required; nothing was sent.')
+  return { sessionId, message }
+}
+
+/**
+ * 往一个**已经存在**的会话里再投一条消息。不建会话、不改会话状态。
+ *
+ * 投递前先 resolveAgent：宿主认不出的会话 id 必须在这里就拒绝，
+ * 不能把「什么都没投进去」说成「投好了」（fail-closed，与 readSessionIn 同一判据）。
+ */
+export async function messageSessionIn(
+  ctx: HostCtx,
+  args: MessageArgs = {},
+  opts: { ledger?: string; signal?: AbortSignal; timeoutMs?: number } = {},
+): Promise<MessageResult> {
+  const missing = preflightMessage(ctx)
+  if (missing.length > 0) {
+    throw new SessionCreateError('host-missing', `this harness cannot send into a Session: it is missing ${missing.join(', ')}. Nothing was sent.`)
+  }
+  const { sessionId, message } = validateMessage(args)
+  const controller = ctx.sessionController as NonNullable<HostCtx['sessionController']>
+
+  // 台账只是附加信息（标题 / 落位）：读不出来不该挡住投递，但也不许静默。
+  const ledgerPath = opts.ledger ?? defaultLedgerPath()
+  let title: string | undefined
+  let placement: string | undefined
+  let ledgerError: string | undefined
+  try {
+    const record = (await readLedger(ledgerPath)).find(entry => entry.sessionId === sessionId)
+    title = record?.title
+    placement = record?.placement
+  } catch (error) {
+    ledgerError = reasonOf(error)
+  }
+
+  const resolved = await controller.resolveAgent?.(sessionId)
+  if (!resolved || 'error' in resolved || resolved.agent?.session === undefined || resolved.agent.session === null) {
+    throw new SessionCreateError('session-unknown', `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ''}; nothing was sent.`)
+  }
+
+  let outcome: unknown
+  try {
+    outcome = await controller.prompt?.(
+      {
+        requestId: randomUUID(),
+        sessionId,
+        mode: 'queue',
+        content: [{ type: 'text', text: message }],
+      },
+      opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS),
+    )
+  } catch (error) {
+    throw new SessionCreateError('message-failed', `the message did not go into Session "${sessionId}" (${reasonOf(error)}); nothing was delivered.`)
+  }
+  // 宿主明确回 false = 拒收。其余（true / undefined / 认不出的形状）按已受理处理，
+  // 但对外只说「已进入队列」，不说「它看过了」——后者只有读回才能证明。
+  if (outcome === false) {
+    throw new SessionCreateError('message-refused', `the harness refused the message for Session "${sessionId}"; nothing was delivered.`)
+  }
+
+  return { sessionId, ...(title === undefined ? {} : { title }), ...(placement === undefined ? {} : { placement }), ...(ledgerError === undefined ? {} : { ledgerError }) }
 }
 
 export type DispatchLine = {
