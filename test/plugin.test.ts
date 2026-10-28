@@ -17,6 +17,9 @@ type Spec = {
 const TMP_ROOT = join(import.meta.dir, '..', '.tmp')
 const AMBIENT_LEDGER = join(TMP_ROOT, 'plugin-test-ledger.jsonl')
 const previousLedger = process.env.DSH_SESSION_CREATE_LEDGER
+// 启动自检（src/autoresume.ts）默认会在 apply() 后延迟 6 秒读真盘并投递。冒烟测试不许碰真会话，
+// 整段跑在关闭开关下：apply() 连定时器都不会注册。
+const previousAutoResume = process.env.DSH_AUTORESUME_DISABLE
 
 type Calls = { create: Record<string, unknown>[]; prompt: Record<string, unknown>[]; rename: unknown[][]; archive: unknown[][]; page: Record<string, unknown>[] }
 
@@ -62,11 +65,14 @@ beforeAll(async () => {
   await mkdir(TMP_ROOT, { recursive: true })
   await rm(AMBIENT_LEDGER, { force: true })
   process.env.DSH_SESSION_CREATE_LEDGER = AMBIENT_LEDGER
+  process.env.DSH_AUTORESUME_DISABLE = '1'
 })
 
 afterAll(async () => {
   if (previousLedger === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
   else process.env.DSH_SESSION_CREATE_LEDGER = previousLedger
+  if (previousAutoResume === undefined) delete process.env.DSH_AUTORESUME_DISABLE
+  else process.env.DSH_AUTORESUME_DISABLE = previousAutoResume
   await rm(AMBIENT_LEDGER, { force: true })
 })
 

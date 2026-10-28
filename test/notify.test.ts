@@ -17,6 +17,7 @@ import {
 import { apply as applyBuilt } from '../index.js'
 
 const TMP_ROOT = join(import.meta.dir, '..', '.tmp')
+const previousAutoResume = process.env.DSH_AUTORESUME_DISABLE
 
 type Timer = { ms: number; fn: () => void | Promise<void>; cancelled: boolean }
 
@@ -115,9 +116,13 @@ async function endTurn(notifier: ReturnType<typeof harness>['notifier'], turn: n
 
 beforeAll(async () => {
   await mkdir(TMP_ROOT, { recursive: true })
+  // 末尾「构建产物」那一段会调 apply()；启动自检默认延迟 6 秒读真盘并投真会话，这里整段关掉。
+  process.env.DSH_AUTORESUME_DISABLE = '1'
 })
 
 afterAll(async () => {
+  if (previousAutoResume === undefined) delete process.env.DSH_AUTORESUME_DISABLE
+  else process.env.DSH_AUTORESUME_DISABLE = previousAutoResume
   // 自测自清：只删本文件建的台账。
   const entries = await readdir(TMP_ROOT).catch(() => [] as string[])
   await Promise.all(

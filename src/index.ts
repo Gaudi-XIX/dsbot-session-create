@@ -4,6 +4,7 @@
 // 理由见 docs/chief-session-create-capability-20261026.md §三.8——硬 inject 会在宿主缺服务时
 // 让整棵插件树加载失败，preflight 那句可读报错就永远不会被执行。
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { installAutoResume } from './autoresume'
 import {
   SessionCreateError,
   createSessionIn,
@@ -279,4 +280,8 @@ export function apply(ctx: HostCtx): void {
   // 安静满 120 秒且宿主复核为 idle 时，用 controller.prompt(mode:'queue') 投一条短回执给派活人。
   // 这一处挂在 ctx 上而不是工具里 —— 没人调用工具时也要有东西替我们盯着（用户 2026-10-28 要求）。
   installDispatchNotify(ctx)
+
+  // 宿主启动自检（2026-10-28 用户要求）：延迟几秒读盘上的接手指针，把「刚重启过、先读指针」
+  // 投给指针里指定的会话。整段 fail-open、不阻塞宿主启动；细节与判据见 src/autoresume.ts。
+  installAutoResume(ctx)
 }
