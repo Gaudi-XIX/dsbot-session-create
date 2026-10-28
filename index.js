@@ -700,7 +700,14 @@ var CREATE_DESCRIPTION = [
   "Optionally set the Session's agent preset (`preset`) and permission mode (`permission`) before it starts; leave them out for the host default.",
   "The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.",
   "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot."
-].join(" ");
+].join(" ") + `
+` + [
+  "派会话前先自问三句：",
+  "① 要落盘还是回传？落盘就在 prompt 里写死输出路径，只回摘要+路径。",
+  "② 只有 Main Bot 能派吗？（值不值得做／范围多大／谁收口提交——三条不全就别派，交清单给 Main Bot）",
+  "③ 派出去就管到底：prompt 写清终点（改完→测过→本地 commit），不许写「先别提交」。"
+].join(`
+`);
 var READ_DESCRIPTION = [
   "Read back what a Session has said and where it stands, by session id: its latest messages (oldest first) and whether its current turn has already ended.",
   "This is how a dispatched Session's result is collected without opening it by hand. Omit `sessionId` to read the most recent dispatch from the ledger.",
