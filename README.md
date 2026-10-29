@@ -1,6 +1,6 @@
 # dsbot-session-create
 
-给 DSH 加三个工具：**`create_session`** —— 在指定的工作区、或任意一个已存在的工作文件夹里开一个新会话，并把一段提示词直接投进去；**`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来；**`list_dispatched_sessions`** —— 看这个插件派送过哪些会话、各自此刻什么状态。
+给 DSH 加四个工具：**`create_session`** —— 在指定的工作区、或任意一个已存在的工作文件夹里开一个新会话，并把一段提示词直接投进去；**`session_message`** —— 给一个已经存在（在跑或已结束）的会话再追加一条消息，排队投递、落在当前这一轮之后；**`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来；**`list_dispatched_sessions`** —— 看这个插件派送过哪些会话、各自此刻什么状态。
 
 它是一个 DSH 插件（dsh-plugin），宿主半边，没有界面。
 
@@ -16,6 +16,7 @@ DS Bot 的 Chief 能把活派给别的 Bot（`message_bot`），但派不到「�
 
 ```
 create_session(title, prompt, workspace? | folder?)
+session_message(sessionId, message)
 read_session_transcript(sessionId?, last?)
 list_dispatched_sessions(limit?)
 ```
@@ -49,6 +50,17 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 这是「派出去以后还能找回来」的凭据。台账写失败**不会**让整次派送算失败（会话已经建出来了），但结果里会带一个 `ledgerError`，并把「自己手动记下这个 session id」写进给用户看的文案。
 
 落点为什么在 `bot/` 下：这份账是 **Bot ↔ 人的交接记录**，属于 DS Bot 自己的数据，所以跟在 DS Bot 的 home（`<DSH_HOME>/bot`，ds-bot 自己也是这条规则）里，不与它平级另立一处。若 ds-bot 的 home 被它自己的 profile 配置改到别处，用 `DSH_SESSION_CREATE_LEDGER` 对齐。
+
+### `session_message`
+
+给一个**已经存在**的会话再投一条消息，不新建会话：
+
+| 参数 | 必填 | 说明 |
+| --- | --- | --- |
+| `sessionId` | 是 | 目标会话的 id（`create_session` 或 `list_dispatched_sessions` 给的） |
+| `message` | 是 | 追加的那段话 |
+
+走的是宿主 `controller.prompt(mode: 'queue')`，所以它是**排队投递**：落在当前正在跑的那一轮之后，不会打断它。会话已经跑完时投进去，等于让它接着再跑一轮。
 
 ### `read_session_transcript`
 
@@ -94,8 +106,8 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 本机（DSH 0.2.1-rc.3）以链路方式装进 profile：
 
 ```
-# 在 profile 目录里（F:\AgentData\dsh\data\profiles\desktop）
-# 把 "dsbot-session-create": "link:F:\\DSBOT\\plugins\\dsbot-session-create" 加进 package.json 的 dependencies
+# 在 profile 目录里（<DSH_HOME>/profiles/<profile>）
+# 把 "dsbot-session-create": "link:<本插件目录的绝对路径>" 加进 package.json 的 dependencies
 ```
 
 或直接把本目录复制进 `node_modules/`。装完 **必须重启 DSH**（重启只能由用户执行）。
@@ -118,15 +130,15 @@ bun test        # 69 个测试；plugin.test.ts 测的是构建产物，跑前�
 类型检查（本机没装 tsc，借用现成的）：
 
 ```bash
-node F:/AgentData/dsh-agy-cli/node_modules/typescript/bin/tsc --noEmit -p .
+node <任意本机已有的 typescript>/bin/tsc --noEmit -p .
 ```
 
 ## 几个必须知道的事实
 
 - **`@deepseek-ai/dsh-tools` 不在 profile 的 `node_modules` 里**（在宿主 `app.asar` 内，加载插件时注入；`node_modules/@deepseek-ai/**/package.json` 在本 profile 是 0 命中）。所以 `test/stubs/dsh-tools.ts` 是它的替身，`tsconfig.json` 的 `paths` 只为本机开发把它指过去 —— 那**不是**权威类型定义，是按 DS Bot 的实际用法反推的最小形状。
 - 宿主 API 的形状（`create` 返回 `{ sessionId }`、`prompt` 要 `requestId` + `mode: 'queue'` + `content:[{type:'text',text}]`）是从 DS Bot 的 `src/host/roster.js`、`channel.js` **读出来**的，不是从官方文档抄的。上游没有这层文档。
-- **尚未在真实宿主里加载过**：需要用户重启 DSH 才能验。在此之前，全部验证都止于「假 ctx + 构建产物」。
-- 本机沙箱只允许在插件目录下写（`%TEMP%` 与 `F:\DSBOT\tmp` 都是 EPERM），所以测试的临时目录放在 `.tmp/`。
+- **已在真实宿主里加载过**：2026-10-30 00:36 重启后，四个工具在一个活会话里都出现了（描述逐字来自本插件的 `index.js`），不是只有「假 ctx + 构建产物」的验证。
+- 作者的开发沙箱当时只允许在插件目录下写（系统临时目录与工作区的 `tmp/` 都是 EPERM），所以测试的临时目录放在 `.tmp/`。
 
 ## 尚未验证的边界
 
@@ -138,7 +150,7 @@ node F:/AgentData/dsh-agy-cli/node_modules/typescript/bin/tsc --noEmit -p .
 4. **提示词的 30 秒超时上限**：这条路径没有「真触发」用例——测试运行器 bun 1.3.13 的 `AbortSignal.timeout` 在进程没有其它待办定时器时不触发（宿主是 Node，不受影响）。
 5. **`last` 夹到 1..200、`limit` 夹到 1..20** 是本插件自定的范围，宿主有没有更低的天花板未验。
 
-另外，能否「跑完自动把结果推给你」也**没做**：现在是**一条命令就能取回**，不是自动送达。要做自动送达得靠定时轮询或宿主事件，建议等上面第 1 条验过之后再谈。
+「跑完自动把结果推给派活人」这条**已经实现**：派送时把回执地址记进台账，目标会话安静满 120 秒、且宿主复核为 idle 时，插件用 `controller.prompt(mode: 'queue')` 投一条短回执回去（`src/index.ts:282` 的 `installDispatchNotify`，源码注释见 `:280`）。**但它在真机上还没验过**——上面第 1 条的读回形状没验，这条通知就谈不上可信。现在也仍然可以一条命令取回，取回是稳的。
 
 ## 许可
 
