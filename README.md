@@ -1,4 +1,4 @@
-# dsh-session-create
+# dsbot-session-create
 
 给 DSH 加三个工具：**`create_session`** —— 在指定的工作区、或任意一个已存在的工作文件夹里开一个新会话，并把一段提示词直接投进去；**`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来；**`list_dispatched_sessions`** —— 看这个插件派送过哪些会话、各自此刻什么状态。
 
@@ -95,7 +95,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ```
 # 在 profile 目录里（F:\AgentData\dsh\data\profiles\desktop）
-# 把 "dsh-session-create": "link:F:\\DSBOT\\plugins\\dsh-session-create" 加进 package.json 的 dependencies
+# 把 "dsbot-session-create": "link:F:\\DSBOT\\plugins\\dsbot-session-create" 加进 package.json 的 dependencies
 ```
 
 或直接把本目录复制进 `node_modules/`。装完 **必须重启 DSH**（重启只能由用户执行）。
@@ -105,7 +105,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 ```yaml
 - insert:
     - id: session-create
-      name: dsh-session-create
+      name: dsbot-session-create
 ```
 
 ## 开发

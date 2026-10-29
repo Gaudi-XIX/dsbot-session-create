@@ -170,7 +170,7 @@ async function readAckedWrittenAt(ackFile: string, readText: ReadText, log: Log)
  */
 export async function runAutoResume(deps: AutoResumeDeps = {}): Promise<AutoResumeOutcome> {
   const env = deps.env ?? process.env
-  const log = deps.log ?? ((line: string) => console.warn(`[dsh-session-create] ${line}`))
+  const log = deps.log ?? ((line: string) => console.warn(`[dsbot-session-create] ${line}`))
   const attempts = Number.isFinite(deps.attempt) && (deps.attempt as number) >= 1 ? Math.trunc(deps.attempt as number) : 1
   // ① 关闭开关：在碰任何文件之前判断（用户判据 6）。
   if (env[AUTORESUME_ENV_FLAG] === '1') {
@@ -305,7 +305,7 @@ export type AutoResumeInstallOptions = AutoResumeDeps & {
  * 送达、已确认、没指针、没目标都被当成终态，不再重试。
  */
 export function installAutoResume(ctx: HostCtx, opts: AutoResumeInstallOptions = {}): void {
-  const log = opts.log ?? ((line: string) => console.warn(`[dsh-session-create] ${line}`))
+  const log = opts.log ?? ((line: string) => console.warn(`[dsbot-session-create] ${line}`))
   const env = opts.env ?? process.env
   // 关掉时连定时器都不注册（判据 6：在读取任何文件之前判断）。
   if (env[AUTORESUME_ENV_FLAG] === '1') {

@@ -126,25 +126,25 @@ export function apply(ctx: HostCtx): void {
   const seenOptions = preflightOptions(services)
   console.log(
     seen.length === 0
-      ? '[dsh-session-create] loaded; the host services create_session needs were all present at load.'
-      : `[dsh-session-create] loaded; at load MISSING: ${seen.join(', ')} (the tool re-checks on every call)`,
+      ? '[dsbot-session-create] loaded; the host services create_session needs were all present at load.'
+      : `[dsbot-session-create] loaded; at load MISSING: ${seen.join(', ')} (the tool re-checks on every call)`,
   )
   console.log(
     seenRead.length === 0
-      ? '[dsh-session-create] loaded; the host services the read-back tools need were all present at load.'
-      : `[dsh-session-create] loaded; at load MISSING for read-back: ${seenRead.join(', ')} (the tools re-check on every call)`,
+      ? '[dsbot-session-create] loaded; the host services the read-back tools need were all present at load.'
+      : `[dsbot-session-create] loaded; at load MISSING for read-back: ${seenRead.join(', ')} (the tools re-check on every call)`,
   )
   // 补话只需要 resolveAgent + prompt：单独报，不混进上面两条。
   console.log(
     seenMessage.length === 0
-      ? '[dsh-session-create] loaded; the host services session_message needs were all present at load.'
-      : `[dsh-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(', ')} (the tool re-checks on every call)`,
+      ? '[dsbot-session-create] loaded; the host services session_message needs were all present at load.'
+      : `[dsbot-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(', ')} (the tool re-checks on every call)`,
   )
   // 选项是可选能力：缺了只影响带 preset/permission 的派活，不影响其余调用 —— 单独报，不混进上面两条。
   console.log(
     seenOptions.length === 0
-      ? '[dsh-session-create] loaded; the host services the session options need were all present at load.'
-      : `[dsh-session-create] loaded; at load MISSING for session options: ${seenOptions.join(', ')} (create_session re-checks on every call)`,
+      ? '[dsbot-session-create] loaded; the host services the session options need were all present at load.'
+      : `[dsbot-session-create] loaded; at load MISSING for session options: ${seenOptions.join(', ')} (create_session re-checks on every call)`,
   )
 
   // 注册是一次性的、必须在加载时完成，所以这一处用当下的解析结果（tools 已在 inject 里，

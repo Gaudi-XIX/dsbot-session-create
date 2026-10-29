@@ -622,7 +622,7 @@ function createDispatchNotifier(deps = {}) {
     fn();
   }, ms));
   const clearTimer = deps.clearTimer ?? ((handle2) => clearTimeout(handle2));
-  const log = deps.log ?? ((line) => console.warn(`[dsh-session-create] ${line}`));
+  const log = deps.log ?? ((line) => console.warn(`[dsbot-session-create] ${line}`));
   const pending = new Map;
   const notified = new Set;
   async function recordOf(sessionId) {
@@ -737,7 +737,7 @@ function createDispatchNotifier(deps = {}) {
 function installDispatchNotify(ctx, opts = {}) {
   const on = ctx?.on;
   if (typeof on !== "function") {
-    console.warn("[dsh-session-create] this harness context has no `on`, so a Session that finishes cannot report back by itself; read_session_transcript still works.");
+    console.warn("[dsbot-session-create] this harness context has no `on`, so a Session that finishes cannot report back by itself; read_session_transcript still works.");
     return;
   }
   const notifier = createDispatchNotifier({ ...opts, controllerOf: () => resolveServices(ctx).sessionController });
@@ -822,7 +822,7 @@ async function readAckedWrittenAt(ackFile, readText, log) {
 }
 async function runAutoResume(deps = {}) {
   const env = deps.env ?? process.env;
-  const log = deps.log ?? ((line) => console.warn(`[dsh-session-create] ${line}`));
+  const log = deps.log ?? ((line) => console.warn(`[dsbot-session-create] ${line}`));
   const attempts = Number.isFinite(deps.attempt) && deps.attempt >= 1 ? Math.trunc(deps.attempt) : 1;
   if (env[AUTORESUME_ENV_FLAG] === "1") {
     const reason = `${AUTORESUME_ENV_FLAG}=1`;
@@ -921,7 +921,7 @@ function defaultSchedule(fn, ms) {
   return handle;
 }
 function installAutoResume(ctx, opts = {}) {
-  const log = opts.log ?? ((line) => console.warn(`[dsh-session-create] ${line}`));
+  const log = opts.log ?? ((line) => console.warn(`[dsbot-session-create] ${line}`));
   const env = opts.env ?? process.env;
   if (env[AUTORESUME_ENV_FLAG] === "1") {
     log(`startup self-check is off (${AUTORESUME_ENV_FLAG}=1); no pointer will be read.`);
@@ -1052,10 +1052,10 @@ function apply(ctx) {
   const seenRead = preflightRead(services);
   const seenMessage = preflightMessage(services);
   const seenOptions = preflightOptions(services);
-  console.log(seen.length === 0 ? "[dsh-session-create] loaded; the host services create_session needs were all present at load." : `[dsh-session-create] loaded; at load MISSING: ${seen.join(", ")} (the tool re-checks on every call)`);
-  console.log(seenRead.length === 0 ? "[dsh-session-create] loaded; the host services the read-back tools need were all present at load." : `[dsh-session-create] loaded; at load MISSING for read-back: ${seenRead.join(", ")} (the tools re-check on every call)`);
-  console.log(seenMessage.length === 0 ? "[dsh-session-create] loaded; the host services session_message needs were all present at load." : `[dsh-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(", ")} (the tool re-checks on every call)`);
-  console.log(seenOptions.length === 0 ? "[dsh-session-create] loaded; the host services the session options need were all present at load." : `[dsh-session-create] loaded; at load MISSING for session options: ${seenOptions.join(", ")} (create_session re-checks on every call)`);
+  console.log(seen.length === 0 ? "[dsbot-session-create] loaded; the host services create_session needs were all present at load." : `[dsbot-session-create] loaded; at load MISSING: ${seen.join(", ")} (the tool re-checks on every call)`);
+  console.log(seenRead.length === 0 ? "[dsbot-session-create] loaded; the host services the read-back tools need were all present at load." : `[dsbot-session-create] loaded; at load MISSING for read-back: ${seenRead.join(", ")} (the tools re-check on every call)`);
+  console.log(seenMessage.length === 0 ? "[dsbot-session-create] loaded; the host services session_message needs were all present at load." : `[dsbot-session-create] loaded; at load MISSING for session_message: ${seenMessage.join(", ")} (the tool re-checks on every call)`);
+  console.log(seenOptions.length === 0 ? "[dsbot-session-create] loaded; the host services the session options need were all present at load." : `[dsbot-session-create] loaded; at load MISSING for session options: ${seenOptions.join(", ")} (create_session re-checks on every call)`);
   const register = services.tools?.register?.bind(services.tools);
   register?.(defineTool({
     name: "create_session",

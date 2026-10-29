@@ -1,5 +1,5 @@
 {
-  "name": "dsh-session-create",
+  "name": "dsbot-session-create",
   "version": "0.1.0",
   "description": "A DSH plugin that gives a Session the create_session tool: start a new Session in a named workspace or working folder and deliver one prompt into it.",
   "keywords": [

@@ -1018,7 +1018,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
   const now = deps.now ?? (() => Date.now())
   const setTimer = deps.setTimer ?? ((fn: () => void | Promise<void>, ms: number) => setTimeout(() => { void fn() }, ms))
   const clearTimer = deps.clearTimer ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>))
-  const log = deps.log ?? ((line: string) => console.warn(`[dsh-session-create] ${line}`))
+  const log = deps.log ?? ((line: string) => console.warn(`[dsbot-session-create] ${line}`))
 
   const pending = new Map<string, PendingQuiet>()
   // 同一实例内「这一段静默期已经投过」的会话。turn/start 时清掉：新一轮跑完允许再投一条。
@@ -1155,7 +1155,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
 export function installDispatchNotify(ctx: HostCtx, opts: { quietMs?: number; ledger?: string } = {}): DispatchNotifier | undefined {
   const on = ctx?.on
   if (typeof on !== 'function') {
-    console.warn('[dsh-session-create] this harness context has no `on`, so a Session that finishes cannot report back by itself; read_session_transcript still works.')
+    console.warn('[dsbot-session-create] this harness context has no `on`, so a Session that finishes cannot report back by itself; read_session_transcript still works.')
     return undefined
   }
   const notifier = createDispatchNotifier({ ...opts, controllerOf: () => resolveServices(ctx).sessionController })
