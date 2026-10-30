@@ -1,6 +1,6 @@
 {
   "name": "dsbot-session-create",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A DSH plugin that gives a Session four tools: create_session (open a new Session in a named workspace or existing folder and deliver one prompt into it), session_message (append a queued message to an existing Session), read_session_transcript, and list_dispatched_sessions.",
   "keywords": [
     "dsh-plugin",
