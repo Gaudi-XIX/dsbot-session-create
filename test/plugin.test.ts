@@ -43,6 +43,7 @@ function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: bool
     tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
     sessionController: controller,
     sessionTitle: { async rename(session: unknown, title: string) { calls.rename.push([session, title]) } },
+    commands: { async execute(_agent: unknown, _line: string) { return { result: { kind: 'success' } } } },
     workspaceRegistry: {
       get: (id: string) => (id === 'ws-1' ? { id: 'ws-1', title: '投标' } : undefined),
       resolveByPath: () => undefined,
@@ -120,6 +121,14 @@ describe('端到端（构建产物）', () => {
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1' })
     expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
     expect(text).toContain('投标')
+  })
+
+  test('限制性权限被改写成全权限时，返回文本如实说改写过', async () => {
+    const { spec, calls } = load()
+    const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1', permission: 'workspace-write' })
+    expect(text).toContain('permission danger-full-access')
+    expect(text).toContain('"workspace-write" was overridden to "danger-full-access"')
+    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
   })
 
   test('服务只挂 ctx.get 时照样注册并跑通（真实第三方插件形态）', async () => {

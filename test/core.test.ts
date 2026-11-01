@@ -382,18 +382,44 @@ describe('会话选项：agent preset 与权限模式', () => {
 
   test('permission 走 /permission 命令，在建会话之后、投提示词之前', async () => {
     const { ctx, calls } = fakeCtx(ws)
-    const result = await createSessionIn(ctx, { ...base, permission: 'read-only' })
+    const result = await createSessionIn(ctx, { ...base, permission: 'danger-full-access' })
     expect(calls.command).toHaveLength(1)
-    expect(calls.command[0][1]).toBe('/permission read-only')
+    expect(calls.command[0][1]).toBe('/permission danger-full-access')
     expect(calls.order).toEqual(['create', 'execute', 'prompt'])
-    expect(result.permission).toBe('read-only')
+    expect(result.permission).toBe('danger-full-access')
+    expect(result.permissionOverriddenFrom).toBeUndefined()
+  })
+
+  // 2026-11-01 守卫：read-only / workspace-write 的审批策略是 ask，派出去的会话没人应答就整轮卡死，
+  // 而且宿主没有给已存在会话提权的入口 —— 这两档一律改写成全权限，调用方原本要的值如实带出来。
+  test('read-only 与 workspace-write（含大小写与空白变体）被改写成 danger-full-access，原值带在 permissionOverriddenFrom 上', async () => {
+    for (const asked of ['read-only', 'workspace-write', 'READ-ONLY', ' Workspace-Write ']) {
+      const { ctx, calls } = fakeCtx(ws)
+      const result = await createSessionIn(ctx, { ...base, permission: asked })
+      expect(calls.command[0][1]).toBe('/permission danger-full-access')
+      expect(result.permission).toBe('danger-full-access')
+      expect(result.permissionOverriddenFrom).toBe(asked.trim())
+    }
+  })
+
+  test('环境开关 DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 时原值照发（要派只读探针时用）', async () => {
+    process.env.DSBOT_ALLOW_RESTRICTIVE_PERMISSION = '1'
+    try {
+      const { ctx, calls } = fakeCtx(ws)
+      const result = await createSessionIn(ctx, { ...base, permission: 'read-only' })
+      expect(calls.command[0][1]).toBe('/permission read-only')
+      expect(result.permission).toBe('read-only')
+      expect(result.permissionOverriddenFrom).toBeUndefined()
+    } finally {
+      delete process.env.DSBOT_ALLOW_RESTRICTIVE_PERMISSION
+    }
   })
 
   test('两项一起给：先 list、再 create（带 preset）、再 execute、最后 prompt', async () => {
     const { ctx, calls } = fakeCtx(ws)
-    const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'read-only' })
+    const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'danger-full-access' })
     expect(calls.order).toEqual(['list', 'create', 'execute', 'prompt'])
-    expect(result).toMatchObject({ preset: 'ptc', permission: 'read-only' })
+    expect(result).toMatchObject({ preset: 'ptc', permission: 'danger-full-access' })
   })
 
   test('命令返回 error → 归档、抛 options-failed 带宿主原文、提示词不投、台账留痕', async () => {
@@ -458,9 +484,9 @@ describe('会话选项：agent preset 与权限模式', () => {
       },
     }
     const ctx = { ...fakeCtx(ws).ctx, agentPresets: presets, commands } as HostCtx
-    const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'read-only' })
+    const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'danger-full-access' })
     expect(result.preset).toBe('ptc')
-    expect(commands.seen).toEqual(['/permission read-only'])
+    expect(commands.seen).toEqual(['/permission danger-full-access'])
   })
 
   test('设过的选项记进派送台账（没设的就不写字段）', async () => {
@@ -470,8 +496,10 @@ describe('会话选项：agent preset 与权限模式', () => {
     await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'read-only' }, { ledger })
     await createSessionIn(ctx, base, { ledger })
     const records = (await readFile(ledger, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
-    expect(records[0]).toMatchObject({ preset: 'ptc', permission: 'read-only' })
+    expect(records[0]).toMatchObject({ preset: 'ptc', permission: 'danger-full-access', permissionOverriddenFrom: 'read-only' })
     expect(records[1].preset).toBeUndefined()
+    expect(records[1].permission).toBeUndefined()
+    expect(records[1].permissionOverriddenFrom).toBeUndefined()
     await rm(dir, { recursive: true, force: true })
   })
 })

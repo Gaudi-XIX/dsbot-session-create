@@ -171,8 +171,8 @@ export type CreateArgs = {
   /** 会话的权限模式（宿主三档：read-only / workspace-write / danger-full-access）。 */
   permission?: string
 }
-/** 这一单用到的会话选项：preset 在建会话时写进 header；permission 是**请求值**（无回读）。 */
-export type SessionOptions = { preset?: string; permission?: string }
+/** 这一单用到的会话选项：preset 在建会话时写进 header；permission 是**实际下发值**（无回读）。 */
+export type SessionOptions = { preset?: string; permission?: string; permissionOverriddenFrom?: string }
 export type CreateResult = {
   sessionId: string
   title: string
@@ -180,8 +180,10 @@ export type CreateResult = {
   renamed: boolean
   /** 实际用的 agent 预设：建会话时写进 header，宿主不接受就是没建成。 */
   preset?: string
-  /** **请求**的权限模式。宿主没有回读通道证实它生效，所以这里只敢写「请求值」。 */
+  /** **实际下发**的权限模式。宿主没有回读通道证实它生效，所以这里只敢写「下发值」。 */
   permission?: string
+  /** 调用方原本请求、被守卫改写掉的权限档；没被改写就没有这个字段。 */
+  permissionOverriddenFrom?: string
   /** 台账写入失败时的原因；有值 = 会话已建但没记上 ID，调用方必须如实说出来。 */
   ledgerError?: string
   /** 台账路径（成功写入时给出），便于调用方事后自己去看。 */
@@ -208,12 +210,27 @@ export function validate(args: CreateArgs): { title: string; prompt: string; fol
 // 两个选项只是名字，合法值由宿主判定：名字集合会随宿主升级漂移，本插件硬编码白名单迟早误伤
 // （而且宿主的报错本身就带可用值 —— `/permission` 的 unknown preset 会列出 names）。
 // 这里只做「空串等于没给」的规整，不做猜测式校验。
+// 2026-11-01：宿主默认档一直是 danger-full-access，历史上所有低权限都来自调用方手写传参。
+// read-only / workspace-write 两档带 approval: ask，无人应答就整轮卡死，而且没有给已存在会话
+// 提权的入口（`/permission` 只在建会话时跑一次）。所以这里把这两档改写成全权限、并如实回报被改写；
+// 要放行只读探针，在宿主环境里设 DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1（大小写不敏感匹配）。
+const RESTRICTIVE_PERMISSIONS = ['read-only', 'workspace-write']
+const FULL_PERMISSION = 'danger-full-access'
+
 export function readOptions(args: CreateArgs): SessionOptions {
   const preset = args?.preset?.trim() || undefined
-  const permission = args?.permission?.trim() || undefined
+  const requested = args?.permission?.trim() || undefined
+  const overridden =
+    requested !== undefined &&
+    RESTRICTIVE_PERMISSIONS.includes(requested.toLowerCase()) &&
+    process.env.DSBOT_ALLOW_RESTRICTIVE_PERMISSION !== '1'
+      ? requested
+      : undefined
+  const permission = overridden === undefined ? requested : FULL_PERMISSION
   return {
     ...(preset === undefined ? {} : { preset }),
     ...(permission === undefined ? {} : { permission }),
+    ...(overridden === undefined ? {} : { permissionOverriddenFrom: overridden }),
   }
 }
 
@@ -346,7 +363,17 @@ async function applyPermission(
 // 出错那一单也要留痕：既不回 ID、又不记台账，事后谁都没法在会话列表里找到那个空会话。
 async function recordFailedDispatch(
   ledgerPath: string,
-  record: { sessionId: string; title: string; placement: string; promptHead: string; failure: string; preset?: string; dispatcherSessionId?: string },
+  record: {
+    sessionId: string
+    title: string
+    placement: string
+    promptHead: string
+    failure: string
+    preset?: string
+    permission?: string
+    permissionOverriddenFrom?: string
+    dispatcherSessionId?: string
+  },
 ): Promise<string | undefined> {
   try {
     await appendDispatch(ledgerPath, {
@@ -356,6 +383,10 @@ async function recordFailedDispatch(
       dispatchedAt: Date.now(),
       promptHead: record.promptHead,
       ...(record.preset === undefined ? {} : { preset: record.preset }),
+      ...(record.permission === undefined ? {} : { permission: record.permission }),
+      ...(record.permissionOverriddenFrom === undefined
+        ? {}
+        : { permissionOverriddenFrom: record.permissionOverriddenFrom }),
       ...(record.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: record.dispatcherSessionId }),
       failed: record.failure,
     })
@@ -427,6 +458,10 @@ export async function createSessionIn(
         promptHead: headOf(prompt, 200),
         failure,
         ...(preset === undefined ? {} : { preset }),
+        ...(options.permission === undefined ? {} : { permission: options.permission }),
+        ...(options.permissionOverriddenFrom === undefined
+          ? {}
+          : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
         ...(opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }),
       })
       const note = ledgerNote === undefined
@@ -439,6 +474,9 @@ export async function createSessionIn(
   const applied: SessionOptions = {
     ...(preset === undefined ? {} : { preset }),
     ...(options.permission === undefined ? {} : { permission: options.permission }),
+    ...(options.permissionOverriddenFrom === undefined
+      ? {}
+      : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
   }
 
   try {
@@ -474,6 +512,9 @@ export async function createSessionIn(
       promptHead: headOf(prompt, 200),
       ...(applied.preset === undefined ? {} : { preset: applied.preset }),
       ...(applied.permission === undefined ? {} : { permission: applied.permission }),
+      ...(applied.permissionOverriddenFrom === undefined
+        ? {}
+        : { permissionOverriddenFrom: applied.permissionOverriddenFrom }),
       ...(opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }),
     })
   } catch (error) {
@@ -511,8 +552,10 @@ export type DispatchRecord = {
   promptHead: string
   /** 派送时设过的 agent 预设（没设就不写）。 */
   preset?: string
-  /** 派送时请求的权限模式（没设就不写；宿主未回传生效值）。 */
+  /** 派送时实际下发的权限模式（没设就不写；宿主未回传生效值）。 */
   permission?: string
+  /** 调用方原本请求、被守卫改写掉的权限档（没被改写就不写）。 */
+  permissionOverriddenFrom?: string
   /** 这一单在建了会话之后失败了（归档不了时用它留痕，便于事后找到那个空会话）。 */
   failed?: string
   /**
