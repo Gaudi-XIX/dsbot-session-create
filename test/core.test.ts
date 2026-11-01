@@ -12,6 +12,8 @@ type Calls = {
   signals: (AbortSignal | undefined)[]
   list: unknown[]
   command: unknown[][]
+  /** auto 档写审批策略的调用：[[agent, policy]] */
+  approval: unknown[][]
   /** 三个会互相影响顺序的调用按实际发生次序记下来（preset 必须在第一轮之前设好）。 */
   order: string[]
 }
@@ -34,8 +36,17 @@ function fakeCtx(options: {
   commandResult?: unknown
   /** true = 宿主没有 agentPresets / commands 这两个服务 */
   noOptionServices?: boolean
+  /** true = 宿主没有 approval 服务（auto 档要用） */
+  noApprovalService?: boolean
+  /** session.append 抛这个错（测 auto 写策略的 fail-closed 归档路径） */
+  appendThrows?: Error
+  /**
+   * 宿主 permissionPresets 服务的形态：'with-auto'（缺省，模拟本机四档）／
+   * 'without-auto'（auto-review 没装或没启用，名单里没有 auto）／'absent'（服务根本取不到）。
+   */
+  autoPreset?: 'with-auto' | 'without-auto' | 'absent'
 } = {}) {
-  const calls: Calls = { create: [], prompt: [], rename: [], archive: [], signals: [], list: [], command: [], order: [] }
+  const calls: Calls = { create: [], prompt: [], rename: [], archive: [], signals: [], list: [], command: [], approval: [], order: [] }
   let notifyPromptStarted: (() => void) | undefined
   const promptStarted = new Promise<void>(resolve => { notifyPromptStarted = resolve })
   const services = {
@@ -61,7 +72,20 @@ function fakeCtx(options: {
         return true
       },
       async resolveAgent() {
-        return (options.resolveAgent ? options.resolveAgent() : { agent: { session: { id: 'sess-1' } } }) as never
+        return (options.resolveAgent
+          ? options.resolveAgent()
+          : {
+              agent: {
+                session: {
+                  id: 'sess-1',
+                  append(type: string, data: unknown) {
+                    calls.approval.push([type, data])
+                    calls.order.push('approval')
+                    if (options.appendThrows) throw options.appendThrows
+                  },
+                },
+              },
+            }) as never
       },
     },
     sessionTitle: {
@@ -94,6 +118,17 @@ function fakeCtx(options: {
               calls.order.push('execute')
               return options.commandResult ?? { commandId: 'cmd-1', result: { kind: 'success' } }
             },
+          },
+        }),
+    ...(options.noApprovalService ? {} : { approval: {} }),
+    ...(options.autoPreset === 'absent'
+      ? {}
+      : {
+          permissionPresets: {
+            names:
+              options.autoPreset === 'without-auto'
+                ? ['read-only', 'workspace-write', 'danger-full-access']
+                : ['read-only', 'workspace-write', 'danger-full-access', 'auto'],
           },
         }),
   }
@@ -310,7 +345,7 @@ describe('失败处置', () => {
   })
 
   test('改名失败不致命：如实标 renamed:false，提示词照投', async () => {
-    const { ctx, calls } = fakeCtx({ workspaces: { w: { id: 'w' } }, resolveAgent: () => ({ error: { message: 'unavailable' } }) })
+    const { ctx, calls } = fakeCtx({ workspaces: { w: { id: 'w' } }, noOptionServices: true, resolveAgent: () => ({ error: { message: 'unavailable' } }) })
     const result = await createSessionIn(ctx, { title: 't', prompt: 'p', workspace: 'w' })
     expect(result.renamed).toBe(false)
     expect(calls.rename).toHaveLength(0)
@@ -340,20 +375,25 @@ describe('会话选项：agent preset 与权限模式', () => {
   const base = { title: 't', prompt: 'p', workspace: 'w' }
   const ws = { workspaces: { w: { id: 'w' } } }
 
-  test('都不给 → 不碰这两个服务，create 也不带 agentPreset（老行为不变）', async () => {
+  test('都不给 → 缺省派单走 auto，但仍不碰 agentPresets、create 也不带 agentPreset', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, base)
     expect(calls.list).toHaveLength(0)
-    expect(calls.command).toHaveLength(0)
+    // 缺省档＝auto（2026-11-01 定）：多跑一次 /permission，再把策略压成 never。
+    expect(calls.command.map(c => c[1])).toEqual(['/permission auto'])
+    expect(calls.approval).toEqual([['approval/policy', { policy: 'never' }]])
     expect(calls.create[0].agentPreset).toBeUndefined()
     expect(result.preset).toBeUndefined()
+    expect(result.permission).toBe('auto')
+    expect(result.approvalPolicy).toBe('never')
+    expect(result.permissionNote).toBeUndefined()
   })
 
   test('preset 走 create 的 agentPreset 字段，且先查过宿主有没有这个预设', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc' })
     expect(calls.create[0]).toMatchObject({ workspaceId: 'w', agentPreset: 'ptc' })
-    expect(calls.order).toEqual(['list', 'create', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'execute', 'approval', 'prompt'])
     expect(result.preset).toBe('ptc')
   })
 
@@ -420,6 +460,48 @@ describe('会话选项：agent preset 与权限模式', () => {
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'danger-full-access' })
     expect(calls.order).toEqual(['list', 'create', 'execute', 'prompt'])
     expect(result).toMatchObject({ preset: 'ptc', permission: 'danger-full-access' })
+  })
+
+  // 2026-11-01 auto 档：宿主 auto 预设的审批策略被官方写死成 ask，派出去的会话没人应答，
+  // auto reviewer 的 deny 就变成「等一个永远不会来的答复」——整晚卡死。这里压成 never：
+  // deny 直接终结为拒绝，不弹审批窗。依据 dsh-experimental-auto-review/lib/index.js:479-483。
+  test('auto 档：/permission auto 之后把审批策略压成 never，并回报 approvalPolicy', async () => {
+    const { ctx, calls } = fakeCtx(ws)
+    const result = await createSessionIn(ctx, { ...base, permission: 'auto' })
+    expect(calls.command[0][1]).toBe('/permission auto')
+    expect(calls.approval).toEqual([['approval/policy', { policy: 'never' }]])
+    expect(calls.order).toEqual(['create', 'execute', 'approval', 'prompt'])
+    expect(result.permission).toBe('auto')
+    expect(result.approvalPolicy).toBe('never')
+    expect(result.permissionOverriddenFrom).toBeUndefined()
+  })
+
+  test('非 auto 档一概不碰审批策略（不影响别的设定）', async () => {
+    for (const p of ['danger-full-access', 'read-only', 'workspace-write']) {
+      const { ctx, calls } = fakeCtx(ws)
+      const result = await createSessionIn(ctx, { ...base, permission: p })
+      expect(calls.approval).toHaveLength(0)
+      expect(result.approvalPolicy).toBeUndefined()
+    }
+  })
+
+  test('auto 但宿主没有审批层 → 建会话之前就报错，不建会话', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, noApprovalService: true })
+    const error = (await createSessionIn(ctx, { ...base, permission: 'auto' }).catch(e => e)) as SessionCreateError
+    expect(error.code).toBe('host-missing')
+    expect(calls.create).toHaveLength(0)
+  })
+
+  test('auto 但写审批策略失败 → 归档、抛 options-failed、提示词不投', async () => {
+    const dir = await tempFolder()
+    const ledger = join(dir, 'ledger.jsonl')
+    const { ctx, calls } = fakeCtx({ ...ws, appendThrows: new Error('append nope') })
+    const error = (await createSessionIn(ctx, { ...base, permission: 'auto' }, { ledger }).catch(e => e)) as SessionCreateError
+    expect(error.code).toBe('options-failed')
+    expect(error.message).toContain('append nope')
+    expect(calls.archive).toHaveLength(1)
+    expect(calls.prompt).toHaveLength(0)
+    await rm(dir, { recursive: true, force: true })
   })
 
   test('命令返回 error → 归档、抛 options-failed 带宿主原文、提示词不投、台账留痕', async () => {
@@ -489,6 +571,45 @@ describe('会话选项：agent preset 与权限模式', () => {
     expect(commands.seen).toEqual(['/permission danger-full-access'])
   })
 
+  // 缺省档的三态探测（2026-11-01 加）：用户要「派单一律 auto」，但别人机器上可能没有 auto 档、
+  // 或者 auto-review 集成没启用。以下五条锁住「问到就用、问不到就降级并如实说明、显式要才失败」。
+  test('缺省档：名单里没有 auto → 退回 danger-full-access 并如实说明', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'without-auto' })
+    const result = await createSessionIn(ctx, base)
+    expect(result.permission).toBe('danger-full-access')
+    expect(result.approvalPolicy).toBeUndefined()
+    expect(result.permissionNote).toContain('no `auto` permission preset')
+    expect(calls.approval).toHaveLength(0)
+  })
+
+  test('缺省档：名单根本取不到 → 也退回 danger-full-access，不猜', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'absent' })
+    const result = await createSessionIn(ctx, base)
+    expect(result.permission).toBe('danger-full-access')
+    expect(result.permissionNote).toContain('does not expose its permission presets')
+    expect(calls.command.map(c => c[1])).toEqual(['/permission danger-full-access'])
+  })
+
+  test('缺省档：有 auto 但没有审批服务 → 不选 auto（会卡在审查弹窗），退回全权限', async () => {
+    const { ctx } = fakeCtx({ ...ws, noApprovalService: true })
+    const result = await createSessionIn(ctx, base)
+    expect(result.permission).toBe('danger-full-access')
+    expect(result.permissionNote).toContain('no approval service')
+  })
+
+  test('显式要 auto 但名单明确没有 → host-missing，且根本不建会话', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'without-auto' })
+    await expect(createSessionIn(ctx, { ...base, permission: 'auto' })).rejects.toMatchObject({ code: 'host-missing' })
+    expect(calls.create).toHaveLength(0)
+  })
+
+  test('显式要 auto 而名单取不到 → 不预先否决，照旧下发（宿主的 /permission 才是权威）', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'absent' })
+    const result = await createSessionIn(ctx, { ...base, permission: 'auto' })
+    expect(result.permission).toBe('auto')
+    expect(calls.command.map(c => c[1])).toEqual(['/permission auto'])
+  })
+
   test('设过的选项记进派送台账（没设的就不写字段）', async () => {
     const dir = await tempFolder()
     const ledger = join(dir, 'ledger.jsonl')
@@ -498,7 +619,8 @@ describe('会话选项：agent preset 与权限模式', () => {
     const records = (await readFile(ledger, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     expect(records[0]).toMatchObject({ preset: 'ptc', permission: 'danger-full-access', permissionOverriddenFrom: 'read-only' })
     expect(records[1].preset).toBeUndefined()
-    expect(records[1].permission).toBeUndefined()
+    expect(records[1].permission).toBe('auto')
+    expect(records[1].approvalPolicy).toBe('never')
     expect(records[1].permissionOverriddenFrom).toBeUndefined()
     await rm(dir, { recursive: true, force: true })
   })

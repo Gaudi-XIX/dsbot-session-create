@@ -161,7 +161,7 @@ export function apply(ctx: HostCtx): void {
         workspace: { type: 'string', description: 'A DSH workspace: its id, or its exact folder path. Give this or `folder`, not both.' },
         folder: { type: 'string', description: 'Full path of a folder that exists. The Session works there and joins no DSH workspace. Give this or `workspace`, not both.' },
         preset: { type: 'string', description: 'Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default.' },
-        permission: { type: 'string', description: 'Permission mode for the new Session, set with the host\'s own `/permission` command before the prompt: `read-only`, `workspace-write`, or `danger-full-access`. Any other name is refused by the host, which lists the valid ones. Omit for the host default. `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.' },
+        permission: { type: 'string', description: 'Permission mode for the new Session, set with the host\'s own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit to dispatch at `auto` (the default: the host auto reviewer checks every tool call, and a denied call is refused outright). `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session\'s approval policy to `never`: the host\'s auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness has no `auto` preset at all (auto review off or not installed), an omitted permission falls back to `danger-full-access` and the result says so, while an explicit `auto` fails and starts nothing.' },
       },
       output,
       async execute(args: CreateArgs, exec?: unknown) {
@@ -180,12 +180,14 @@ export function apply(ctx: HostCtx): void {
           const overrideNote = result.permissionOverriddenFrom === undefined
             ? ''
             : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`
+          const permissionNote = result.permissionNote === undefined ? '' : `NOTE: ${result.permissionNote}`
           return [
             `Started a new Session in ${result.placement}.`,
             `- title: ${result.title}${renameNote}`,
             `- session id: ${result.sessionId}`,
             ...(options.length === 0 ? [] : [`- options: ${options.join(' · ')} (permission is what was requested; the Session itself is the record)`]),
             ...(overrideNote === '' ? [] : [overrideNote]),
+            ...(permissionNote === '' ? [] : [permissionNote]),
             'The prompt is queued in the Session.',
             ledgerNote,
           ].join('\n')

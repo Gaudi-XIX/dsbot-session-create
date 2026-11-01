@@ -38,7 +38,9 @@ function resolveServices(ctx) {
     sessionTitle: pickService(ctx, "sessionTitle"),
     workspaceRegistry: pickService(ctx, "workspaceRegistry"),
     agentPresets: pickService(ctx, "agentPresets"),
-    commands: pickService(ctx, "commands")
+    commands: pickService(ctx, "commands"),
+    approval: pickService(ctx, "approval"),
+    permissionPresets: pickService(ctx, "permissionPresets")
   };
 }
 function safeGet(ctx, name) {
@@ -113,6 +115,39 @@ function validate(args) {
 }
 var RESTRICTIVE_PERMISSIONS = ["read-only", "workspace-write"];
 var FULL_PERMISSION = "danger-full-access";
+var AUTO_PERMISSION = "auto";
+var AUTO_APPROVAL_POLICY = "never";
+function autoPresetState(ctx) {
+  const names = ctx.permissionPresets?.names;
+  if (!Array.isArray(names))
+    return "unknown";
+  return names.some((name) => String(name).trim().toLowerCase() === AUTO_PERMISSION) ? "yes" : "no";
+}
+function resolveDefaultPermission(ctx, options) {
+  const state = autoPresetState(ctx);
+  if (options.permission !== undefined) {
+    if (options.permission.toLowerCase() === AUTO_PERMISSION && state === "no") {
+      throw new SessionCreateError("host-missing", "this harness lists no `auto` permission preset (auto review is off or not installed); no Session was made.");
+    }
+    return;
+  }
+  if (typeof ctx.commands?.execute !== "function") {
+    return "this harness has no commands.execute, so no permission preset was set; the Session runs at the host default.";
+  }
+  if (state === "yes" && ctx.approval === undefined) {
+    options.permission = FULL_PERMISSION;
+    return 'this harness lists an `auto` permission preset but exposes no approval service, so an `auto` dispatch there could stall on a review prompt; the Session was opened at "' + FULL_PERMISSION + '" instead.';
+  }
+  if (state === "yes") {
+    options.permission = AUTO_PERMISSION;
+    return;
+  }
+  options.permission = FULL_PERMISSION;
+  if (state === "no") {
+    return 'this harness lists no `auto` permission preset (auto review is off or not installed), so the Session was opened at "' + FULL_PERMISSION + '".';
+  }
+  return 'this harness does not expose its permission presets, so the `auto` default could not be confirmed; the Session was opened at "' + FULL_PERMISSION + '".';
+}
 function readOptions(args) {
   const preset = args?.preset?.trim() || undefined;
   const requested = args?.permission?.trim() || undefined;
@@ -215,6 +250,19 @@ async function applyPermission(ctx, controller, sessionId, permission, signal, t
   if (!verdict.ok) {
     throw new SessionCreateError("options-failed", `the host refused the permission "${permission}": ${verdict.reason}`);
   }
+  return agent;
+}
+async function applyDenyOnly(agent) {
+  const session = agent?.session;
+  if (typeof session?.append !== "function") {
+    throw new SessionCreateError("host-missing", "this harness exposes no session.append, so an `auto` dispatch cannot be made deny-only.");
+  }
+  try {
+    session.append("approval/policy", { policy: AUTO_APPROVAL_POLICY });
+  } catch (error) {
+    throw new SessionCreateError("options-failed", `the Session was made but its approval policy could not be set to "${AUTO_APPROVAL_POLICY}" (${reasonOf(error)}).`);
+  }
+  return AUTO_APPROVAL_POLICY;
 }
 async function recordFailedDispatch(ledgerPath, record) {
   try {
@@ -242,9 +290,13 @@ async function createSessionIn(ctx, args, opts = {}) {
   }
   const { title, prompt, folder, workspace } = validate(args);
   const options = readOptions(args);
+  const permissionNote = resolveDefaultPermission(ctx, options);
   const preset = options.preset === undefined ? undefined : await resolvePreset(ctx, options.preset);
   if (options.permission !== undefined && typeof ctx.commands?.execute !== "function") {
     throw new SessionCreateError("host-missing", "this harness has no commands.execute, so `permission` could not be applied. No Session was made.");
+  }
+  if (options.permission === AUTO_PERMISSION && ctx.approval === undefined) {
+    throw new SessionCreateError("host-missing", "this harness has no approval service, so an `auto` dispatch cannot be made deny-only. No Session was made.");
   }
   const { placement, text } = await resolvePlacement(ctx, folder, workspace);
   const controller = ctx.sessionController;
@@ -264,9 +316,12 @@ async function createSessionIn(ctx, args, opts = {}) {
   } catch {
     renamed = false;
   }
+  let approvalPolicy;
   if (options.permission !== undefined) {
     try {
-      await applyPermission(ctx, controller, sessionId, options.permission, opts.signal, opts.timeoutMs);
+      const agent = await applyPermission(ctx, controller, sessionId, options.permission, opts.signal, opts.timeoutMs);
+      if (options.permission === AUTO_PERMISSION)
+        approvalPolicy = await applyDenyOnly(agent);
     } catch (error) {
       const archived = await archiveQuietly(ctx, sessionId);
       const tail = archived.ok ? `the Session ${sessionId} was archived.` : `the Session ${sessionId} may still be in the session list (archiving it failed: ${archived.reason}).`;
@@ -290,7 +345,8 @@ async function createSessionIn(ctx, args, opts = {}) {
   const applied = {
     ...preset === undefined ? {} : { preset },
     ...options.permission === undefined ? {} : { permission: options.permission },
-    ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom }
+    ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom },
+    ...approvalPolicy === undefined ? {} : { approvalPolicy }
   };
   try {
     await controller.prompt?.({
@@ -316,12 +372,22 @@ async function createSessionIn(ctx, args, opts = {}) {
       ...applied.preset === undefined ? {} : { preset: applied.preset },
       ...applied.permission === undefined ? {} : { permission: applied.permission },
       ...applied.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: applied.permissionOverriddenFrom },
+      ...applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy },
       ...opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }
     });
   } catch (error) {
     ledgerError = error instanceof Error ? error.message : String(error);
   }
-  return { sessionId, title, placement: text, renamed, ...applied, ledgerPath, ...ledgerError === undefined ? {} : { ledgerError } };
+  return {
+    sessionId,
+    title,
+    placement: text,
+    renamed,
+    ...applied,
+    ledgerPath,
+    ...permissionNote === undefined ? {} : { permissionNote },
+    ...ledgerError === undefined ? {} : { ledgerError }
+  };
 }
 var LEDGER_FILE = "dispatched-sessions.jsonl";
 function defaultLedgerPath(env = process.env, home = homedir()) {
@@ -1077,7 +1143,7 @@ function apply(ctx) {
       workspace: { type: "string", description: "A DSH workspace: its id, or its exact folder path. Give this or `folder`, not both." },
       folder: { type: "string", description: "Full path of a folder that exists. The Session works there and joins no DSH workspace. Give this or `workspace`, not both." },
       preset: { type: "string", description: "Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default." },
-      permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, or `danger-full-access`. Any other name is refused by the host, which lists the valid ones. Omit for the host default. `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one." }
+      permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit to dispatch at `auto` (the default: the host auto reviewer checks every tool call, and a denied call is refused outright). `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session's approval policy to `never`: the host's auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness has no `auto` preset at all (auto review off or not installed), an omitted permission falls back to `danger-full-access` and the result says so, while an explicit `auto` fails and starts nothing." }
     },
     output,
     async execute(args, exec) {
@@ -1090,12 +1156,14 @@ function apply(ctx) {
           result.permission === undefined ? "" : `permission ${result.permission}`
         ].filter((part) => part !== "");
         const overrideNote = result.permissionOverriddenFrom === undefined ? "" : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`;
+        const permissionNote = result.permissionNote === undefined ? "" : `NOTE: ${result.permissionNote}`;
         return [
           `Started a new Session in ${result.placement}.`,
           `- title: ${result.title}${renameNote}`,
           `- session id: ${result.sessionId}`,
           ...options.length === 0 ? [] : [`- options: ${options.join(" · ")} (permission is what was requested; the Session itself is the record)`],
           ...overrideNote === "" ? [] : [overrideNote],
+          ...permissionNote === "" ? [] : [permissionNote],
           "The prompt is queued in the Session.",
           ledgerNote
         ].join(`

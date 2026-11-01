@@ -75,12 +75,27 @@ export type HostCtx = {
   commands?: {
     execute?: (agent: unknown, line: string, attachments: unknown[], signal: AbortSignal) => Promise<unknown>
   }
+  // 审批层（2026-11-01 加）：只用来在建会话之前判断宿主有没有审批服务，**不用它写入**。
+  // auto 档要写的那条 `approval/policy` 事件走 `resolved.agent.session.append`——理由见 applyDenyOnly。
+  approval?: unknown
+  // 权限档名单（2026-11-01 加）：只读 `names`，用来判断宿主此刻有没有 `auto` 档。
+  // 宿主没装或没启用 auto-review 集成时，这个名单里不会出现 auto（permission-presets 只在
+  // 它自己的 autoAdmit 有值时才把 auto 列进 names），拿它探测比猜版本号可靠。
+  permissionPresets?: { names?: unknown }
 }
 
 // 把宿主 ctx 上的四个服务取出来：先直接取属性，取不到再走 ctx.get。
 // 直接取属性在真实宿主里可能对「未 inject 的服务」抛错，故两边都包 try —— 一律降级成 undefined，
 // 交给 preflight 报出「缺了哪一个」，而不是让异常穿透到插件树。
-type ServiceName = 'tools' | 'sessionController' | 'sessionTitle' | 'workspaceRegistry' | 'agentPresets' | 'commands'
+type ServiceName =
+  | 'tools'
+  | 'sessionController'
+  | 'sessionTitle'
+  | 'workspaceRegistry'
+  | 'agentPresets'
+  | 'commands'
+  | 'approval'
+  | 'permissionPresets'
 
 function pickService<T>(ctx: HostCtx, name: ServiceName): T | undefined {
   try {
@@ -105,6 +120,8 @@ export function resolveServices(ctx: HostCtx): HostCtx {
     workspaceRegistry: pickService(ctx, 'workspaceRegistry'),
     agentPresets: pickService(ctx, 'agentPresets'),
     commands: pickService(ctx, 'commands'),
+    approval: pickService(ctx, 'approval'),
+    permissionPresets: pickService(ctx, 'permissionPresets'),
   }
 }
 
@@ -172,7 +189,13 @@ export type CreateArgs = {
   permission?: string
 }
 /** 这一单用到的会话选项：preset 在建会话时写进 header；permission 是**实际下发值**（无回读）。 */
-export type SessionOptions = { preset?: string; permission?: string; permissionOverriddenFrom?: string }
+export type SessionOptions = {
+  preset?: string
+  permission?: string
+  permissionOverriddenFrom?: string
+  /** auto 档额外压下去的审批策略（目前只有 `never`）；其它档没有这个字段。 */
+  approvalPolicy?: string
+}
 export type CreateResult = {
   sessionId: string
   title: string
@@ -184,6 +207,10 @@ export type CreateResult = {
   permission?: string
   /** 调用方原本请求、被守卫改写掉的权限档；没被改写就没有这个字段。 */
   permissionOverriddenFrom?: string
+  /** auto 档压下去的审批策略（`never`）：auto reviewer 判 deny 时直接拒绝、不弹审批窗。 */
+  approvalPolicy?: string
+  /** 权限档被降级或没设时的如实说明：有值 = 结果不是调用方可能以为的那个档。 */
+  permissionNote?: string
   /** 台账写入失败时的原因；有值 = 会话已建但没记上 ID，调用方必须如实说出来。 */
   ledgerError?: string
   /** 台账路径（成功写入时给出），便于调用方事后自己去看。 */
@@ -216,6 +243,69 @@ export function validate(args: CreateArgs): { title: string; prompt: string; fol
 // 要放行只读探针，在宿主环境里设 DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1（大小写不敏感匹配）。
 const RESTRICTIVE_PERMISSIONS = ['read-only', 'workspace-write']
 const FULL_PERMISSION = 'danger-full-access'
+// auto 档由宿主 auto-review 插件审查每一次工具调用。它自带的审批策略是 `ask`，派单会话无人值守，
+// 于是 reviewer 的 deny 会变成「等一个永远不会来的答复」——整晚卡死（2026-10-29 实测事故）。
+// 本插件对 auto 档额外把审批策略写成 `never`：deny 直接终结为拒绝，不再弹窗。
+export const AUTO_PERMISSION = 'auto'
+const AUTO_APPROVAL_POLICY = 'never'
+
+// 宿主此刻有没有 `auto` 档——三态，不能压成布尔：
+//   'yes'     名单里有；
+//   'no'      名单读得到、但里面没有（auto-review 没装或没启用）；
+//   'unknown' 名单根本读不到（老宿主、别的客户端、服务没 inject）。
+// 压成两态会踩两种坑：把 unknown 当 no，显式要 auto 的调用会在取不到服务时被硬拒（功能等于没装）；
+// 把 unknown 当 yes，缺省派单会在没有 auto 的宿主上失败。
+function autoPresetState(ctx: HostCtx): 'yes' | 'no' | 'unknown' {
+  const names = ctx.permissionPresets?.names
+  if (!Array.isArray(names)) return 'unknown'
+  return names.some((name) => String(name).trim().toLowerCase() === AUTO_PERMISSION) ? 'yes' : 'no'
+}
+
+/**
+ * 定这一单的权限档。缺省档＝auto（2026-10-29 2026-11-01 13:19 口述「我倒是想写成派单也一律 auto，
+ * 但是我怕有些人没有这个 auto。或者有这个 auto，但是他没把插件打开」——他要的是一律 auto，但别人机器上
+ * 没有 auto 时不能炸）。
+ *
+ * 所以缺省值不写死成 auto：现场问一次宿主拿名单（auto 由宿主 auto-review 集成注册，没装或没启用时
+ * 名单里不出现这个名字），问到什么用什么，问不到就退回全权限，并把降级原因如实写进结果——
+ * 降级要看得见，不能悄悄换了档还说一切正常。
+ *
+ * 调用方显式要 auto 时不降级：名单明确没有就整单失败、不建会话。名单读不到则照旧下发，让宿主的
+ * `/permission` 自己去判认不认这个名字（那里才是权威）。
+ *
+ * @returns 需要写进结果的一句说明（缺省档被降级、或没有命令服务所以没设档）；正常情况返回 undefined。
+ */
+function resolveDefaultPermission(ctx: HostCtx, options: SessionOptions): string | undefined {
+  const state = autoPresetState(ctx)
+  if (options.permission !== undefined) {
+    if (options.permission.toLowerCase() === AUTO_PERMISSION && state === 'no') {
+      throw new SessionCreateError(
+        'host-missing',
+        'this harness lists no `auto` permission preset (auto review is off or not installed); no Session was made.',
+      )
+    }
+    return undefined
+  }
+  // 没有命令服务就设不了档：保持不传，吃宿主默认（本机默认就是全权限）。这条与 preflightOptions
+  // 的约定一致——会话选项是可选能力，缺了不该拦住「不传参的派活」。
+  if (typeof ctx.commands?.execute !== 'function') {
+    return 'this harness has no commands.execute, so no permission preset was set; the Session runs at the host default.'
+  }
+  if (state === 'yes' && ctx.approval === undefined) {
+    // 有 auto 档但没有审批层：压不成 never，auto 的 deny 会变成等一个永远不来的答复。
+    options.permission = FULL_PERMISSION
+    return 'this harness lists an `auto` permission preset but exposes no approval service, so an `auto` dispatch there could stall on a review prompt; the Session was opened at "' + FULL_PERMISSION + '" instead.'
+  }
+  if (state === 'yes') {
+    options.permission = AUTO_PERMISSION
+    return undefined
+  }
+  options.permission = FULL_PERMISSION
+  if (state === 'no') {
+    return 'this harness lists no `auto` permission preset (auto review is off or not installed), so the Session was opened at "' + FULL_PERMISSION + '".'
+  }
+  return 'this harness does not expose its permission presets, so the `auto` default could not be confirmed; the Session was opened at "' + FULL_PERMISSION + '".'
+}
 
 export function readOptions(args: CreateArgs): SessionOptions {
   const preset = args?.preset?.trim() || undefined
@@ -339,7 +429,7 @@ async function applyPermission(
   permission: string,
   signal?: AbortSignal,
   timeoutMs?: number,
-): Promise<void> {
+): Promise<unknown> {
   const commands = ctx.commands
   if (typeof commands?.execute !== 'function') {
     throw new SessionCreateError('host-missing', 'this harness has no commands.execute, so `permission` was not applied.')
@@ -358,6 +448,44 @@ async function applyPermission(
   if (!verdict.ok) {
     throw new SessionCreateError('options-failed', `the host refused the permission "${permission}": ${verdict.reason}`)
   }
+  // 把 agent 交回调用方：紧接着的 auto 审批策略要写在同一支 agent 上，不再解析一遍。
+  return agent
+}
+
+// auto 档的第二步：把审批策略压成 `never`，让 auto reviewer 判 deny 时直接终结为拒绝、不弹审批窗。
+// 只对 auto 档调用；其它档（宿主默认 danger-full-access 本就写 never）一概不碰，满足「不影响别的设定」。
+//
+// 为什么直接写会话事件、不走 ApprovalService.setPolicy：那个方法除了写 `approval/policy`，还会往会话里
+// inject 一条「The approval policy changed from X to Y (changed by the user)」的 user 消息
+// （app.asar 内 dsh-user-approval/lib/index.js:98-110）。这里正是「会话刚建好、还没有任何可见策略」的
+// 初始化场景，宿主自己初始化会话时也是直接调底层的 setApprovalPolicy(session, policy)
+// （同文件 :63-66，注释写明 "Session initialization uses setApprovalPolicy directly"）。
+//
+// 边界说清楚：这一步只保证「本步不额外注入一条假消息」。上一步 `/permission auto` 自己走的是
+// permission-presets 的 apply → approval.setPolicy，auto 档自带的 approval 是 `ask`、而新会话种子档
+// 是 `never`，所以那一步必然已写一条 ask 并注入一句「changed from "never" to "ask"」
+// （permission-presets/lib/index.js:222-224、:357，AUTO_PRESET_SPEC 见 :58-61）。
+// 结果：会话日志里 ask 在前、never 在后，overrideOf 取最后一条 = never，功能正确；
+// 但会话首步会看到一条声称 ask 的 user 消息，读 transcript 时要知道这条是机制产物。
+//
+// 失败一律 fail-closed：调用方在同一处归档会话并报错 —— 让会话带着 ask 活下去，等于埋一颗整晚卡死的雷。
+async function applyDenyOnly(agent: unknown): Promise<string> {
+  const session = (agent as { session?: { append?: unknown } } | undefined)?.session
+  if (typeof session?.append !== 'function') {
+    throw new SessionCreateError(
+      'host-missing',
+      'this harness exposes no session.append, so an `auto` dispatch cannot be made deny-only.',
+    )
+  }
+  try {
+    ;(session.append as (type: string, data: unknown) => unknown)('approval/policy', { policy: AUTO_APPROVAL_POLICY })
+  } catch (error) {
+    throw new SessionCreateError(
+      'options-failed',
+      `the Session was made but its approval policy could not be set to "${AUTO_APPROVAL_POLICY}" (${reasonOf(error)}).`,
+    )
+  }
+  return AUTO_APPROVAL_POLICY
 }
 
 // 出错那一单也要留痕：既不回 ID、又不记台账，事后谁都没法在会话列表里找到那个空会话。
@@ -409,6 +537,8 @@ export async function createSessionIn(
   }
   const { title, prompt, folder, workspace } = validate(args)
   const options = readOptions(args)
+  // 缺省档的判定要在建会话之前做完：它决定这一单到底用 auto 还是全权限，也决定要不要 approval 服务。
+  const permissionNote = resolveDefaultPermission(ctx, options)
   // preset 在建会话之前就要定好：它写进会话 header，会话一开跑就不能再换。
   // 名字错、预设坏了都在这拦下，不建会话（比建完再归档干净）。
   const preset = options.preset === undefined ? undefined : await resolvePreset(ctx, options.preset)
@@ -416,6 +546,13 @@ export async function createSessionIn(
   // 只能建完再归档，白留一个空会话。
   if (options.permission !== undefined && typeof ctx.commands?.execute !== 'function') {
     throw new SessionCreateError('host-missing', 'this harness has no commands.execute, so `permission` could not be applied. No Session was made.')
+  }
+  // auto 档还要求 approval 服务：缺了就在建会话之前拦下，别建完再归档白留一个空会话。
+  if (options.permission === AUTO_PERMISSION && ctx.approval === undefined) {
+    throw new SessionCreateError(
+      'host-missing',
+      'this harness has no approval service, so an `auto` dispatch cannot be made deny-only. No Session was made.',
+    )
   }
   const { placement, text } = await resolvePlacement(ctx, folder, workspace)
 
@@ -441,9 +578,12 @@ export async function createSessionIn(
 
   // 权限必须在投提示词之前设好（会话一开跑，用户看到的默认档就已经定了）。
   // 设不成就整单失败并归档 —— 让用户在错档下干活，比不派这一单更糟。
+  let approvalPolicy: string | undefined
   if (options.permission !== undefined) {
     try {
-      await applyPermission(ctx, controller, sessionId, options.permission, opts.signal, opts.timeoutMs)
+      const agent = await applyPermission(ctx, controller, sessionId, options.permission, opts.signal, opts.timeoutMs)
+      // auto 档必须在 /permission 之后紧跟一步：`/permission auto` 自己会把策略写成 ask，这一步把它压回 never。
+      if (options.permission === AUTO_PERMISSION) approvalPolicy = await applyDenyOnly(agent)
     } catch (error) {
       const archived = await archiveQuietly(ctx, sessionId)
       const tail = archived.ok
@@ -477,6 +617,7 @@ export async function createSessionIn(
     ...(options.permissionOverriddenFrom === undefined
       ? {}
       : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
+    ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
   }
 
   try {
@@ -515,13 +656,23 @@ export async function createSessionIn(
       ...(applied.permissionOverriddenFrom === undefined
         ? {}
         : { permissionOverriddenFrom: applied.permissionOverriddenFrom }),
+      ...(applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy }),
       ...(opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }),
     })
   } catch (error) {
     ledgerError = error instanceof Error ? error.message : String(error)
   }
 
-  return { sessionId, title, placement: text, renamed, ...applied, ledgerPath, ...(ledgerError === undefined ? {} : { ledgerError }) }
+  return {
+    sessionId,
+    title,
+    placement: text,
+    renamed,
+    ...applied,
+    ledgerPath,
+    ...(permissionNote === undefined ? {} : { permissionNote }),
+    ...(ledgerError === undefined ? {} : { ledgerError }),
+  }
 }
 
 // ---------------------------------------------------------------------------
