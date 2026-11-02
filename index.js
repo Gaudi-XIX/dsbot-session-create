@@ -150,11 +150,13 @@ function resolveDefaultPermission(ctx, options) {
 }
 function readOptions(args) {
   const preset = args?.preset?.trim() || undefined;
+  const model = args?.model?.trim() || undefined;
   const requested = args?.permission?.trim() || undefined;
   const overridden = requested !== undefined && RESTRICTIVE_PERMISSIONS.includes(requested.toLowerCase()) && process.env.DSBOT_ALLOW_RESTRICTIVE_PERMISSION !== "1" ? requested : undefined;
   const permission = overridden === undefined ? requested : FULL_PERMISSION;
   return {
     ...preset === undefined ? {} : { preset },
+    ...model === undefined ? {} : { model },
     ...permission === undefined ? {} : { permission },
     ...overridden === undefined ? {} : { permissionOverriddenFrom: overridden }
   };
@@ -283,29 +285,35 @@ async function recordFailedDispatch(ledgerPath, record) {
     return error instanceof Error ? error.message : String(error);
   }
 }
-var FALLBACK_MODEL = { provider: "magpie-gateway", model: "group/pool", reasoningEffort: "high" };
 async function dispatcherModelRef(controller, dispatcherSessionId) {
   if (dispatcherSessionId === undefined)
-    return { ...FALLBACK_MODEL };
+    return;
   try {
     const resolved = await controller.resolveAgent?.(dispatcherSessionId);
     if (!resolved || "error" in resolved || !resolved.agent)
-      return { ...FALLBACK_MODEL };
+      return;
     const session = resolved.agent.session;
     const config = session?.requestHeader?.()?.config;
     if (config === undefined || typeof config.provider !== "string" || typeof config.model !== "string") {
-      return { ...FALLBACK_MODEL };
+      return;
     }
-    if (config.provider !== FALLBACK_MODEL.provider)
-      return { ...FALLBACK_MODEL };
     return {
       provider: config.provider,
       model: config.model,
       ...config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }
     };
   } catch {
-    return { ...FALLBACK_MODEL };
+    return;
   }
+}
+function parseModelRef(ref) {
+  const cut = ref.indexOf("/");
+  const provider = cut === -1 ? "" : ref.slice(0, cut).trim();
+  const model = cut === -1 ? "" : ref.slice(cut + 1).trim();
+  if (provider === "" || model === "") {
+    throw new SessionCreateError("model-invalid", `"${ref}" is not a model written as "provider/model"; no Session was made.`);
+  }
+  return { provider, model };
 }
 async function createSessionIn(ctx, args, opts = {}) {
   const missing = preflight(ctx);
@@ -324,6 +332,11 @@ async function createSessionIn(ctx, args, opts = {}) {
   }
   const { placement, text } = await resolvePlacement(ctx, folder, workspace);
   const controller = ctx.sessionController;
+  const explicit = options.model === undefined ? undefined : parseModelRef(options.model);
+  const pinned = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit;
+  if (pinned === undefined) {
+    throw new SessionCreateError("dispatcher-model-unknown", `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? "" : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`);
+  }
   const created = await controller.create?.({ ...placement, ...preset === undefined ? {} : { agentPreset: preset } });
   const sessionId = created?.sessionId;
   if (typeof sessionId !== "string" || sessionId === "") {
@@ -340,7 +353,6 @@ async function createSessionIn(ctx, args, opts = {}) {
   } catch {
     renamed = false;
   }
-  const pinned = await dispatcherModelRef(controller, opts.dispatcherSessionId);
   const model = `${pinned.provider}/${pinned.model}`;
   let modelNote;
   try {
@@ -1103,6 +1115,7 @@ var CREATE_DESCRIPTION = [
   "Give exactly one of `workspace` (a workspace id, or its exact folder path) or `folder` (any existing folder).",
   "A `folder` Session joins no DSH workspace, so the user's project list stays as it is; a `workspace` Session shows up under that workspace.",
   "Optionally set the Session's agent preset (`preset`) and permission mode (`permission`) before it starts; leave them out for the host default.",
+  "The Session's model is pinned explicitly and is never the host's global default: it is the model the dispatching Bot's own Session runs on, unless `model` names another one as `provider/model`. If neither can be read, no Session is started.",
   "The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.",
   "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot."
 ].join(" ") + `
@@ -1192,7 +1205,8 @@ function apply(ctx) {
       workspace: { type: "string", description: "A DSH workspace: its id, or its exact folder path. Give this or `folder`, not both." },
       folder: { type: "string", description: "Full path of a folder that exists. The Session works there and joins no DSH workspace. Give this or `workspace`, not both." },
       preset: { type: "string", description: "Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default." },
-      permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit to dispatch at `auto` (the default: the host auto reviewer checks every tool call, and a denied call is refused outright). `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session's approval policy to `never`: the host's auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness has no `auto` preset at all (auto review off or not installed), an omitted permission falls back to `danger-full-access` and the result says so, while an explicit `auto` fails and starts nothing." }
+      permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit to dispatch at `auto` (the default: the host auto reviewer checks every tool call, and a denied call is refused outright). `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session's approval policy to `never`: the host's auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness has no `auto` preset at all (auto review off or not installed), an omitted permission falls back to `danger-full-access` and the result says so, while an explicit `auto` fails and starts nothing." },
+      model: { type: "string", description: "Model for the new Session, written `provider/model`. Omit it and the Session is pinned to the model the dispatching Bot's own Session runs on — never the host's global default. A string without one slash, or with an empty side, is refused and no Session is made." }
     },
     output,
     async execute(args, exec) {

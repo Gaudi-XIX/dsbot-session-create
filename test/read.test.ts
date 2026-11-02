@@ -247,11 +247,11 @@ describe('台账', () => {
         ...services.sessionController,
         async create() { return { sessionId: 'sess-77' } },
         async prompt() { return true },
-        async resolveAgent() { return { agent: { session: { seq: 0 } } } },
+        async resolveAgent() { return { agent: { session: { seq: 0, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) } } } },
       }
       services.sessionTitle = { async rename() { return undefined } }
       services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w' }), async archiveSession() { return undefined } }
-      const result = await createSessionIn(services, { title: '派送一单', prompt: '把结果写出来', workspace: 'w' }, { ledger, signal: new AbortController().signal })
+      const result = await createSessionIn(services, { title: '派送一单', prompt: '把结果写出来', workspace: 'w' }, { ledger, signal: new AbortController().signal, dispatcherSessionId: 'session-bot-1' })
       expect(result.sessionId).toBe('sess-77')
       expect(result.ledgerError).toBeUndefined()
       const records = await readLedger(ledger)
@@ -269,7 +269,7 @@ describe('台账', () => {
       ...services.sessionController,
       async create() { return { sessionId: 'sess-88' } },
       async prompt() { return true },
-      async resolveAgent() { return { agent: { session: { seq: 0 } } } },
+      async resolveAgent() { return { agent: { session: { seq: 0, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) } } } },
     }
     services.sessionTitle = { async rename() { return undefined } }
     services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w' }), async archiveSession() { return undefined } }
@@ -278,7 +278,7 @@ describe('台账', () => {
       // 把台账路径指到一个「父级是文件」的位置，mkdir 必失败。
       const blocker = join(dir, 'blocker')
       await writeFile(blocker, 'x', 'utf8')
-      const result = await createSessionIn(services, { title: 't', prompt: 'p', workspace: 'w' }, { ledger: join(blocker, 'l.jsonl'), signal: new AbortController().signal })
+      const result = await createSessionIn(services, { title: 't', prompt: 'p', workspace: 'w' }, { ledger: join(blocker, 'l.jsonl'), signal: new AbortController().signal, dispatcherSessionId: 'session-bot-1' })
       expect(result.sessionId).toBe('sess-88')
       expect(result.ledgerError).toBeTruthy()
     } finally {

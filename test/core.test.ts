@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SessionCreateError, createSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type HostCtx, type WorkspaceEntry } from '../src/core'
+import { SessionCreateError, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type HostCtx, type WorkspaceEntry } from '../src/core'
 
 type Calls = {
   create: Record<string, unknown>[]
@@ -20,6 +20,16 @@ type Calls = {
   order: string[]
 }
 
+/** 派活人会话缺省的模型（免费池）；用例要考「与派活人一致」就自己传 dispatcherHeader。 */
+const DISPATCHER_HEADER = { provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' }
+/** 派活人会话 id：生产路径上它来自工具执行上下文，永远有值。 */
+const DISPATCHER_ID = 'session-bot-1'
+
+// create_session 只从一个正在跑的 Bot 会话里调，所以这个前置在生产路径上必然成立；
+// 这里统一补上它，用例只在要考它的时候自己传第三次参数。
+const createSessionIn: typeof coreCreateSessionIn = (ctx, args, opts = {}) =>
+  coreCreateSessionIn(ctx, args, { dispatcherSessionId: DISPATCHER_ID, ...opts })
+
 function fakeCtx(options: {
   createResult?: { sessionId?: string }
   promptThrows?: Error
@@ -27,7 +37,7 @@ function fakeCtx(options: {
   promptWaitsForAbort?: boolean
   archiveThrows?: Error
   renameThrows?: Error
-  resolveAgent?: () => unknown
+  resolveAgent?: (id?: string) => unknown
   workspaces?: Record<string, WorkspaceEntry>
   paths?: Record<string, WorkspaceEntry>
   /** true = 服务只挂在 ctx.get 上，不直接挂在 ctx 属性上（模拟真实宿主的宽容路径） */
@@ -47,8 +57,10 @@ function fakeCtx(options: {
    * 'without-auto'（auto-review 没装或没启用，名单里没有 auto）／'absent'（服务根本取不到）。
    */
   autoPreset?: 'with-auto' | 'without-auto' | 'absent'
-  /** 派活人会话的 request/header.config：测「与派任务的 bot 模型一致」用；缺省 = 读不到 */
+  /** 派活人会话的 request/header.config：测「与派任务的 bot 模型一致」用；缺省给一个免费池模型 */
   dispatcherHeader?: { provider?: string; model?: string; reasoningEffort?: string }
+  /** true = 派活人会话读不到请求头（测「读不到就不建会话」） */
+  dispatcherHeaderUnreadable?: boolean
   /** 宿主没有 selectModel（测「钉模型这重保护没生效时如实报出」） */
   noSelectModel?: boolean
   /** selectModel 抛这个错 */
@@ -79,9 +91,9 @@ function fakeCtx(options: {
         }
         return true
       },
-      async resolveAgent() {
+      async resolveAgent(id?: string) {
         return (options.resolveAgent
-          ? options.resolveAgent()
+          ? options.resolveAgent(id)
           : {
               agent: {
                 session: {
@@ -91,9 +103,9 @@ function fakeCtx(options: {
                     calls.order.push('approval')
                     if (options.appendThrows) throw options.appendThrows
                   },
-                  ...(options.dispatcherHeader === undefined
+                  ...(options.dispatcherHeaderUnreadable === true
                     ? {}
-                    : { requestHeader: () => ({ config: options.dispatcherHeader }) }),
+                    : { requestHeader: () => ({ config: options.dispatcherHeader ?? DISPATCHER_HEADER }) }),
                 },
               },
             }) as never
@@ -366,7 +378,15 @@ describe('失败处置', () => {
   })
 
   test('改名失败不致命：如实标 renamed:false，提示词照投', async () => {
-    const { ctx, calls } = fakeCtx({ workspaces: { w: { id: 'w' } }, noOptionServices: true, resolveAgent: () => ({ error: { message: 'unavailable' } }) })
+    // 派活人会话（拿模型用）读得到，被派出去那条会话（改名用）读不到 —— 只让改名这一环失败。
+    const { ctx, calls } = fakeCtx({
+      workspaces: { w: { id: 'w' } },
+      noOptionServices: true,
+      resolveAgent: (id?: string) =>
+        id === DISPATCHER_ID
+          ? { agent: { session: { id, requestHeader: () => ({ config: DISPATCHER_HEADER }) } } }
+          : { error: { message: 'unavailable' } },
+    })
     const result = await createSessionIn(ctx, { title: 't', prompt: 'p', workspace: 'w' })
     expect(result.renamed).toBe(false)
     expect(calls.rename).toHaveLength(0)
@@ -647,41 +667,69 @@ describe('会话选项：agent preset 与权限模式', () => {
   })
 })
 
-// 派出去的会话必须显式钉死模型（2026-11-02 加，用户 m00097「不能默认，而是指定模型，或者说与派任务的 bot 模型一致」）。
+// 派出去的会话必须显式钉死模型（2026-11-02 加，用户 m00097「不能默认，而是指定模型，或者说与派任务的 bot 模型一致」；
+// 同日 m00211 追加「不能固定这个名字…应该绑定分任务的 BOT 的模型」）。
 // 背景：宿主 create 只转传 sessionId/cwd/agentPreset/reusable，**不转传 model**，新会话于是落到「全局默认模型」；
 // 2026-11-01 该默认一度是按量付费的 deepseek-account/deepseek-flash，派出去的会话因此替用户烧了真钱。
-// 判据：派出去时与派活人（bot）实际用的模型一致；读不到、或不是免费池（magpie-gateway）→ 一律回落免费池。
-describe('派出去的会话必须钉死模型（不许落到全局默认）', () => {
+// 判据：取值＝派活人（bot）正在用的模型，或调用方显式给的 `provider/model`；两者都没有就不建会话。
+// **不写死任何模型名**——provider 或组一改名，写死的兜底会静默失效，等于这条绑定不存在。
+describe('派出去的会话钉死模型（跟派任务的 bot，或有显式指定；不许落到全局默认）', () => {
   const base = { title: 't', prompt: 'p', workspace: 'w' }
   const ws = { workspaces: { w: { id: 'w' } } }
 
-  test('不给派活人 → 钉到免费池，结果里写明用的模型、且无告警', async () => {
+  test('拿不到派活人会话 id → 整单失败，不建会话、不投提示词', async () => {
     const { ctx, calls } = fakeCtx(ws)
+    const error = await createSessionIn(ctx, base, { dispatcherSessionId: undefined }).catch(e => e)
+    expect(error).toBeInstanceOf(SessionCreateError)
+    expect(error.code).toBe('dispatcher-model-unknown')
+    expect(calls.create).toEqual([])
+    expect(calls.prompt).toEqual([])
+  })
+
+  test('读不到派活人的请求头 → 同样不建会话', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeaderUnreadable: true })
+    const error = await createSessionIn(ctx, base).catch(e => e)
+    expect(error).toBeInstanceOf(SessionCreateError)
+    expect(error.code).toBe('dispatcher-model-unknown')
+    expect(calls.create).toEqual([])
+  })
+
+  test('与派活人一致：它跑什么模型，新会话就钉什么（thinking 档也跟随）', async () => {
+    const { ctx, calls } = fakeCtx({
+      ...ws,
+      dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality', reasoningEffort: 'medium' },
+    })
     const result = await createSessionIn(ctx, base)
-    expect(calls.selectModel).toEqual([
-      { sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' },
-    ])
-    expect(result.model).toBe('magpie-gateway/group/pool')
-    expect(result.modelNote).toBeUndefined()
-  })
-
-  test('给了派活人且它用免费池 → 与派活人一致', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality' } })
-    const result = await createSessionIn(ctx, base, { dispatcherSessionId: 'session-bot-1' })
-    expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/high-quality' })
-    expect(result.model).toBe('magpie-gateway/group/high-quality')
-  })
-
-  test('派活人用的是按量付费 provider → 一律回落免费池，绝不透传', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'deepseek-account', model: 'deepseek-flash' } })
-    const result = await createSessionIn(ctx, base, { dispatcherSessionId: 'session-bot-1' })
     expect(calls.selectModel[0]).toEqual({
       sessionId: 'sess-1',
       provider: 'magpie-gateway',
-      model: 'group/pool',
-      reasoningEffort: 'high',
+      model: 'group/high-quality',
+      reasoningEffort: 'medium',
     })
+    expect(result.model).toBe('magpie-gateway/group/high-quality')
+    expect(result.modelNote).toBeUndefined()
+  })
+
+  test('派活人的模型或 provider 改了名也跟随：不写死名字、不按 provider 过滤', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'some-other-gateway', model: 'pool/x' } })
+    const result = await createSessionIn(ctx, base)
+    expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'some-other-gateway', model: 'pool/x' })
+    expect(result.model).toBe('some-other-gateway/pool/x')
+  })
+
+  test('显式给 model → 用它，不去读派活人', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality' } })
+    const result = await createSessionIn(ctx, { ...base, model: 'magpie-gateway/group/pool' })
+    expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/pool' })
     expect(result.model).toBe('magpie-gateway/group/pool')
+  })
+
+  test('model 写错（没有斜杠／缺半边）→ 整单失败，不建会话', async () => {
+    const { ctx, calls } = fakeCtx(ws)
+    const error = await createSessionIn(ctx, { ...base, model: 'group-pool' }).catch(e => e)
+    expect(error).toBeInstanceOf(SessionCreateError)
+    expect(error.code).toBe('model-invalid')
+    expect(calls.create).toEqual([])
   })
 
   test('钉模型必须发生在投提示词之前', async () => {

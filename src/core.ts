@@ -192,6 +192,8 @@ export type CreateArgs = {
   preset?: string
   /** 会话的权限模式（宿主三档：read-only / workspace-write / danger-full-access）。 */
   permission?: string
+  /** 显式指定新会话的模型，`provider/model`。不写它就与派活的那个 Bot 一致。**不写死任何模型名**。 */
+  model?: string
 }
 /** 这一单用到的会话选项：preset 在建会话时写进 header；permission 是**实际下发值**（无回读）。 */
 export type SessionOptions = {
@@ -320,6 +322,7 @@ function resolveDefaultPermission(ctx: HostCtx, options: SessionOptions): string
 
 export function readOptions(args: CreateArgs): SessionOptions {
   const preset = args?.preset?.trim() || undefined
+  const model = args?.model?.trim() || undefined
   const requested = args?.permission?.trim() || undefined
   const overridden =
     requested !== undefined &&
@@ -330,6 +333,7 @@ export function readOptions(args: CreateArgs): SessionOptions {
   const permission = overridden === undefined ? requested : FULL_PERMISSION
   return {
     ...(preset === undefined ? {} : { preset }),
+    ...(model === undefined ? {} : { model }),
     ...(permission === undefined ? {} : { permission }),
     ...(overridden === undefined ? {} : { permissionOverriddenFrom: overridden }),
   }
@@ -535,38 +539,47 @@ async function recordFailedDispatch(
   }
 }
 
-// 派出去会话的模型钉死值：先与派活人（bot）实际用的模型一致，读不到或不是免费池就回落免费池。
-// 为什么必须钉：宿主 create 只转传 sessionId/cwd/agentPreset/reusable，**不转传 model**
-// （dsh-api-session-controller/lib 的 create → agents.createSession），新会话于是落到
-// 「全局默认模型」。2026-11-01 全局默认一度是 deepseek-account/deepseek-flash（按量付费），
-// 派出去的会话因此替用户烧了真钱。故这里显式取值，绝不把付费模型透传给派出去的会话。
-export const FALLBACK_MODEL = { provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' } as const
-
+// 派出去会话的模型：**与派活的那个 Bot 一致**，取它自己会话正在用的模型（requestHeader().config）。
+// 不取全局默认：宿主 create 只转传 sessionId/cwd/agentPreset/reusable，**不转传 model**
+// （dsh-api-session-controller/lib 的 create → agents.createSession），不钉就落到
+// 「全局默认模型」——2026-11-01 它一度是按量付费的 deepseek-account/deepseek-flash，
+// 派出去的会话因此替用户烧了真钱。
+// 不写任何模型名做兜底：写死一个名字，provider 或组一改名，这条绑定就静默失效
+// （2026-11-02 用户口径）。读不到派活人的模型就不建会话，让调用方把话说清。
 async function dispatcherModelRef(
   controller: NonNullable<HostCtx['sessionController']>,
   dispatcherSessionId: string | undefined,
-): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
-  if (dispatcherSessionId === undefined) return { ...FALLBACK_MODEL }
+): Promise<{ provider: string; model: string; reasoningEffort?: string } | undefined> {
+  if (dispatcherSessionId === undefined) return undefined
   try {
     const resolved = await controller.resolveAgent?.(dispatcherSessionId)
-    if (!resolved || 'error' in resolved || !resolved.agent) return { ...FALLBACK_MODEL }
+    if (!resolved || 'error' in resolved || !resolved.agent) return undefined
     const session = resolved.agent.session as
       | { requestHeader?: () => { config?: { provider?: string; model?: string; reasoningEffort?: string } } | undefined }
       | undefined
     const config = session?.requestHeader?.()?.config
     if (config === undefined || typeof config.provider !== 'string' || typeof config.model !== 'string') {
-      return { ...FALLBACK_MODEL }
+      return undefined
     }
-    // 只有免费池（magpie-gateway）才允许沿用；其它 provider（尤其是按量付费的）一律回落到免费池。
-    if (config.provider !== FALLBACK_MODEL.provider) return { ...FALLBACK_MODEL }
     return {
       provider: config.provider,
       model: config.model,
       ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }),
     }
   } catch {
-    return { ...FALLBACK_MODEL }
+    return undefined
   }
+}
+
+// 显式给的模型 `provider/model`：只认一段斜杠、两边都要有字。写错了就是写错了，不猜、不补默认。
+export function parseModelRef(ref: string): { provider: string; model: string } {
+  const cut = ref.indexOf('/')
+  const provider = cut === -1 ? '' : ref.slice(0, cut).trim()
+  const model = cut === -1 ? '' : ref.slice(cut + 1).trim()
+  if (provider === '' || model === '') {
+    throw new SessionCreateError('model-invalid', `"${ref}" is not a model written as "provider/model"; no Session was made.`)
+  }
+  return { provider, model }
 }
 
 export async function createSessionIn(
@@ -602,6 +615,18 @@ export async function createSessionIn(
   const { placement, text } = await resolvePlacement(ctx, folder, workspace)
 
   const controller = ctx.sessionController as NonNullable<HostCtx['sessionController']>
+
+  // 模型必须在**建会话之前**定下来：显式给的用显式值，否则用派活那个 Bot 正在用的模型。
+  // 两者都没有就整单不建——宁可失败，也不留一条会落到宿主全局默认模型上的会话
+  //（那正是 2026-11-01 烧钱的那条路）。这两条取值里没有任何写死的模型名。
+  const explicit = options.model === undefined ? undefined : parseModelRef(options.model)
+  const pinned = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit
+  if (pinned === undefined) {
+    throw new SessionCreateError(
+      'dispatcher-model-unknown',
+      `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? '' : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`,
+    )
+  }
   const created = await controller.create?.({ ...placement, ...(preset === undefined ? {} : { agentPreset: preset }) })
   const sessionId = created?.sessionId
   if (typeof sessionId !== 'string' || sessionId === '') {
@@ -621,9 +646,7 @@ export async function createSessionIn(
     renamed = false
   }
 
-  // 钉死模型（必须在投提示词之前）：见 dispatcherModelRef 的说明——宿主 create 不转传 model，
-  // 新会话否则会落到全局默认模型（曾一度是按量付费的 deepseek-account/deepseek-flash）。
-  const pinned = await dispatcherModelRef(controller, opts.dispatcherSessionId)
+  // 钉死模型（必须在投提示词之前；取值已在建会话之前解析好，读不到就不建这一单）。
   const model = `${pinned.provider}/${pinned.model}`
   let modelNote: string | undefined
   try {
