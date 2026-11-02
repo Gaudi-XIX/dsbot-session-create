@@ -14,6 +14,8 @@ type Calls = {
   command: unknown[][]
   /** auto 档写审批策略的调用：[[agent, policy]] */
   approval: unknown[][]
+  /** 钉死派出去会话模型的调用（宿主 selectModel） */
+  selectModel: Record<string, unknown>[]
   /** 三个会互相影响顺序的调用按实际发生次序记下来（preset 必须在第一轮之前设好）。 */
   order: string[]
 }
@@ -45,8 +47,14 @@ function fakeCtx(options: {
    * 'without-auto'（auto-review 没装或没启用，名单里没有 auto）／'absent'（服务根本取不到）。
    */
   autoPreset?: 'with-auto' | 'without-auto' | 'absent'
+  /** 派活人会话的 request/header.config：测「与派任务的 bot 模型一致」用；缺省 = 读不到 */
+  dispatcherHeader?: { provider?: string; model?: string; reasoningEffort?: string }
+  /** 宿主没有 selectModel（测「钉模型这重保护没生效时如实报出」） */
+  noSelectModel?: boolean
+  /** selectModel 抛这个错 */
+  selectModelThrows?: Error
 } = {}) {
-  const calls: Calls = { create: [], prompt: [], rename: [], archive: [], signals: [], list: [], command: [], approval: [], order: [] }
+  const calls: Calls = { create: [], prompt: [], rename: [], archive: [], signals: [], list: [], command: [], approval: [], selectModel: [], order: [] }
   let notifyPromptStarted: (() => void) | undefined
   const promptStarted = new Promise<void>(resolve => { notifyPromptStarted = resolve })
   const services = {
@@ -83,10 +91,23 @@ function fakeCtx(options: {
                     calls.order.push('approval')
                     if (options.appendThrows) throw options.appendThrows
                   },
+                  ...(options.dispatcherHeader === undefined
+                    ? {}
+                    : { requestHeader: () => ({ config: options.dispatcherHeader }) }),
                 },
               },
             }) as never
       },
+      ...(options.noSelectModel
+        ? {}
+        : {
+            async selectModel(o: Record<string, unknown>) {
+              calls.selectModel.push(o)
+              calls.order.push('selectModel')
+              if (options.selectModelThrows) throw options.selectModelThrows
+              return undefined
+            },
+          }),
     },
     sessionTitle: {
       async rename(session: unknown, title: string) {
@@ -393,7 +414,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc' })
     expect(calls.create[0]).toMatchObject({ workspaceId: 'w', agentPreset: 'ptc' })
-    expect(calls.order).toEqual(['list', 'create', 'execute', 'approval', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'approval', 'prompt'])
     expect(result.preset).toBe('ptc')
   })
 
@@ -425,7 +446,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const result = await createSessionIn(ctx, { ...base, permission: 'danger-full-access' })
     expect(calls.command).toHaveLength(1)
     expect(calls.command[0][1]).toBe('/permission danger-full-access')
-    expect(calls.order).toEqual(['create', 'execute', 'prompt'])
+    expect(calls.order).toEqual(['create', 'selectModel', 'execute', 'prompt'])
     expect(result.permission).toBe('danger-full-access')
     expect(result.permissionOverriddenFrom).toBeUndefined()
   })
@@ -458,7 +479,7 @@ describe('会话选项：agent preset 与权限模式', () => {
   test('两项一起给：先 list、再 create（带 preset）、再 execute、最后 prompt', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'danger-full-access' })
-    expect(calls.order).toEqual(['list', 'create', 'execute', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'prompt'])
     expect(result).toMatchObject({ preset: 'ptc', permission: 'danger-full-access' })
   })
 
@@ -470,7 +491,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const result = await createSessionIn(ctx, { ...base, permission: 'auto' })
     expect(calls.command[0][1]).toBe('/permission auto')
     expect(calls.approval).toEqual([['approval/policy', { policy: 'never' }]])
-    expect(calls.order).toEqual(['create', 'execute', 'approval', 'prompt'])
+    expect(calls.order).toEqual(['create', 'selectModel', 'execute', 'approval', 'prompt'])
     expect(result.permission).toBe('auto')
     expect(result.approvalPolicy).toBe('never')
     expect(result.permissionOverriddenFrom).toBeUndefined()
@@ -623,5 +644,63 @@ describe('会话选项：agent preset 与权限模式', () => {
     expect(records[1].approvalPolicy).toBe('never')
     expect(records[1].permissionOverriddenFrom).toBeUndefined()
     await rm(dir, { recursive: true, force: true })
+  })
+})
+
+// 派出去的会话必须显式钉死模型（2026-11-02 加，用户 m00097「不能默认，而是指定模型，或者说与派任务的 bot 模型一致」）。
+// 背景：宿主 create 只转传 sessionId/cwd/agentPreset/reusable，**不转传 model**，新会话于是落到「全局默认模型」；
+// 2026-11-01 该默认一度是按量付费的 deepseek-account/deepseek-flash，派出去的会话因此替用户烧了真钱。
+// 判据：派出去时与派活人（bot）实际用的模型一致；读不到、或不是免费池（magpie-gateway）→ 一律回落免费池。
+describe('派出去的会话必须钉死模型（不许落到全局默认）', () => {
+  const base = { title: 't', prompt: 'p', workspace: 'w' }
+  const ws = { workspaces: { w: { id: 'w' } } }
+
+  test('不给派活人 → 钉到免费池，结果里写明用的模型、且无告警', async () => {
+    const { ctx, calls } = fakeCtx(ws)
+    const result = await createSessionIn(ctx, base)
+    expect(calls.selectModel).toEqual([
+      { sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' },
+    ])
+    expect(result.model).toBe('magpie-gateway/group/pool')
+    expect(result.modelNote).toBeUndefined()
+  })
+
+  test('给了派活人且它用免费池 → 与派活人一致', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality' } })
+    const result = await createSessionIn(ctx, base, { dispatcherSessionId: 'session-bot-1' })
+    expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/high-quality' })
+    expect(result.model).toBe('magpie-gateway/group/high-quality')
+  })
+
+  test('派活人用的是按量付费 provider → 一律回落免费池，绝不透传', async () => {
+    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'deepseek-account', model: 'deepseek-flash' } })
+    const result = await createSessionIn(ctx, base, { dispatcherSessionId: 'session-bot-1' })
+    expect(calls.selectModel[0]).toEqual({
+      sessionId: 'sess-1',
+      provider: 'magpie-gateway',
+      model: 'group/pool',
+      reasoningEffort: 'high',
+    })
+    expect(result.model).toBe('magpie-gateway/group/pool')
+  })
+
+  test('钉模型必须发生在投提示词之前', async () => {
+    const { ctx, calls } = fakeCtx(ws)
+    await createSessionIn(ctx, base)
+    expect(calls.order.indexOf('selectModel')).toBeLessThan(calls.order.indexOf('prompt'))
+  })
+
+  test('宿主没有 selectModel → 会话照建，但如实报出这一重保护没生效', async () => {
+    const { ctx } = fakeCtx({ ...ws, noSelectModel: true })
+    const result = await createSessionIn(ctx, base)
+    expect(result.sessionId).toBe('sess-1')
+    expect(result.modelNote).toContain('NOT pinned')
+  })
+
+  test('selectModel 抛错 → 会话照建，但如实报出原因', async () => {
+    const { ctx } = fakeCtx({ ...ws, selectModelThrows: new Error('model unavailable') })
+    const result = await createSessionIn(ctx, base)
+    expect(result.sessionId).toBe('sess-1')
+    expect(result.modelNote).toContain('model unavailable')
   })
 })

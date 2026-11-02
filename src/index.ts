@@ -176,11 +176,13 @@ export function apply(ctx: HostCtx): void {
           const options = [
             result.preset === undefined ? '' : `preset ${result.preset}`,
             result.permission === undefined ? '' : `permission ${result.permission}`,
+            result.model === undefined ? '' : `model ${result.model}`,
           ].filter(part => part !== '')
           const overrideNote = result.permissionOverriddenFrom === undefined
             ? ''
             : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`
           const permissionNote = result.permissionNote === undefined ? '' : `NOTE: ${result.permissionNote}`
+          const modelNote = result.modelNote === undefined ? '' : `NOTE: ${result.modelNote}`
           return [
             `Started a new Session in ${result.placement}.`,
             `- title: ${result.title}${renameNote}`,
@@ -188,6 +190,7 @@ export function apply(ctx: HostCtx): void {
             ...(options.length === 0 ? [] : [`- options: ${options.join(' · ')} (permission is what was requested; the Session itself is the record)`]),
             ...(overrideNote === '' ? [] : [overrideNote]),
             ...(permissionNote === '' ? [] : [permissionNote]),
+            ...(modelNote === '' ? [] : [modelNote]),
             'The prompt is queued in the Session.',
             ledgerNote,
           ].join('\n')

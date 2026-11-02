@@ -283,6 +283,30 @@ async function recordFailedDispatch(ledgerPath, record) {
     return error instanceof Error ? error.message : String(error);
   }
 }
+var FALLBACK_MODEL = { provider: "magpie-gateway", model: "group/pool", reasoningEffort: "high" };
+async function dispatcherModelRef(controller, dispatcherSessionId) {
+  if (dispatcherSessionId === undefined)
+    return { ...FALLBACK_MODEL };
+  try {
+    const resolved = await controller.resolveAgent?.(dispatcherSessionId);
+    if (!resolved || "error" in resolved || !resolved.agent)
+      return { ...FALLBACK_MODEL };
+    const session = resolved.agent.session;
+    const config = session?.requestHeader?.()?.config;
+    if (config === undefined || typeof config.provider !== "string" || typeof config.model !== "string") {
+      return { ...FALLBACK_MODEL };
+    }
+    if (config.provider !== FALLBACK_MODEL.provider)
+      return { ...FALLBACK_MODEL };
+    return {
+      provider: config.provider,
+      model: config.model,
+      ...config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }
+    };
+  } catch {
+    return { ...FALLBACK_MODEL };
+  }
+}
 async function createSessionIn(ctx, args, opts = {}) {
   const missing = preflight(ctx);
   if (missing.length > 0) {
@@ -316,6 +340,21 @@ async function createSessionIn(ctx, args, opts = {}) {
   } catch {
     renamed = false;
   }
+  const pinned = await dispatcherModelRef(controller, opts.dispatcherSessionId);
+  const model = `${pinned.provider}/${pinned.model}`;
+  let modelNote;
+  try {
+    if (controller.selectModel === undefined)
+      throw new Error("the host exposes no selectModel");
+    await controller.selectModel({
+      sessionId,
+      provider: pinned.provider,
+      model: pinned.model,
+      ...pinned.reasoningEffort === undefined ? {} : { reasoningEffort: pinned.reasoningEffort }
+    });
+  } catch (error) {
+    modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`;
+  }
   let approvalPolicy;
   if (options.permission !== undefined) {
     try {
@@ -346,7 +385,8 @@ async function createSessionIn(ctx, args, opts = {}) {
     ...preset === undefined ? {} : { preset },
     ...options.permission === undefined ? {} : { permission: options.permission },
     ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom },
-    ...approvalPolicy === undefined ? {} : { approvalPolicy }
+    ...approvalPolicy === undefined ? {} : { approvalPolicy },
+    model
   };
   try {
     await controller.prompt?.({
@@ -386,6 +426,7 @@ async function createSessionIn(ctx, args, opts = {}) {
     ...applied,
     ledgerPath,
     ...permissionNote === undefined ? {} : { permissionNote },
+    ...modelNote === undefined ? {} : { modelNote },
     ...ledgerError === undefined ? {} : { ledgerError }
   };
 }
@@ -1153,10 +1194,12 @@ function apply(ctx) {
         const ledgerNote = result.ledgerError === undefined ? `Recorded in the dispatch ledger (${result.ledgerPath}); read_session_transcript collects its result later.` : `WARNING: the Session is running, but recording it in the dispatch ledger failed (${result.ledgerError}) — keep this session id by hand.`;
         const options = [
           result.preset === undefined ? "" : `preset ${result.preset}`,
-          result.permission === undefined ? "" : `permission ${result.permission}`
+          result.permission === undefined ? "" : `permission ${result.permission}`,
+          result.model === undefined ? "" : `model ${result.model}`
         ].filter((part) => part !== "");
         const overrideNote = result.permissionOverriddenFrom === undefined ? "" : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`;
         const permissionNote = result.permissionNote === undefined ? "" : `NOTE: ${result.permissionNote}`;
+        const modelNote = result.modelNote === undefined ? "" : `NOTE: ${result.modelNote}`;
         return [
           `Started a new Session in ${result.placement}.`,
           `- title: ${result.title}${renameNote}`,
@@ -1164,6 +1207,7 @@ function apply(ctx) {
           ...options.length === 0 ? [] : [`- options: ${options.join(" · ")} (permission is what was requested; the Session itself is the record)`],
           ...overrideNote === "" ? [] : [overrideNote],
           ...permissionNote === "" ? [] : [permissionNote],
+          ...modelNote === "" ? [] : [modelNote],
           "The prompt is queued in the Session.",
           ledgerNote
         ].join(`

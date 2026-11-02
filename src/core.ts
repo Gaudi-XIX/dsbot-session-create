@@ -51,6 +51,11 @@ export type HostCtx = {
     create?: (options: Record<string, unknown>) => Promise<{ sessionId?: string }>
     prompt?: (options: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>
     resolveAgent?: (sessionId: string) => Promise<ResolvedAgent>
+    // 钉死派出去会话的模型用：宿主 create 不转传 model，新会话会落到「全局默认模型」，
+    // 全局默认一度被切成按量付费的 deepseek-account/deepseek-flash，于是派出去的会话替用户烧额度。
+    // 用 selectModel 显式钉死到派活人（bot）实际用的模型；它同时会把「全局默认」也写成这个值
+    // （本机 bot 用的就是免费池，副作用是把全局默认稳在免费池，不引入付费风险）。
+    selectModel?: (request: { sessionId: string; provider: string; model: string; reasoningEffort?: string }) => Promise<unknown>
     // 读回通道：ds-bot 0.2.2 有两处生产调用（parts.js:1287、chat-index.js:58），
     // 且都是不带可选链的直接调用 —— 本宿主里它存在。本插件仍按未验处理，缺了就报错。
     page?: (options: Record<string, unknown>, signal?: AbortSignal) => Promise<SessionPage | undefined>
@@ -195,6 +200,8 @@ export type SessionOptions = {
   permissionOverriddenFrom?: string
   /** auto 档额外压下去的审批策略（目前只有 `never`）；其它档没有这个字段。 */
   approvalPolicy?: string
+  /** 显式钉死给这个会话的模型（`provider/model`）。不写它，新会话会落到宿主的「全局默认模型」。 */
+  model?: string
 }
 export type CreateResult = {
   sessionId: string
@@ -209,6 +216,10 @@ export type CreateResult = {
   permissionOverriddenFrom?: string
   /** auto 档压下去的审批策略（`never`）：auto reviewer 判 deny 时直接拒绝、不弹审批窗。 */
   approvalPolicy?: string
+  /** 显式钉死给这个会话的模型（`provider/model`）；派出去的会话不再落到宿主全局默认。 */
+  model?: string
+  /** 模型钉死失败或发生回落时的如实说明：有值 = 这一重保护没按预期生效。 */
+  modelNote?: string
   /** 权限档被降级或没设时的如实说明：有值 = 结果不是调用方可能以为的那个档。 */
   permissionNote?: string
   /** 台账写入失败时的原因；有值 = 会话已建但没记上 ID，调用方必须如实说出来。 */
@@ -524,6 +535,40 @@ async function recordFailedDispatch(
   }
 }
 
+// 派出去会话的模型钉死值：先与派活人（bot）实际用的模型一致，读不到或不是免费池就回落免费池。
+// 为什么必须钉：宿主 create 只转传 sessionId/cwd/agentPreset/reusable，**不转传 model**
+// （dsh-api-session-controller/lib 的 create → agents.createSession），新会话于是落到
+// 「全局默认模型」。2026-11-01 全局默认一度是 deepseek-account/deepseek-flash（按量付费），
+// 派出去的会话因此替用户烧了真钱。故这里显式取值，绝不把付费模型透传给派出去的会话。
+export const FALLBACK_MODEL = { provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' } as const
+
+async function dispatcherModelRef(
+  controller: NonNullable<HostCtx['sessionController']>,
+  dispatcherSessionId: string | undefined,
+): Promise<{ provider: string; model: string; reasoningEffort?: string }> {
+  if (dispatcherSessionId === undefined) return { ...FALLBACK_MODEL }
+  try {
+    const resolved = await controller.resolveAgent?.(dispatcherSessionId)
+    if (!resolved || 'error' in resolved || !resolved.agent) return { ...FALLBACK_MODEL }
+    const session = resolved.agent.session as
+      | { requestHeader?: () => { config?: { provider?: string; model?: string; reasoningEffort?: string } } | undefined }
+      | undefined
+    const config = session?.requestHeader?.()?.config
+    if (config === undefined || typeof config.provider !== 'string' || typeof config.model !== 'string') {
+      return { ...FALLBACK_MODEL }
+    }
+    // 只有免费池（magpie-gateway）才允许沿用；其它 provider（尤其是按量付费的）一律回落到免费池。
+    if (config.provider !== FALLBACK_MODEL.provider) return { ...FALLBACK_MODEL }
+    return {
+      provider: config.provider,
+      model: config.model,
+      ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }),
+    }
+  } catch {
+    return { ...FALLBACK_MODEL }
+  }
+}
+
 export async function createSessionIn(
   ctx: HostCtx,
   args: CreateArgs,
@@ -576,6 +621,23 @@ export async function createSessionIn(
     renamed = false
   }
 
+  // 钉死模型（必须在投提示词之前）：见 dispatcherModelRef 的说明——宿主 create 不转传 model，
+  // 新会话否则会落到全局默认模型（曾一度是按量付费的 deepseek-account/deepseek-flash）。
+  const pinned = await dispatcherModelRef(controller, opts.dispatcherSessionId)
+  const model = `${pinned.provider}/${pinned.model}`
+  let modelNote: string | undefined
+  try {
+    if (controller.selectModel === undefined) throw new Error('the host exposes no selectModel')
+    await controller.selectModel({
+      sessionId,
+      provider: pinned.provider,
+      model: pinned.model,
+      ...(pinned.reasoningEffort === undefined ? {} : { reasoningEffort: pinned.reasoningEffort }),
+    })
+  } catch (error) {
+    modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`
+  }
+
   // 权限必须在投提示词之前设好（会话一开跑，用户看到的默认档就已经定了）。
   // 设不成就整单失败并归档 —— 让用户在错档下干活，比不派这一单更糟。
   let approvalPolicy: string | undefined
@@ -618,6 +680,7 @@ export async function createSessionIn(
       ? {}
       : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
     ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
+    model,
   }
 
   try {
@@ -671,6 +734,7 @@ export async function createSessionIn(
     ...applied,
     ledgerPath,
     ...(permissionNote === undefined ? {} : { permissionNote }),
+    ...(modelNote === undefined ? {} : { modelNote }),
     ...(ledgerError === undefined ? {} : { ledgerError }),
   }
 }
