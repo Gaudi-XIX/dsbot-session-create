@@ -1,7 +1,7 @@
 {
   "name": "dsbot-session-create",
-  "version": "0.1.1",
-  "description": "A DSH plugin that gives a Session four tools: create_session (open a new Session in a named workspace or existing folder and deliver one prompt into it), session_message (append a queued message to an existing Session), read_session_transcript, and list_dispatched_sessions.",
+  "version": "0.2.0",
+  "description": "A DSH plugin that gives a Session four tools: create_session (open a new Session in a named workspace or existing folder, pin its model to the dispatching Session and deliver one prompt into it), session_message (splice a message into a Session that is still running), read_session_transcript, and list_dispatched_sessions.",
   "keywords": [
     "dsh-plugin",
     "deepseek-harness",
@@ -19,7 +19,8 @@
   "files": [
     "index.js",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "bun build src/index.ts --target=node --format=esm --outfile=index.js --external @deepseek-ai/dsh-tools",

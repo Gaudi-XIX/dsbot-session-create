@@ -1,12 +1,23 @@
 # dsbot-session-create
 
-给 DSH 加四个工具：**`create_session`** —— 在指定的工作区、或任意一个已存在的工作文件夹里开一个新会话，并把一段提示词直接投进去；**`session_message`** —— 给一个已经存在（在跑或已结束）的会话再追加一条消息，排队投递、落在当前这一轮之后；**`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来；**`list_dispatched_sessions`** —— 看这个插件派送过哪些会话、各自此刻什么状态。
+给 DSH 加四个工具：
+
+- **`create_session`** —— 在指定的 DSH 工作区、或任意一个已存在的文件夹里开一个新会话，并把一段提示词投进去。开之前先把**模型**和**权限档**定下来。
+- **`session_message`** —— 给一个**还在跑**的会话插一条消息（插队投放，它下一步就读到）。
+- **`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来。
+- **`list_dispatched_sessions`** —— 看这个插件派过哪些会话、各自此刻什么状态。
 
 它是一个 DSH 插件（dsh-plugin），宿主半边，没有界面。
 
+三条与普通「开个会话」不同的硬规则，先看这里：
+
+1. **派出去的会话不落到宿主的全局默认模型上**。它钉死到派活那个 Bot 自己正在用的模型；读不到派活人的模型就**不建这一单**。
+2. **权限档的降级要看得见**。缺省想给 `auto`；宿主没有这个档就退回全权限，并把「为什么退」写进结果——不悄悄换档还说一切正常。
+3. **补话只服务还在跑的会话**。目标会话已经停下，就拒投并让你新开一个，不往历史里一层一层堆活。
+
 ## 为什么需要它
 
-DS Bot 的 Chief 能把活派给别的 Bot（`message_bot`），但派不到「某个项目的那个会话」里去。
+DS Bot 的 Chief 能把活派给别的 Bot（`message_bot`），但派不进「某个项目的那个会话」。
 宿主本身早就有这个能力（`ctx.sessionController.create({ cwd | workspaceId })`），只是没有对外开放成工具。
 
 这个插件就是那层薄壳：**把宿主已有的原语开成工具**。
@@ -15,7 +26,7 @@ DS Bot 的 Chief 能把活派给别的 Bot（`message_bot`），但派不到「�
 ## 工具
 
 ```
-create_session(title, prompt, workspace? | folder?)
+create_session(title, prompt, workspace? | folder?, preset?, permission?, model?)
 session_message(sessionId, message)
 read_session_transcript(sessionId?, last?)
 list_dispatched_sessions(limit?)
@@ -26,9 +37,12 @@ list_dispatched_sessions(limit?)
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `title` | 是 | 新会话的名字，显示在会话列表里 |
-| `prompt` | 是 | 投进新会话的那段话（排队投递；它会不会立刻开跑见下面「尚未验证的边界」） |
+| `prompt` | 是 | 投进新会话的那段话（排队投放，`mode: 'queue'`） |
 | `workspace` | 二选一 | 工作区 id，或它的完整文件夹路径 |
 | `folder` | 二选一 | 任意一个存在的文件夹的完整路径 |
+| `preset` | 否 | agent 预设（`standard` / `minimal` / `ptc` / `creator`），建会话时写进 header，开跑后不能换；名字错就整单不建 |
+| `permission` | 否 | 权限档，见下面「权限档」 |
+| `model` | 否 | 写成 `provider/model`；不写就与派活的那个 Bot 一致 |
 
 `workspace` 和 `folder` **必须给且只能给一个**。
 
@@ -39,34 +53,69 @@ list_dispatched_sessions(limit?)
 
 两者是同一套宿主原语的两种落位方式，没有别的差别。
 
+#### 模型（fail-closed）
+
+宿主 `sessionController.create` **不转传 model**，所以不钉就是「宿主的全局默认模型」；2026-11-01 那个默认一度是按量付费的模型，派出去的会话因此替用户烧过真钱。所以：
+
+- 不写 `model` 时，取**派活那个 Bot 自己会话正在用的模型**（`agent.session.requestHeader().config` 的 provider / model / reasoningEffort）。
+- **不写任何模型名做兜底**：写死一个名字，provider 或组一改名，这条绑定就静默失效。
+- 显式写 `model` 必须是 `provider/model`——只认一段斜杠、两边都要有字，写错就整单失败（`model-invalid`）。
+- 派活人的模型**读不到就不建这一单**（`dispatcher-model-unknown`）。宁可失败，也不留一条会落到全局默认模型上的会话。
+- 建会话之后用 `sessionController.selectModel` 钉死。这一步失败**不**中断派送，但结果里带一句 `modelNote`，明说「没钉上、可能落到宿主默认、花额度之前先查它的模型」。
+
+#### 权限档
+
+档名由宿主判定（`/permission` 的合法值会随宿主升级漂移），本插件不硬编码白名单，只做三件事：
+
+- **显式传 `read-only` / `workspace-write` 会被改写成 `danger-full-access`**，并在结果里如实标出 `permissionOverriddenFrom`。理由：这两档带 `approval: ask`，派单会话无人应答就整轮卡死，而宿主没有「给已存在会话提权」的入口。要放行只读探针，在宿主环境里设 `DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1`（值必须严格等于 `1`）。
+- **没传 `permission` 时现场问一次宿主**，看它的权限档名单里有没有 `auto`，按三态处理：
+
+| 宿主此刻的样子 | 这一单用哪个档 | 是否在结果里说明 |
+| --- | --- | --- |
+| 名单有 `auto`，也有审批服务 | `auto`，随后把审批策略压成 `never` | 正常，不额外说明 |
+| 名单有 `auto`，但没有审批服务 | `danger-full-access` | 说明（`auto` 的 deny 会变成等一个永远不来的答复） |
+| 名单读得到、里面没有 `auto` | `danger-full-access` | 说明（auto review 没装或没启用） |
+| 名单根本读不到（老宿主／别的客户端） | `danger-full-access` | 说明（默认档无法确认） |
+| 没有 `commands.execute` | 不设档，吃宿主默认 | 说明 |
+
+- **显式要 `auto` 时**：宿主名单明确没有就整单失败、不建会话（`host-missing`）；名单读不到就照旧下发，让宿主的 `/permission` 自己去判认不认这个名字。
+- `auto` 档的第二步是把审批策略写成 `never`：`auto` 自带 `ask`，无人值守时 reviewer 判 deny 会变成整晚卡死。这一步走 `session.append('approval/policy', { policy: 'never' })`，不调 `ApprovalService.setPolicy`（后者会往会话里注入一条假消息）；写不进去就**归档这个会话并整单失败**——让会话带着 `ask` 活下去，等于埋一颗整晚卡死的雷。
+- 有一处宿主机制产物要知道：`/permission auto` 那一步自己会写一条 `ask`，并往会话里注入一句「changed from "never" to "ask"」的 user 消息；本插件紧跟其后写 `never`，最终生效的是 `never`，但读 transcript 时会看到那条消息。
+
 ### 派送台账
 
-每次 `create_session` 成功，都会往**派送台账**追加一行，记住这条会话的 id、标题、落位、提示词开头和派送时刻：
+每次 `create_session` 成功，都会往**派送台账**追加一行：
 
 ```
 $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION_CREATE_LEDGER 覆盖
 ```
 
-这是「派出去以后还能找回来」的凭据。台账写失败**不会**让整次派送算失败（会话已经建出来了），但结果里会带一个 `ledgerError`，并把「自己手动记下这个 session id」写进给用户看的文案。
+每行记住：会话 id、标题、落位、提示词开头、派送时刻，以及这一单实际下发的 `preset` / `permission` / `permissionOverriddenFrom` / `approvalPolicy`，和**派活人的会话 id**（回执按它投回去）。建了会话但后面失败的单也会留一行（带 `failed` 原因），否则事后谁都在会话列表里找不到那个空会话。
 
-落点为什么在 `bot/` 下：这份账是 **Bot ↔ 人的交接记录**，属于 DS Bot 自己的数据，所以跟在 DS Bot 的 home（`<DSH_HOME>/bot`，ds-bot 自己也是这条规则）里，不与它平级另立一处。若 ds-bot 的 home 被它自己的 profile 配置改到别处，用 `DSH_SESSION_CREATE_LEDGER` 对齐。
+台账写失败**不会**让整次派送算失败（会话已经建出来了），但结果里会带 `ledgerError`，并写明「自己手动记下这个 session id」。
+
+落点为什么在 `bot/` 下：这份账是 **Bot ↔ 人的交接记录**，属于 DS Bot 自己的数据，所以跟在 DS Bot 的 home（`<DSH_HOME>/bot`）里。若 ds-bot 的 home 被它自己的 profile 配置改到别处，用 `DSH_SESSION_CREATE_LEDGER` 对齐。
 
 ### `session_message`
 
-给一个**已经存在**的会话再投一条消息，不新建会话：
+给一个**已经存在、且还在跑**的会话插一条消息，不新建会话：
 
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `sessionId` | 是 | 目标会话的 id（`create_session` 或 `list_dispatched_sessions` 给的） |
-| `message` | 是 | 追加的那段话 |
+| `message` | 是 | 插进去的那段话 |
 
-走的是宿主 `controller.prompt(mode: 'queue')`，所以它是**排队投递**：落在当前正在跑的那一轮之后，不会打断它。会话已经跑完时投进去，等于让它接着再跑一轮。
+- 走 `controller.prompt(mode: 'steer')`（宿主 `agent.steer`）：**插进正在跑的那一轮**，会话下一步就读到，不等这一轮结束。
+- 目标会话的 turn 已经结束（宿主直报 `idle`）时**拒投**（`session-idle`），并指向 `create_session`。判据只用宿主直给的状态，不替调用方判断「这条消息算新任务还是纠偏」——那是语义判断。这条是 2026-11-01 那单事故的防线：同一条会话被补了 16 轮裁决，历史涨到约 76 万 token，第二天宿主把它切到 512,000 窗口的模型后立刻放不下。
+- 宿主没报状态时按「还在跑」处理，结果里如实标 `targetState: unreported`。
+- 只说「已插进正在跑的那一轮」，不说「它看过了」——后者只有读回才能证明。
+- 单次投递超时 10 秒（`MESSAGE_TIMEOUT_MS`）。
 
 ### `read_session_transcript`
 
 按 id 取回一个会话说了什么、现在什么状态（最新若干条消息 + 当前这一轮结束没有）。**不给 `sessionId` 就取台账里最近一条派送**，所以「刚派完那单跑完没」不需要手动找 id。
 
-`last` 给取回多少条（1..200，默认 40），更早的用更大的值再读。
+`last` 给取回多少条（1..200，默认 40），更早的用更大的值再读。历史读回超时 20 秒（`HISTORY_TIMEOUT_MS`）。
 
 ### `list_dispatched_sessions`
 
@@ -81,8 +130,25 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 两种来源的措辞**故意不同**：推断不许冒充宿主结论。
 
-读回走的是宿主自带的 `ctx.sessionController.page({ address, throughSeq, maxMessages }, signal)`，参数形状逐字照抄 DS Bot 自己的三处生产调用（`src/host/parts.js:1287`、`chat-index.js:58`、`usage.js:351`）——不自己造一套读事件的机制。宿主内置的 `session_event_read` / `session_search` 工具**对普通会话不可用**（返回 `No session matched "…"`），故不走。
+读回走宿主自带的 `ctx.sessionController.page({ address, throughSeq, maxMessages }, signal)`，参数形状逐字照抄 DS Bot 自己的三处生产调用（`src/host/parts.js:1287`、`chat-index.js:58`、`usage.js:351`）——不自己造一套读事件的机制。宿主内置的 `session_event_read` / `session_search` 工具**对普通会话不可用**（返回 `No session matched "…"`），故不走。
 
+### 派完自动回执
+
+派送时把派活人的会话 id 记进台账；目标会话安静满 **120 秒**（`QUIET_WINDOW_MS`）、且宿主复核为 `idle` 时，插件用 `controller.prompt(mode: 'queue')` 投一条短回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts:299` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
+
+回执走 `queue` 不走 `steer`：它是给派活人的旁路通报，排到下一轮，不去打断他手头正在跑的那一轮。
+
+### 宿主启动自检（重启后自动接续）
+
+宿主重启时在跑的 Bot 会话一并被杀，醒来后没有东西会主动说「刚重启过、盘上有接手指针」。这一段补上它（`src/autoresume.ts`，`src/index.ts:303` 的 `installAutoResume`）：
+
+- **只认两个文件**：指针 `F:\DSBOT\state\restart-pending.json`，已确认记录 `F:\DSBOT\state\restart-pending.ack.json`（`src/autoresume.ts:26-28`，路径写死在这里，没有 env 覆盖）。
+- **目标只能是指针里的 `notify_session_id`**：缺失或不是字符串就跳过。不猜主会话、不遍历会话列表。
+- **投三次**：6s / 12s / 20s（`src/autoresume.ts:34`，累计约 38s）。宿主刚起来那几秒恰恰是最可能投不进去的时刻，所以单跳不够；只有 `send-failed` 才排下一次，送达、已确认、没指针、没目标都是终态。
+- **幂等只看 `written_at`**：已确认记录里的 `written_at` 不严格新于指针的 `written_at` 就跳过。失败也写一份 ack，但**故意不写 `written_at`**——它只是盘上的证据，不参与幂等判断，所以下次启动照常重试。
+- **只投 `prompt(mode: 'queue')`**，不建会话、不改会话状态。唤醒正文只给指针的绝对路径，让收到消息的一方自己去读盘，不抄正文。
+- **关掉它**：`DSH_AUTORESUME_DISABLE=1`（在读任何文件之前就判断，连定时器都不注册）。
+- **全程 fail-open**：读不到盘、JSON 坏、没有目标，都只记一行日志就安静退出；定时器 `unref`，不阻塞宿主启动也不拖住宿主退出。
 
 ## 失败时的行为（fail-closed）
 
@@ -92,18 +158,26 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 | --- | --- |
 | 文件夹不存在 | 报错，不建会话 |
 | 工作区认不出 | 报错，**不回落**到默认工作区 |
-| 两个都给 / 都不给 | 报错 |
+| `workspace`/`folder` 两个都给或都不给 | 报错 |
+| `preset` 名字宿主不认 | 报错，不建会话 |
+| `model` 不是 `provider/model` | 报错（`model-invalid`），不建会话 |
+| 派活人的模型读不到 | 报错（`dispatcher-model-unknown`），不建会话 |
+| 显式要 `auto`、宿主名单里没有 | 报错（`host-missing`），不建会话 |
 | 宿主缺所需服务 | 报错，附上缺了哪几个 |
+| 权限档设不上 | 归档这个会话，整单报错 |
+| `auto` 的审批策略写不进 | 归档这个会话，整单报错 |
+| 提示词投递失败 | 归档这个会话，如实报错，不对外说成功 |
+| 补话给已经停下的会话 | 拒投（`session-idle`），什么都不发 |
 
-那张「宿主缺服务」的报错要能真的报出来，靠的是**服务不写进 `inject` 硬声明**：插件只 `inject: ['tools']`，`sessionController` / `sessionTitle` / `workspaceRegistry` 三个都走 `ctx.get()` 宽容路径（见 `src/core.ts` 的 `resolveServices`）。写成硬 inject 的话，宿主缺服务时整棵插件树会加载失败，`preflight` 那句可读报错根本没有机会执行——用户只会看到「工具不存在」。两个第三方先例（`dsh-better-sidebar`、`dsh-prime-memory`）都只用 `ctx.get` 取这几个服务。
+那张「宿主缺服务」的报错要能真的报出来，靠的是**服务不写进 `inject` 硬声明**：插件只 `inject: ['tools']`，其余服务都走 `ctx.get()` 宽容路径（`src/core.ts` 的 `resolveServices`）。写成硬 inject 的话，宿主缺服务时整棵插件树会加载失败，`preflight` 那句可读报错根本没有机会执行——用户只会看到「工具不存在」。
 
 这里和 DS Bot 的 `roster.js` 有一处**有意不同**：它会「工作目录没了就悄悄换到团队工作区」，本插件不这么做——悄然换位置会让人以为任务落在 A 项目，实际跑在别处。
 
-会话建好但**提示词投递失败**时，会把这个空会话归档掉，并如实报错，不会对外说成功。归档本身也失败时，报错里会改成说「列表里可能还留着一条空会话」——不谎称已归档。
+归档失败时，报错里会改成说「列表里可能还留着一条空会话」——不谎称已归档。
 
 ## 装
 
-本机（DSH 0.2.1-rc.3）以链路方式装进 profile：
+本机以链路方式装进 profile：
 
 ```
 # 在 profile 目录里（<DSH_HOME>/profiles/<profile>）
@@ -124,7 +198,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ```bash
 bun run build   # src/*.ts → index.js（@deepseek-ai/dsh-tools 保持 external）
-bun test        # 69 个测试；plugin.test.ts 测的是构建产物，跑前先 build
+bun test        # 163 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
 ```
 
 类型检查（本机没装 tsc，借用现成的）：
@@ -135,22 +209,27 @@ node <任意本机已有的 typescript>/bin/tsc --noEmit -p .
 
 ## 几个必须知道的事实
 
-- **`@deepseek-ai/dsh-tools` 不在 profile 的 `node_modules` 里**（在宿主 `app.asar` 内，加载插件时注入；`node_modules/@deepseek-ai/**/package.json` 在本 profile 是 0 命中）。所以 `test/stubs/dsh-tools.ts` 是它的替身，`tsconfig.json` 的 `paths` 只为本机开发把它指过去 —— 那**不是**权威类型定义，是按 DS Bot 的实际用法反推的最小形状。
-- 宿主 API 的形状（`create` 返回 `{ sessionId }`、`prompt` 要 `requestId` + `mode: 'queue'` + `content:[{type:'text',text}]`）是从 DS Bot 的 `src/host/roster.js`、`channel.js` **读出来**的，不是从官方文档抄的。上游没有这层文档。
-- **已在真实宿主里加载过**：2026-10-30 00:36 重启后，四个工具在一个活会话里都出现了（描述逐字来自本插件的 `index.js`），不是只有「假 ctx + 构建产物」的验证。
-- 作者的开发沙箱当时只允许在插件目录下写（系统临时目录与工作区的 `tmp/` 都是 EPERM），所以测试的临时目录放在 `.tmp/`。
+- **`@deepseek-ai/dsh-tools` 不在 profile 的 `node_modules` 里**（在宿主 `app.asar` 内，加载插件时注入）。所以 `test/stubs/dsh-tools.ts` 是它的替身，`tsconfig.json` 的 `paths` 只为本机开发把它指过去——那**不是**权威类型定义，是按 DS Bot 的实际用法反推的最小形状。
+- 宿主 API 的形状（`create` 返回 `{ sessionId }`、`prompt` 要 `requestId` + `mode` + `content:[{type:'text',text}]`）是从 DS Bot 的源码**读出来**的，不是从官方文档抄的。上游没有这层文档。
+- 启动自检的两个文件路径**写死在 `src/autoresume.ts`**（`F:\DSBOT\state`），跨机器用要先改这里。
+- 派出去的**提示词**走 `queue`，**补话**走 `steer`，**回执**走 `queue`——三个通道口径不同，改的时候别顺手统一。
 
-## 尚未验证的边界
+## 已验证 / 尚未验证
 
-以下五条**没验过**，写在这里以免被当成已知：
+**已验证（2026-11-02 实测）**
 
-1. **真宿主里读回的形状**：`ctx.sessionController.page` 在真实宿主上是否真按 `{ records, hasMore }` 返回，未验（参数形状抄的是 DS Bot 生产代码，不是官方文档）。装上 + 重启后第一件要验的就是它。
-2. **`mode: 'queue'` 投给一个刚建出来的空会话**是否被宿主接受，未验。
-3. **提示词会不会立刻开跑**：投递只是排队，宿主何时起跑未验；因此对外文案只说「已排队」，不说「它正在干」。
-4. **提示词的 30 秒超时上限**：这条路径没有「真触发」用例——测试运行器 bun 1.3.13 的 `AbortSignal.timeout` 在进程没有其它待办定时器时不触发（宿主是 Node，不受影响）。
-5. **`last` 夹到 1..200、`limit` 夹到 1..20** 是本插件自定的范围，宿主有没有更低的天花板未验。
+- `bun run build` 之后 `git status` 无改动：`index.js` 与 `src/` 同步（63,298 字节）。
+- `bun test`：163 pass / 0 fail / 597 次断言，5 个文件，bun 1.3.13。
+- 新构建的**描述文本已在真实宿主里加载**：本会话工具表里的 `create_session` 已带 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`）——说明 profile 挂的就是当前这份 `index.js`。
 
-「跑完自动把结果推给派活人」这条**已经实现**：派送时把回执地址记进台账，目标会话安静满 120 秒、且宿主复核为 idle 时，插件用 `controller.prompt(mode: 'queue')` 投一条短回执回去（`src/index.ts:282` 的 `installDispatchNotify`，源码注释见 `:280`）。**但它在真机上还没验过**——上面第 1 条的读回形状没验，这条通知就谈不上可信。现在也仍然可以一条命令取回，取回是稳的。
+**尚未验证**
+
+1. `ctx.sessionController.page` 在真宿主里是否真按 `{ records, hasMore }` 返回（参数形状抄的是 DS Bot 生产代码，不是官方文档）。
+2. `steer` 插队以后，目标会话是否真在下一步就读到（只验到「宿主受理」这一层）。
+3. `auto` 档写 `approval/policy: never` 在真宿主里是否被认（单测覆盖的是「写不进去就归档并报错」这条路）。
+4. 启动自检的**真重启投递**：注册、延迟序列、幂等判据都有单测，但没在真重启里收过那条唤醒消息。
+5. **提示词的 30 秒超时上限**没有「真触发」用例——bun 1.3.13 的 `AbortSignal.timeout` 在进程没有其它待办定时器时不触发（宿主是 Node，不受影响）。
+6. `last` 夹到 1..200、`limit` 夹到 1..20 是本插件自定的范围，宿主有没有更低的天花板未验。
 
 ## 许可
 
