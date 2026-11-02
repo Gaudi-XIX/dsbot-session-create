@@ -16,16 +16,32 @@
 //   ④ 延迟用 setTimeout 并 unref：不阻塞宿主启动，也不拖住宿主退出。
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { resolveServices, type HostCtx } from './core'
+import { resolveServices, sessionCreateDir, type HostCtx } from './core'
 
 /** 关闭开关：设成 '1' 时整段跳过（在任何文件被读取之前判断）。 */
 export const AUTORESUME_ENV_FLAG = 'DSH_AUTORESUME_DISABLE'
 
-// 指针与 ack 的落点**只在这里出现一次**：别处不许再拼这两个路径，也不许出现任何 C 盘路径。
-export const AUTORESUME_STATE_DIR = 'F:\\DSBOT\\state'
-export const AUTORESUME_PENDING_FILE = join(AUTORESUME_STATE_DIR, 'restart-pending.json')
-export const AUTORESUME_ACK_FILE = join(AUTORESUME_STATE_DIR, 'restart-pending.ack.json')
+/** 改落点的开关：指到哪个目录就用哪个，缺省跟插件数据目录走（见下）。 */
+export const AUTORESUME_STATE_DIR_ENV = 'DSH_AUTORESUME_STATE_DIR'
+/** 两个文件名；目录**运行时算**——本仓不许出现盘符写死的路径（2026-11-02 用户定）。 */
+export const AUTORESUME_PENDING_NAME = 'restart-pending.json'
+export const AUTORESUME_ACK_NAME = 'restart-pending.ack.json'
+
+/**
+ * 指针与 ack 落在哪：`DSH_AUTORESUME_STATE_DIR` > `<DSH_HOME>/bot/session-create`（DSH_HOME 缺省 `~/.dsh`）。
+ * 与派送台账同一目录——都是本插件自己的数据。要接到某个固定目录就设 env（谁也不用改代码）。
+ */
+export function resolveAutoresumeStateDir(env: Record<string, string | undefined> = process.env, home: string = homedir()): string {
+  const explicit = (env[AUTORESUME_STATE_DIR_ENV] ?? '').trim()
+  return explicit !== '' ? explicit : sessionCreateDir(env, home)
+}
+
+/** 模块加载时的缺省值（运行时一律按当时的 env 现算，见 resolveAutoresumeStateDir；这三个常量只留给测试与外部引用）。 */
+export const AUTORESUME_STATE_DIR = resolveAutoresumeStateDir()
+export const AUTORESUME_PENDING_FILE = join(AUTORESUME_STATE_DIR, AUTORESUME_PENDING_NAME)
+export const AUTORESUME_ACK_FILE = join(AUTORESUME_STATE_DIR, AUTORESUME_ACK_NAME)
 
 /**
  * 三次尝试的间隔：6s → 12s → 20s（累计约 38s）。
@@ -42,9 +58,9 @@ type WriteAtomic = (path: string, text: string) => Promise<void>
 type Log = (line: string) => void
 
 export type AutoResumeDeps = {
-  /** 指针文件；缺省 AUTORESUME_PENDING_FILE。 */
+  /** 指针文件；不传就按当时的 env 现算（只有测试需要显式给）。 */
   pendingFile?: string
-  /** 已确认记录；缺省 AUTORESUME_ACK_FILE。 */
+  /** 已确认记录；不传就按当时的 env 现算（只有测试需要显式给）。 */
   ackFile?: string
   /** 环境变量表；缺省 process.env（单测注入，避免碰真环境）。 */
   env?: Record<string, string | undefined>
@@ -179,8 +195,10 @@ export async function runAutoResume(deps: AutoResumeDeps = {}): Promise<AutoResu
     return { status: 'disabled', reason }
   }
 
-  const pendingFile = deps.pendingFile ?? AUTORESUME_PENDING_FILE
-  const ackFile = deps.ackFile ?? AUTORESUME_ACK_FILE
+  // 落点每次调用现算（不看模块加载时的常量）：env 里指了别的目录就按 env 走。
+  const stateDir = resolveAutoresumeStateDir(env)
+  const pendingFile = deps.pendingFile ?? join(stateDir, AUTORESUME_PENDING_NAME)
+  const ackFile = deps.ackFile ?? join(stateDir, AUTORESUME_ACK_NAME)
   const readText = deps.readText ?? ((path: string) => readFile(path, 'utf8'))
   const writeAtomic = deps.writeAtomic ?? writeAtomicDefault
   const now = deps.now ?? (() => Date.now())

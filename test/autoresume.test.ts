@@ -6,13 +6,17 @@ import { mkdir, readFile as readFileReal, readdir, rm, writeFile as writeFileRea
 import { join } from 'node:path'
 import {
   AUTORESUME_ACK_FILE,
+  AUTORESUME_ACK_NAME,
   AUTORESUME_DELAY_MS,
   AUTORESUME_ENV_FLAG,
   AUTORESUME_PENDING_FILE,
+  AUTORESUME_PENDING_NAME,
   AUTORESUME_RETRY_DELAYS_MS,
   AUTORESUME_STATE_DIR,
+  AUTORESUME_STATE_DIR_ENV,
   installAutoResume,
   isStrictlyNewer,
+  resolveAutoresumeStateDir,
   runAutoResume,
   wakeupText,
   type AutoResumeDeps,
@@ -42,10 +46,14 @@ type Fake = {
 }
 
 /** 假盘 + 假宿主：readText 从 Map 取，writeAtomic 记下内容；prompt 只记录调用。 */
-function fake(opts: { pointer?: Record<string, unknown> | string; ack?: Record<string, unknown> | string; env?: Record<string, string | undefined>; noPrompt?: boolean } = {}): Fake {
+function fake(opts: { pointer?: Record<string, unknown> | string; ack?: Record<string, unknown> | string; env?: Record<string, string | undefined>; noPrompt?: boolean; stateDir?: string } = {}): Fake {
+  // stateDir：把指针与 ack 摆到该目录，并把它写进 env —— 用来验证 DSH_AUTORESUME_STATE_DIR 覆盖真的生效。
+  const pendingPath = opts.stateDir === undefined ? PENDING : join(opts.stateDir, AUTORESUME_PENDING_NAME)
+  const ackPath = opts.stateDir === undefined ? ACK : join(opts.stateDir, AUTORESUME_ACK_NAME)
+  const env = opts.stateDir === undefined ? (opts.env ?? {}) : { ...opts.env, [AUTORESUME_STATE_DIR_ENV]: opts.stateDir }
   const files = new Map<string, string>()
-  if (opts.pointer !== undefined) files.set(PENDING, typeof opts.pointer === 'string' ? opts.pointer : JSON.stringify(opts.pointer))
-  if (opts.ack !== undefined) files.set(ACK, typeof opts.ack === 'string' ? opts.ack : JSON.stringify(opts.ack))
+  if (opts.pointer !== undefined) files.set(pendingPath, typeof opts.pointer === 'string' ? opts.pointer : JSON.stringify(opts.pointer))
+  if (opts.ack !== undefined) files.set(ackPath, typeof opts.ack === 'string' ? opts.ack : JSON.stringify(opts.ack))
   const prompts: Record<string, unknown>[] = []
   const logs: string[] = []
   const reads: string[] = []
@@ -64,9 +72,9 @@ function fake(opts: { pointer?: Record<string, unknown> | string; ack?: Record<s
         },
       }
   const deps: AutoResumeDeps = {
-    pendingFile: PENDING,
-    ackFile: ACK,
-    env: opts.env ?? {},
+    // 没给 stateDir 的用例按 PENDING/ACK 摆文件，这里就显式钉住；给了 stateDir 就让 runAutoResume 自己按 env 现算。
+    ...(opts.stateDir === undefined ? { pendingFile: PENDING, ackFile: ACK } : {}),
+    env: env,
     log: (line: string) => {
       logs.push(line)
     },
@@ -92,12 +100,35 @@ function textOf(call: Record<string, unknown>): string {
 }
 
 describe('路径口径', () => {
-  test('指针与 ack 都落在 F:\\DSBOT\\state 下，代码里没有 C 盘路径', () => {
-    expect(AUTORESUME_STATE_DIR).toBe('F:\\DSBOT\\state')
-    expect(PENDING).toBe('F:\\DSBOT\\state\\restart-pending.json')
-    expect(ACK).toBe('F:\\DSBOT\\state\\restart-pending.ack.json')
-    expect(PENDING.includes('C:')).toBe(false)
-    expect(ACK.includes('C:')).toBe(false)
+  test('落点运行时算：env 覆盖 > $DSH_HOME > ~/.dsh，两个文件名跟着目录走', () => {
+    const home = join('C:', 'users', 'someone')
+    const dshHome = join('D:', 'dsh')
+    const override = join('E:', 'ptr')
+    expect(resolveAutoresumeStateDir({}, home)).toBe(join(home, '.dsh', 'bot', 'session-create'))
+    expect(resolveAutoresumeStateDir({ DSH_HOME: dshHome }, home)).toBe(join(dshHome, 'bot', 'session-create'))
+    expect(resolveAutoresumeStateDir({ DSH_HOME: dshHome, [AUTORESUME_STATE_DIR_ENV]: override }, home)).toBe(override)
+    expect(PENDING).toBe(join(AUTORESUME_STATE_DIR, AUTORESUME_PENDING_NAME))
+    expect(ACK).toBe(join(AUTORESUME_STATE_DIR, AUTORESUME_ACK_NAME))
+  })
+
+  test('env 指到别的目录 ⇒ 从那里读、往那里写，不碰缺省目录', async () => {
+    const stateDir = join('E:', 'ptr')
+    const f = fake({ pointer: POINTER, stateDir })
+    const outcome = await runAutoResume(f.deps)
+    expect(outcome.status).toBe('delivered')
+    expect(f.reads[0]).toBe(join(stateDir, AUTORESUME_PENDING_NAME))
+    expect(f.reads.every((path) => path.startsWith(stateDir))).toBe(true)
+    expect(f.writes[0]?.path).toBe(join(stateDir, AUTORESUME_ACK_NAME))
+  })
+
+  test('src 里没有任何写死的盘符路径（本机路径一律运行时算）', async () => {
+    const dir = join(import.meta.dir, '..', 'src')
+    for (const name of await readdir(dir)) {
+      if (!name.endsWith('.ts')) continue
+      const text = await readFileReal(join(dir, name), 'utf8')
+      const hit = text.split('\n').find((line) => /[A-Za-z]:[\\/]/.test(line))
+      expect(`${name}: ${hit ?? 'clean'}`).toBe(`${name}: clean`)
+    }
   })
 
   test('唤醒正文只带「上一个宿主 pid」与指针绝对路径，不抄指针正文，也不让人误认成当前 pid', () => {

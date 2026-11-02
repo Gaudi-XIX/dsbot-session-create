@@ -59,7 +59,7 @@ list_dispatched_sessions(limit?)
 
 - 不写 `model` 时，取**派活那个 Bot 自己会话正在用的模型**（`agent.session.requestHeader().config` 的 provider / model / reasoningEffort）。
 - **不写任何模型名做兜底**：写死一个名字，provider 或组一改名，这条绑定就静默失效。
-- 显式写 `model` 必须是 `provider/model`——只认一段斜杠、两边都要有字，写错就整单失败（`model-invalid`）。
+- 显式写 `model` 必须是 `provider/model`——按第一个斜杠切一刀、两边都要有字；`provider` 空或 `model` 空就整单失败（`model-invalid`），model 本身允许再带斜杠（`b/c`）。
 - 派活人的模型**读不到就不建这一单**（`dispatcher-model-unknown`）。宁可失败，也不留一条会落到全局默认模型上的会话。
 - 建会话之后用 `sessionController.selectModel` 钉死。这一步失败**不**中断派送，但结果里带一句 `modelNote`，明说「没钉上、可能落到宿主默认、花额度之前先查它的模型」。
 
@@ -90,7 +90,7 @@ list_dispatched_sessions(limit?)
 $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION_CREATE_LEDGER 覆盖
 ```
 
-每行记住：会话 id、标题、落位、提示词开头、派送时刻，以及这一单实际下发的 `preset` / `permission` / `permissionOverriddenFrom` / `approvalPolicy`，和**派活人的会话 id**（回执按它投回去）。建了会话但后面失败的单也会留一行（带 `failed` 原因），否则事后谁都在会话列表里找不到那个空会话。
+每行记住：会话 id、标题、落位、提示词开头、派送时刻，以及这一单实际下发的 `preset` / `permission` / `permissionOverriddenFrom` / `approvalPolicy`，和**派活人的会话 id**（回执按它投回去）。建了会话、但**权限档**这一步失败的单会补写一行 `failed`（`src/core.ts:679`），否则事后谁都在会话列表里找不到那个空会话；提示词投递失败走另一条路——归档会话并报 `prompt-failed`，不写台账。
 
 台账写失败**不会**让整次派送算失败（会话已经建出来了），但结果里会带 `ledgerError`，并写明「自己手动记下这个 session id」。
 
@@ -119,7 +119,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### `list_dispatched_sessions`
 
-倒序列出台账里的派送，每条带**此刻**的状态：还在跑 / 上一轮已结束 / 读失败。用来挑「哪些可以收了」。
+倒序列出台账里的派送，每条带**此刻**的状态：还在跑 / 上一轮已结束 / 还没起跑（`not started`）/ 读失败。用来挑「哪些可以收了」。
 
 ### 状态是怎么来的
 
@@ -142,11 +142,11 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 宿主重启时在跑的 Bot 会话一并被杀，醒来后没有东西会主动说「刚重启过、盘上有接手指针」。这一段补上它（`src/autoresume.ts`，`src/index.ts:303` 的 `installAutoResume`）：
 
-- **只认两个文件**：指针 `F:\DSBOT\state\restart-pending.json`，已确认记录 `F:\DSBOT\state\restart-pending.ack.json`（`src/autoresume.ts:26-28`，路径写死在这里，没有 env 覆盖）。
+- **只认两个文件**：指针 `restart-pending.json`，已确认记录 `restart-pending.ack.json`。目录**运行时算**，不写死：`DSH_AUTORESUME_STATE_DIR` > `<DSH_HOME>/bot/session-create`（`DSH_HOME` 缺省 `~/.dsh`，与派送台账同一目录；`src/autoresume.ts` 的 `resolveAutoresumeStateDir`）。要接到别处就设那个 env，不用改代码。
 - **目标只能是指针里的 `notify_session_id`**：缺失或不是字符串就跳过。不猜主会话、不遍历会话列表。
-- **投三次**：6s / 12s / 20s（`src/autoresume.ts:34`，累计约 38s）。宿主刚起来那几秒恰恰是最可能投不进去的时刻，所以单跳不够；只有 `send-failed` 才排下一次，送达、已确认、没指针、没目标都是终态。
+- **投三次**：间隔 6s / 12s / 20s（`src/autoresume.ts:50`，`AUTORESUME_RETRY_DELAYS_MS`；38s 是三次间隔之和，不是总超时——单次投递上限 10s）。宿主刚起来那几秒恰恰是最可能投不进去的时刻，所以单跳不够；只有 `send-failed` 才排下一次，送达、已确认、没指针、没目标都是终态。
 - **幂等只看 `written_at`**：已确认记录里的 `written_at` 不严格新于指针的 `written_at` 就跳过。失败也写一份 ack，但**故意不写 `written_at`**——它只是盘上的证据，不参与幂等判断，所以下次启动照常重试。
-- **只投 `prompt(mode: 'queue')`**，不建会话、不改会话状态。唤醒正文只给指针的绝对路径，让收到消息的一方自己去读盘，不抄正文。
+- **只投 `prompt(mode: 'queue')`**，不建会话、不改会话状态。唤醒正文只给指针的绝对路径和固定一句「上一个宿主 pid」，让收到消息的一方自己去读盘，不抄正文。
 - **关掉它**：`DSH_AUTORESUME_DISABLE=1`（在读任何文件之前就判断，连定时器都不注册）。
 - **全程 fail-open**：读不到盘、JSON 坏、没有目标，都只记一行日志就安静退出；定时器 `unref`，不阻塞宿主启动也不拖住宿主退出。
 
@@ -177,7 +177,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ## 装
 
-本机以链路方式装进 profile：
+推荐以链路方式装进 profile：
 
 ```
 # 在 profile 目录里（<DSH_HOME>/profiles/<profile>）
@@ -198,29 +198,33 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ```bash
 bun run build   # src/*.ts → index.js（@deepseek-ai/dsh-tools 保持 external）
-bun test        # 163 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
+bun test        # 165 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
 ```
 
-类型检查（本机没装 tsc，借用现成的）：
+类型检查（本仓不带 `typescript` 与 `@types/node` 依赖，用现成的那份就行）：
 
 ```bash
-node <任意本机已有的 typescript>/bin/tsc --noEmit -p .
+node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一个 node_modules>/@types
 ```
+
+`--typeRoots` 显式指过去，是因为 `tsconfig.json` 里**没有**写任何本机路径：它只声明 `"types": ["node"]`，落在哪由你调用时决定。
 
 ## 几个必须知道的事实
 
 - **`@deepseek-ai/dsh-tools` 不在 profile 的 `node_modules` 里**（在宿主 `app.asar` 内，加载插件时注入）。所以 `test/stubs/dsh-tools.ts` 是它的替身，`tsconfig.json` 的 `paths` 只为本机开发把它指过去——那**不是**权威类型定义，是按 DS Bot 的实际用法反推的最小形状。
 - 宿主 API 的形状（`create` 返回 `{ sessionId }`、`prompt` 要 `requestId` + `mode` + `content:[{type:'text',text}]`）是从 DS Bot 的源码**读出来**的，不是从官方文档抄的。上游没有这层文档。
-- 启动自检的两个文件路径**写死在 `src/autoresume.ts`**（`F:\DSBOT\state`），跨机器用要先改这里。
+- **代码与文档里不许出现本机路径**（2026-11-02 用户定）：源码、测试、注释、配置一律不许写盘符路径、用户名或本机目录名。唯一例外是单元测试里验证「Windows 路径怎么处理」用的**虚构样本**（`test/read.test.ts`、`test/core.test.ts` 与 `test/autoresume.test.ts` 里那几个），它们跟这台机器的实际目录无关。默认落点由 `DSH_HOME` / `homedir()` 在运行时算，要换就加一个 env 覆盖；`test/autoresume.test.ts` 有一条用例扫 `src/` 下全部 `.ts`（不递归子目录），命中盘符形式的路径就判红。
+- 启动自检的落点跟随上面的规则：换机器、换 `DSH_HOME` 都不用改代码；要把指针接到某个固定目录，设 `DSH_AUTORESUME_STATE_DIR`。
 - 派出去的**提示词**走 `queue`，**补话**走 `steer`，**回执**走 `queue`——三个通道口径不同，改的时候别顺手统一。
 
 ## 已验证 / 尚未验证
 
 **已验证（2026-11-02 实测）**
 
-- `bun run build` 之后 `git status` 无改动：`index.js` 与 `src/` 同步（63,298 字节）。
-- `bun test`：163 pass / 0 fail / 597 次断言，5 个文件，bun 1.3.13。
-- 新构建的**描述文本已在真实宿主里加载**：本会话工具表里的 `create_session` 已带 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`）——说明 profile 挂的就是当前这份 `index.js`。
+- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（63,920 字节）。
+- `bun test`：165 pass / 0 fail / 603 次断言，5 个文件（bun 1.3.13）。
+- `tsc --noEmit -p . --typeRoots <现成的 node_modules>/@types`（借一份现成的 `typescript` 与 `@types/node`，见「开发」）：0 个错误。**不带 `--typeRoots` 会报 `error TS2688: Cannot find type definition file for 'node'.` 并退出码 2**——本仓没有自己的 `node_modules`。
+- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.3.0 这次的改动要重启宿主之后才生效（重启只能由用户执行）。
 
 **尚未验证**
 

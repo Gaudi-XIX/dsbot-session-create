@@ -1,5 +1,5 @@
 // 事件形状不是编的：2026-10-26 用 .tmp/probe-blocks.mjs 从**真实**会话存储
-// （F:\AgentData\dsh\data\sessions\--F-DSBOT--\session-*.v4.jsonl.zstd，zstd 逐帧解开）里逐字读出字段名与层级，
+// （宿主会话日志 `session-*.v4.jsonl.zstd`，zstd 逐帧解开）里逐字读出字段名与层级，
 // 文本一律换成合成内容，此处不含任何真实对话。
 // 读到的形状（原文逐字）：
 //   turn/start  { turn }

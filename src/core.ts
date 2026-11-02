@@ -1,5 +1,5 @@
 // 核心逻辑：与宿主 ctx 解耦，用假 ctx 可直接单测（test/core.test.ts / test/read.test.ts）。
-// 设计口径见 F:\DSBOT\docs\chief-session-create-capability-20261026.md §1.2 / §三 / §十一：
+// 两条贯穿全文件的判断（2026-10-26 用户定，口径原文见本仓 README 与 CHANGELOG）：
 //   ① 位置不成立 → 不建会话、显式报错（fail-closed），不继承 ds-bot 的「悄悄换到团队工作区」回落。
 //   ② 派送时把会话 ID 写进台账；事后用同一个 ID 读回该会话的转写（用户 2026-10-26 要求）。
 import { randomUUID } from 'node:crypto'
@@ -71,7 +71,7 @@ export type HostCtx = {
   // preset 走 `create({ agentPreset })` —— ds-bot 0.2.2 就是这么开的会话
   // （`ds-bot/src/host/roster.js:87` `create({ ...place, ...await botPreset() })`，
   // `:70-75` 的 botPreset 返回 `{ agentPreset: 'standard' }`），实测落盘可见会话 header 里的
-  // `"agentPreset":"standard"`（F:\AgentData\dsh\data\sessions\--F-DSBOT--/*/session.v4.jsonl.zstd 解压首行）。
+  // `"agentPreset":"standard"`（宿主会话日志 zstd 逐帧解开后的首行）。
   // 不走 agentPresets.select：那个方法对「已开跑」的会话硬锁（agent-preset/locked），
   // 且要重编 agent 组合；create 时传参一次成型，没有这两个麻烦。
   agentPresets?: {
@@ -620,7 +620,7 @@ export async function createSessionIn(
   // 两者都没有就整单不建——宁可失败，也不留一条会落到宿主全局默认模型上的会话
   //（那正是 2026-11-01 烧钱的那条路）。这两条取值里没有任何写死的模型名。
   const explicit = options.model === undefined ? undefined : parseModelRef(options.model)
-  const pinned = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit
+  const pinned: { provider: string; model: string; reasoningEffort?: string } | undefined = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit
   if (pinned === undefined) {
     throw new SessionCreateError(
       'dispatcher-model-unknown',
@@ -768,17 +768,24 @@ export async function createSessionIn(
 
 export const LEDGER_FILE = 'dispatched-sessions.jsonl'
 
-// 台账落点：`$DSH_HOME/bot/session-create/dispatched-sessions.jsonl`（DSH_HOME 缺省 ~/.dsh）。
+// 本插件自己的数据目录：`$DSH_HOME/bot/session-create`（DSH_HOME 缺省 ~/.dsh）。
 // 为什么放在 `bot/` 下（用户 2026-10-26 定）：「Bot 派活 → 工作区会话 → 把结果取回来」这条交接
 // 记录属于 DS Bot 自己的账，不该与 DS Bot 平级另立一处。DS Bot 自己的 home 就是 `<DSH_HOME>/bot`
 // ——`ds-bot/index.js:57` 逐字 `const home = config.home ?? join(dshHome, 'bot')`，本插件跟随同一规则。
+// **路径一律在这里按运行时算**（2026-11-02 用户定）：本仓任何文件里都不许出现盘符写死的路径、
+// 用户名或本机目录名；要换个落点就加一个 env 覆盖。守卫用例见 test/autoresume.test.ts。
+export function sessionCreateDir(env: Record<string, string | undefined> = process.env, home: string = homedir()): string {
+  const root = (env.DSH_HOME ?? '').trim() || join(home, '.dsh')
+  return join(root, 'bot', 'session-create')
+}
+
+// 台账落点：`<数据目录>/dispatched-sessions.jsonl`。
 // 例外：若 ds-bot 的 home 被它自己的 profile 配置（`config.home`）改到别处，须用
 // DSH_SESSION_CREATE_LEDGER 手动对齐——本插件读不到 ds-bot 的配置。
 export function defaultLedgerPath(env: Record<string, string | undefined> = process.env, home: string = homedir()): string {
   const explicit = (env.DSH_SESSION_CREATE_LEDGER ?? '').trim()
   if (explicit !== '') return explicit
-  const root = (env.DSH_HOME ?? '').trim() || join(home, '.dsh')
-  return join(root, 'bot', 'session-create', LEDGER_FILE)
+  return join(sessionCreateDir(env, home), LEDGER_FILE)
 }
 
 export type DispatchRecord = {
@@ -1084,8 +1091,9 @@ export async function readSessionIn(
 // 2026-11-02 用户要求「补充信息的那个应该是直接插队发送，我现在还是排队发送」→ 补话走
 // `mode:'steer'`（宿主 `agent.steer(message)`：插进**正在跑的**那一轮，下一步就读到），
 // 不再走 `mode:'queue'`（`agent.followup(message)`：排到当前轮结束之后才看）。
-// 宿主两处先例（F:\DSBOT\tmp\asc-ctrl.js:949 逐字 `if (request.mode === "steer") agent.steer(message); else agent.followup(message);`
-// 与 :1033 逐字 `if (request.action.kind === "steer" && (target !== "next-turn" || agent.status !== "running")) throw new RemoteError("session/steer-unavailable", …)`）
+// 宿主自身实现里的两处先例（逐字引用；来源是宿主运行态产物，不在本仓）：
+//   `if (request.mode === "steer") agent.steer(message); else agent.followup(message);`
+//   `if (request.action.kind === "steer" && (target !== "next-turn" || agent.status !== "running")) throw new RemoteError("session/steer-unavailable", …)`
 // 说明 steer 只对**还在跑**的会话成立——正是本函数下面那条 idle 拒投判据的理由。
 // 另两处生产先例：①本插件 createSessionIn 用同一条通道投新会话的第一条（mode:'queue'，新会话还没跑）；
 // ②ds-bot 0.2.3 `src/host/channel.js:422` 的 'send' 分支对**已存在**的 Bot 会话调的也是同一个方法。

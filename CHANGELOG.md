@@ -2,7 +2,23 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
-## 0.2.0 — 2026-11-02（本地已提交，尚未发布）
+## 0.3.0 — 2026-11-02
+
+**行为变更**
+
+- 启动自检的落点不再写死：改为运行时算 `DSH_AUTORESUME_STATE_DIR` > `<DSH_HOME>/bot/session-create`（`DSH_HOME` 缺省 `~/.dsh`），与派送台账同一目录。用 0.2.0 及更早版本、靠文件路径接过指针的，要跟着换落点，或设 `DSH_AUTORESUME_STATE_DIR` 指回原处；旧位置的指针不会被读，也不会被删。
+
+**清理**
+
+- 公开包与公开仓库里不再有写死的本机路径：源码与测试注释里的盘符路径、本机目录名全部改成描述或删掉；`tsconfig.json` 的 `typeRoots` 去掉了指向本机另一个项目的那一项。
+- 新增守卫用例：扫 `src/` 下全部 `.ts`（不递归子目录），命中盘符形式的路径就判红——对应「以后不要再硬编码本机路径」这条长期要求。
+- 补齐 `selectModel` 调用的类型标注：此前 `tsc --noEmit` 报 2 个错，现在 0 个；运行行为不变。
+
+**文档**
+
+- README 同步：启动自检的落点与 env 覆盖、类型检查怎么做、已验证的实测数字。
+
+## 0.2.0 — 2026-11-02（已发布到 npm）
 
 **两处不向后兼容的行为变更**
 
@@ -15,7 +31,7 @@
 - `create_session` 新增 `model` 参数，写法 `provider/model`。不写就钉死到**派活那个 Bot 自己正在用的模型**；读不到派活人的模型就整单不建（`dispatcher-model-unknown`）；写法不对也整单不建（`model-invalid`）。任何情况下都不写死模型名做兜底。
 - `auto` 档在建会话后把审批策略写成 `never`（`session.append('approval/policy')`），让 reviewer 的 deny 直接终结为拒绝而不是弹一个没人应答的窗；这一步失败就归档会话并整单失败。
 - 显式传 `read-only` / `workspace-write` 会被改写成 `danger-full-access`，并在结果里标出原值（`permissionOverriddenFrom`）；要放行只读探针设 `DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1`。
-- 台账新增字段：`preset`、`permission`、`permissionOverriddenFrom`、`approvalPolicy`；建了会话之后失败的单也会留痕（`failed`）。
+- 台账新增字段：`preset`、`permission`、`permissionOverriddenFrom`、`approvalPolicy`；建了会话之后在权限档这一步失败的单会补写一行 `failed`（提示词投递失败不写台账，只归档并报 `prompt-failed`）。
 - 结果新增 `permissionNote` / `modelNote`：任何降级或没按预期生效的保护都如实写出来。
 - `session_message` 结果新增 `targetState`（`running` / `unreported`）。
 

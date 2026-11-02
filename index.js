@@ -4,6 +4,7 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 // src/autoresume.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
 import { mkdir as mkdir2, readFile as readFile2, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
+import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, join as join2 } from "node:path";
 
 // src/core.ts
@@ -443,12 +444,15 @@ async function createSessionIn(ctx, args, opts = {}) {
   };
 }
 var LEDGER_FILE = "dispatched-sessions.jsonl";
+function sessionCreateDir(env = process.env, home = homedir()) {
+  const root = (env.DSH_HOME ?? "").trim() || join(home, ".dsh");
+  return join(root, "bot", "session-create");
+}
 function defaultLedgerPath(env = process.env, home = homedir()) {
   const explicit = (env.DSH_SESSION_CREATE_LEDGER ?? "").trim();
   if (explicit !== "")
     return explicit;
-  const root = (env.DSH_HOME ?? "").trim() || join(home, ".dsh");
-  return join(root, "bot", "session-create", LEDGER_FILE);
+  return join(sessionCreateDir(env, home), LEDGER_FILE);
 }
 function headOf(text, max) {
   if (text.length <= max)
@@ -884,9 +888,16 @@ function installDispatchNotify(ctx, opts = {}) {
 
 // src/autoresume.ts
 var AUTORESUME_ENV_FLAG = "DSH_AUTORESUME_DISABLE";
-var AUTORESUME_STATE_DIR = "F:\\DSBOT\\state";
-var AUTORESUME_PENDING_FILE = join2(AUTORESUME_STATE_DIR, "restart-pending.json");
-var AUTORESUME_ACK_FILE = join2(AUTORESUME_STATE_DIR, "restart-pending.ack.json");
+var AUTORESUME_STATE_DIR_ENV = "DSH_AUTORESUME_STATE_DIR";
+var AUTORESUME_PENDING_NAME = "restart-pending.json";
+var AUTORESUME_ACK_NAME = "restart-pending.ack.json";
+function resolveAutoresumeStateDir(env = process.env, home = homedir2()) {
+  const explicit = (env[AUTORESUME_STATE_DIR_ENV] ?? "").trim();
+  return explicit !== "" ? explicit : sessionCreateDir(env, home);
+}
+var AUTORESUME_STATE_DIR = resolveAutoresumeStateDir();
+var AUTORESUME_PENDING_FILE = join2(AUTORESUME_STATE_DIR, AUTORESUME_PENDING_NAME);
+var AUTORESUME_ACK_FILE = join2(AUTORESUME_STATE_DIR, AUTORESUME_ACK_NAME);
 var AUTORESUME_RETRY_DELAYS_MS = [6000, 12000, 20000];
 var AUTORESUME_DELAY_MS = AUTORESUME_RETRY_DELAYS_MS[0];
 var AUTORESUME_TIMEOUT_MS = 1e4;
@@ -964,8 +975,9 @@ async function runAutoResume(deps = {}) {
     log(`startup self-check skipped (${reason}); no pointer was read.`);
     return { status: "disabled", reason };
   }
-  const pendingFile = deps.pendingFile ?? AUTORESUME_PENDING_FILE;
-  const ackFile = deps.ackFile ?? AUTORESUME_ACK_FILE;
+  const stateDir = resolveAutoresumeStateDir(env);
+  const pendingFile = deps.pendingFile ?? join2(stateDir, AUTORESUME_PENDING_NAME);
+  const ackFile = deps.ackFile ?? join2(stateDir, AUTORESUME_ACK_NAME);
   const readText = deps.readText ?? ((path) => readFile2(path, "utf8"));
   const writeAtomic = deps.writeAtomic ?? writeAtomicDefault;
   const now = deps.now ?? (() => Date.now());

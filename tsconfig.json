@@ -8,7 +8,6 @@
     "noEmit": true,
     "skipLibCheck": true,
     "types": ["node"],
-    "typeRoots": ["node_modules/@types", "F:/AgentData/dsh-agy-cli/node_modules/@types"],
     "baseUrl": ".",
     "paths": {
       "@deepseek-ai/dsh-tools": ["./test/stubs/dsh-tools.ts"]

@@ -171,7 +171,7 @@ function fakeCtx(options: {
   return { ctx, calls, promptStarted }
 }
 
-// 本机沙箱只允许在插件目录下写（%TEMP% 与 F:\DSBOT\tmp 都是 EPERM），临时目录放插件内。
+// 沙箱只允许在插件目录下写（写系统临时目录会被拒 EPERM），所以临时目录放插件内。
 const TMP_ROOT = join(import.meta.dir, '..', '.tmp')
 const TEST_LEDGER = join(TMP_ROOT, 'core-test-ledger.jsonl')
 
@@ -189,8 +189,8 @@ async function tempFolder(): Promise<string> {
 describe('台账隔离', () => {
   test('默认落点必须被指到 .tmp，不得碰用户真实 $DSH_HOME', () => {
     // 若将来有人删掉文件顶部那行 env，或 defaultLedgerPath 改成不再读 env，这条会红。
+    // 只断言「等于 .tmp 下那个路径」——不拿本机目录名或盘符当判据（2026-11-02 用户定）。
     expect(defaultLedgerPath()).toBe(TEST_LEDGER)
-    expect(defaultLedgerPath()).not.toContain('AgentData')
   })
 })
 
@@ -773,7 +773,7 @@ describe('补话只许投给还在跑的会话（已停下 → 拒投，要新�
     const { ctx, calls } = fakeCtx({
       resolveAgent: () => ({ agent: { session: { id: 'session-live' }, status: 'running' } }),
     })
-    const result = await messageSessionIn(ctx, { sessionId: 'session-live', message: '别动 F:/defws 那个分支' }, opts)
+    const result = await messageSessionIn(ctx, { sessionId: 'session-live', message: '别动 E:/sample-repo 那个分支' }, opts)
     expect(result.targetState).toBe('running')
     expect(calls.prompt).toHaveLength(1)
     expect(calls.prompt[0]).toMatchObject({ sessionId: 'session-live', mode: 'steer' })
