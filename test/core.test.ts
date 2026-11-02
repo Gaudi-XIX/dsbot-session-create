@@ -776,7 +776,7 @@ describe('补话只许投给还在跑的会话（已停下 → 拒投，要新�
     const result = await messageSessionIn(ctx, { sessionId: 'session-live', message: '别动 F:/defws 那个分支' }, opts)
     expect(result.targetState).toBe('running')
     expect(calls.prompt).toHaveLength(1)
-    expect(calls.prompt[0]).toMatchObject({ sessionId: 'session-live', mode: 'queue' })
+    expect(calls.prompt[0]).toMatchObject({ sessionId: 'session-live', mode: 'steer' })
   })
 
   test('宿主没报状态 → 照投，但如实标 unreported（不冒充「它在跑」）', async () => {

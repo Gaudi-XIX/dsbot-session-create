@@ -428,7 +428,10 @@ describe('完成回执：接线', () => {
         sessionController: {
           async create() { return { sessionId: 'sess-built' } },
           async prompt() { return true },
-          async resolveAgent(sessionId: string) { return { agent: { session: { id: sessionId, seq: 1 }, status: 'idle' } } },
+          async resolveAgent(sessionId: string) {
+            // 派活人的会话要能被读出「正在跑哪个模型」，否则 create_session 按判据整单失败、不建会话。
+            return { agent: { session: { id: sessionId, seq: 1, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) }, status: 'idle' } }
+          },
         },
         sessionTitle: { async rename() {} },
         workspaceRegistry: {

@@ -690,7 +690,7 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
     outcome = await controller.prompt?.({
       requestId: randomUUID(),
       sessionId,
-      mode: "queue",
+      mode: "steer",
       content: [{ type: "text", text: message }]
     }, opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS));
   } catch (error) {
@@ -1130,7 +1130,8 @@ var MESSAGE_DESCRIPTION = [
   "Send one more message into a Session that already exists, by its session id. No new Session is created.",
   "This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.",
   "Only a Session that is still working accepts it: when the harness reports the Session idle (its turn has finished), the message is refused and nothing is sent — a dispatch that has stopped is a new task, so send it a new Session with create_session.",
-  "The message is queued: it does not interrupt the turn that is running, it is picked up after it.",
+  "The message steers the turn that is running: the host splices it into that turn at once, so the Session reads it on its next step instead of waiting for the turn to end.",
+  "Nothing yet proves the Session read it — read_session_transcript shows that.",
   "A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.",
   "Read what the Session did with it afterwards using read_session_transcript."
 ].join(" ");
@@ -1172,7 +1173,7 @@ function formatTranscript(transcript) {
 `);
 }
 function formatMessage(result) {
-  const head = `Queued a message into Session ${result.sessionId}${result.title === undefined ? "" : ` · "${result.title}"`}.`;
+  const head = `Steered a message into Session ${result.sessionId}${result.title === undefined ? "" : ` · "${result.title}"`}.`;
   const place = result.placement === undefined ? "" : `place: ${result.placement}`;
   const state = result.targetState === "running" ? "The harness reports this Session as still running, so this goes into the turn that is in flight." : "The harness did not report this Session's state; it was taken as still in flight. If its turn had already ended, this should have gone to a new Session instead.";
   const ledger = result.ledgerError === undefined ? "" : `(the dispatch ledger could not be read, so this Session was not matched to a dispatch: ${result.ledgerError})`;
@@ -1180,7 +1181,7 @@ function formatMessage(result) {
     head,
     ...place === "" ? [] : [place],
     state,
-    `The host took it into the Session's queue (mode "queue"): it does not interrupt the turn that is running, and the Session picks it up after it. Nothing yet proves the Session has read it — read_session_transcript shows that.`,
+    'The host spliced it into the turn that is running (mode "steer"): the Session reads it on its next step, without waiting for that turn to finish. Nothing yet proves the Session has read it — read_session_transcript shows that.',
     ...ledger === "" ? [] : [ledger]
   ].join(`
 `);
@@ -1301,7 +1302,7 @@ function apply(ctx) {
     description: MESSAGE_DESCRIPTION,
     parameters: {
       sessionId: { type: "string", required: true, description: "The Session to send into: an id this harness already knows. No new Session is made; an unknown id is refused." },
-      message: { type: "string", required: true, description: "The message to deliver into that Session. It is queued, so it lands after the turn that is running." }
+      message: { type: "string", required: true, description: "The message to deliver into that Session. It steers the turn that is running: it is spliced in at once and read on the next step, not after the turn ends." }
     },
     output,
     async execute(args) {

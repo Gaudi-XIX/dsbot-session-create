@@ -711,7 +711,7 @@ export async function createSessionIn(
       {
         requestId: randomUUID(),
         sessionId,
-        mode: 'queue',
+        mode: 'queue', // 新会话还没跑起来：steer 只往「正在跑的轮」里插，起不动这一轮，必须用 queue
         content: [{ type: 'text', text: prompt }],
       },
       // opts.signal 优先：调用方自带取消信号时用它（也让它可被单测 —— bun 1.3.13 的
@@ -1080,11 +1080,15 @@ export async function readSessionIn(
 // ---------------------------------------------------------------------------
 // 给已存在的会话补一条消息（2026-10-28 加，用户要求）
 //
-// 通道就是**派送与完成回执已经在用的那一条**：宿主 `sessionController.prompt`
-// （`{ requestId, sessionId, mode:'queue', content }`，排队投递、不打断当前轮）。
-// 两处生产先例：①本插件 createSessionIn 用它开新会话投第一条；②createDispatchNotifier
-// 把回执投给**已经在跑的**派活人会话（core.ts 的 deliver）；③ds-bot 0.2.3
-// `src/host/channel.js:422` 的 'send' 分支对**已存在**的 Bot 会话调的也是同一个方法。
+// 通道就是**派送与完成回执已经在用的那一条**：宿主 `sessionController.prompt`。
+// 2026-11-02 用户要求「补充信息的那个应该是直接插队发送，我现在还是排队发送」→ 补话走
+// `mode:'steer'`（宿主 `agent.steer(message)`：插进**正在跑的**那一轮，下一步就读到），
+// 不再走 `mode:'queue'`（`agent.followup(message)`：排到当前轮结束之后才看）。
+// 宿主两处先例（F:\DSBOT\tmp\asc-ctrl.js:949 逐字 `if (request.mode === "steer") agent.steer(message); else agent.followup(message);`
+// 与 :1033 逐字 `if (request.action.kind === "steer" && (target !== "next-turn" || agent.status !== "running")) throw new RemoteError("session/steer-unavailable", …)`）
+// 说明 steer 只对**还在跑**的会话成立——正是本函数下面那条 idle 拒投判据的理由。
+// 另两处生产先例：①本插件 createSessionIn 用同一条通道投新会话的第一条（mode:'queue'，新会话还没跑）；
+// ②ds-bot 0.2.3 `src/host/channel.js:422` 的 'send' 分支对**已存在**的 Bot 会话调的也是同一个方法。
 // 所以这里不新造旁路，只把这条现成通道开成一个工具。
 // ---------------------------------------------------------------------------
 
@@ -1178,7 +1182,7 @@ export async function messageSessionIn(
       {
         requestId: randomUUID(),
         sessionId,
-        mode: 'queue',
+        mode: 'steer',
         content: [{ type: 'text', text: message }],
       },
       opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS),
@@ -1187,7 +1191,9 @@ export async function messageSessionIn(
     throw new SessionCreateError('message-failed', `the message did not go into Session "${sessionId}" (${reasonOf(error)}); nothing was delivered.`)
   }
   // 宿主明确回 false = 拒收。其余（true / undefined / 认不出的形状）按已受理处理，
-  // 但对外只说「已进入队列」，不说「它看过了」——后者只有读回才能证明。
+  // 但对外只说「已插进正在跑的那一轮」（mode:'steer'），不说「它看过了」——后者只有读回才能证明。
+  // 宿主在「这一轮已经收口」时会抛 session/agent-busy 或 session/steer-unavailable：
+  // 那种情况走下面 message-failed 分支如实报错，不假装投进去了。
   if (outcome === false) {
     throw new SessionCreateError('message-refused', `the harness refused the message for Session "${sessionId}"; nothing was delivered.`)
   }
@@ -1382,7 +1388,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
         {
           requestId: randomUUID(),
           sessionId: dispatcher,
-          mode: 'queue',
+          mode: 'queue', // 回执是给派活人的旁路通报：排到下一轮，不去打断他手头正在跑的那一轮
           content: [{ type: 'text', text: receiptText(record, sessionId, endTime, turn, reason) }],
         },
         AbortSignal.timeout(NOTIFY_TIMEOUT_MS),

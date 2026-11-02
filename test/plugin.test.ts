@@ -23,14 +23,21 @@ const previousAutoResume = process.env.DSH_AUTORESUME_DISABLE
 
 type Calls = { create: Record<string, unknown>[]; prompt: Record<string, unknown>[]; rename: unknown[][]; archive: unknown[][]; page: Record<string, unknown>[] }
 
-function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: boolean; agentStatus?: string } = {}): { spec: Spec; tools: Map<string, Spec>; calls: Calls } {
+// 派活人的会话：create_session 建会话前要读它正在跑的模型，读不到就整单失败、不建会话。
+// 冒烟测试里固定成一组免费池读数，好让「钉模型」这一环有东西可读（要考读不到的场景，用 options.dispatcherHeaderUnreadable）。
+const DISPATCHER_ID = 'session-bot-1'
+const DISPATCHER_HEADER = { provider: 'magpie-gateway', model: 'group/pool', reasoningEffort: 'high' }
+const DISPATCHER_EXEC = { agent: { session: { id: DISPATCHER_ID } } }
+
+function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: boolean; agentStatus?: string; dispatcherHeaderUnreadable?: boolean } = {}): { spec: Spec; tools: Map<string, Spec>; calls: Calls } {
   const tools = new Map<string, Spec>()
   const calls: Calls = { create: [], prompt: [], rename: [], archive: [], page: [] }
   const controller: Record<string, unknown> = {
     async create(o: Record<string, unknown>) { calls.create.push(o); return { sessionId: 'sess-9' } },
     async prompt(o: Record<string, unknown>) { calls.prompt.push(o); return true },
     async resolveAgent(sessionId: string) {
-      return { agent: { session: { id: sessionId, seq: 42 }, ...(options.agentStatus === undefined ? {} : { status: options.agentStatus }) } }
+      const header = options.dispatcherHeaderUnreadable === true ? {} : { requestHeader: () => ({ config: DISPATCHER_HEADER }) }
+      return { agent: { session: { id: sessionId, seq: 42, ...header }, ...(options.agentStatus === undefined ? {} : { status: options.agentStatus }) } }
     },
   }
   if (options.noPage !== true) {
@@ -40,7 +47,13 @@ function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: bool
     }
   }
   const services = {
-    tools: { register: (tool: Spec) => { tools.set(tool.name, tool) } },
+    // 工具调用一律带上「派活人」这份执行上下文：真宿主在 exec.agent.session.id 里给这个身份，
+    // 冒烟测试没有真会话，就固定喂 DISPATCHER_EXEC（用例自己传 exec 时以它为准）。
+    tools: {
+      register: (tool: Spec) => {
+        tools.set(tool.name, { ...tool, execute: (args: Record<string, unknown>, exec?: unknown) => tool.execute(args, exec ?? DISPATCHER_EXEC) })
+      },
+    },
     sessionController: controller,
     sessionTitle: { async rename(session: unknown, title: string) { calls.rename.push([session, title]) } },
     commands: { async execute(_agent: unknown, _line: string) { return { result: { kind: 'success' } } } },
@@ -91,7 +104,7 @@ describe('插件清单', () => {
   test('create_session 参数齐全且必填项正确', () => {
     const { spec } = load()
     expect(spec.name).toBe('create_session')
-    expect(Object.keys(spec.parameters).sort()).toEqual(['folder', 'permission', 'preset', 'prompt', 'title', 'workspace'])
+    expect(Object.keys(spec.parameters).sort()).toEqual(['folder', 'model', 'permission', 'preset', 'prompt', 'title', 'workspace'])
     expect(spec.parameters.title.required).toBe(true)
     expect(spec.parameters.prompt.required).toBe(true)
     expect(spec.parameters.workspace.required).toBeUndefined()
@@ -147,7 +160,7 @@ describe('端到端（构建产物）', () => {
       sessionController: {
         async create(o: Record<string, unknown>) { calls.create.push(o); return { sessionId: 'sess-late' } },
         async prompt(o: Record<string, unknown>) { calls.prompt.push(o); return true },
-        async resolveAgent(sessionId: string) { return { agent: { session: { id: sessionId, seq: 42 } } } },
+        async resolveAgent(sessionId: string) { return { agent: { session: { id: sessionId, seq: 42, requestHeader: () => ({ config: DISPATCHER_HEADER }) } } } },
       },
       sessionTitle: { async rename() { return undefined } },
       workspaceRegistry: {
@@ -164,7 +177,7 @@ describe('端到端（构建产物）', () => {
     }
     apply(ctx as never)
     ready = true
-    const text = await (tools.get('create_session') as Spec).execute({ title: 't', prompt: 'p', workspace: 'ws-1' })
+    const text = await (tools.get('create_session') as Spec).execute({ title: 't', prompt: 'p', workspace: 'ws-1' }, DISPATCHER_EXEC)
     expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
     expect(calls.prompt).toHaveLength(1)
     expect(text).toContain('sess-late')
@@ -193,7 +206,7 @@ describe('端到端（构建产物）', () => {
       sessionController: {
         async create() { return { sessionId: 'orphan-1' } },
         async prompt() { throw new Error('no agent') },
-        async resolveAgent() { return { agent: { session: {} } } },
+        async resolveAgent() { return { agent: { session: { requestHeader: () => ({ config: DISPATCHER_HEADER }) } } } },
       },
       sessionTitle: { async rename() { return undefined } },
       workspaceRegistry: {
@@ -204,21 +217,21 @@ describe('端到端（构建产物）', () => {
     }
     apply(ctx as never)
     const spec = tools.get('create_session') as Spec
-    const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'w' })
+    const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'w' }, DISPATCHER_EXEC)
     expect(text).toContain('Could not start the Session')
     expect(archived).toEqual([['orphan-1', { stopActivity: true }]])
   })
 })
 
 describe('给已存在的会话补一条消息（构建产物）', () => {
-  test('正常投递：只投一条 prompt，不建会话，回执只说「已排队」不说「它看过」', async () => {
+  test('正常投递：只投一条 prompt（steer 插队，不排队），不建会话，回执只说「已插进那一轮」不说「它看过」', async () => {
     const { tools, calls } = load()
     const text = await (tools.get('session_message') as Spec).execute({ sessionId: 'sess-live', message: '别把契约文件漏掉' })
     expect(calls.create).toHaveLength(0)
     expect(calls.prompt).toHaveLength(1)
-    expect(calls.prompt[0]).toMatchObject({ sessionId: 'sess-live', mode: 'queue', content: [{ type: 'text', text: '别把契约文件漏掉' }] })
-    expect(text).toContain('Queued a message into Session sess-live')
-    expect(text).toContain('The host took it into the Session\'s queue')
+    expect(calls.prompt[0]).toMatchObject({ sessionId: 'sess-live', mode: 'steer', content: [{ type: 'text', text: '别把契约文件漏掉' }] })
+    expect(text).toContain('Steered a message into Session sess-live')
+    expect(text).toContain('The host spliced it into the turn that is running (mode "steer")')
     expect(text).toContain('Nothing yet proves the Session has read it')
   })
 
