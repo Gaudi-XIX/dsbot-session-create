@@ -1073,6 +1073,12 @@ export type MessageResult = {
   placement?: string
   /** 台账读不出来时的原因；不影响投递，但要如实带出去。 */
   ledgerError?: string
+  /**
+   * 投递那一刻目标会话的宿主状态。`running` = 还在跑，这条补话进的是在飞的那一轮；
+   * `unreported` = 宿主没报状态，只能当它还在跑（要如实告诉调用方）。
+   * 宿主报 `idle` 的情况不会走到这里——那种投递在闸门处就被拒了。
+   */
+  targetState: 'running' | 'unreported'
 }
 
 // 补话只需要两项能力，不该被建会话所需的其余服务连坐。
@@ -1127,6 +1133,22 @@ export async function messageSessionIn(
     throw new SessionCreateError('session-unknown', `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ''}; nothing was sent.`)
   }
 
+  // 派任务是「新会话」，补话只服务「还在跑的那一轮」。
+  // 目标会话的 turn 已经结束（宿主直给 idle）时，再往这条历史里投一件新活就是复用：
+  // 不同轮次的活会一层层堆在同一条会话上。2026-11-01 那单正是这么堆的——同一条会话被补了
+  // 16 轮裁决，历史涨到约 76 万 token，第二天宿主把它从 1,048,576 窗口的模型切到 512,000
+  // 窗口的免费池后立刻放不下，10:52 报 preflight_compress_failed。
+  // 判据只用宿主直给的状态，不替调用方判断「这条消息算新任务还是纠偏」（那是语义判断）：
+  // running = 还在跑，允许补；idle = 已停下，要接着干就新开一个会话。
+  const hostStatus = resolved.agent?.status
+  if (hostStatus === 'idle') {
+    throw new SessionCreateError(
+      'session-idle',
+      `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`,
+    )
+  }
+  const targetState: 'running' | 'unreported' = hostStatus === 'running' ? 'running' : 'unreported'
+
   let outcome: unknown
   try {
     outcome = await controller.prompt?.(
@@ -1147,7 +1169,7 @@ export async function messageSessionIn(
     throw new SessionCreateError('message-refused', `the harness refused the message for Session "${sessionId}"; nothing was delivered.`)
   }
 
-  return { sessionId, ...(title === undefined ? {} : { title }), ...(placement === undefined ? {} : { placement }), ...(ledgerError === undefined ? {} : { ledgerError }) }
+  return { sessionId, targetState, ...(title === undefined ? {} : { title }), ...(placement === undefined ? {} : { placement }), ...(ledgerError === undefined ? {} : { ledgerError }) }
 }
 
 export type DispatchLine = {

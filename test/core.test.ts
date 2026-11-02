@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SessionCreateError, createSessionIn, defaultLedgerPath, preflight, resolveServices, type HostCtx, type WorkspaceEntry } from '../src/core'
+import { SessionCreateError, createSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type HostCtx, type WorkspaceEntry } from '../src/core'
 
 type Calls = {
   create: Record<string, unknown>[]
@@ -702,5 +702,44 @@ describe('派出去的会话必须钉死模型（不许落到全局默认）', (
     const result = await createSessionIn(ctx, base)
     expect(result.sessionId).toBe('sess-1')
     expect(result.modelNote).toContain('model unavailable')
+  })
+})
+
+// 派出去的任务必须开新会话。补话通道只服务「还在跑的那一轮」——
+// 目标会话已经停下（宿主直给 idle）时再投一件活就是复用，实测能把同一条会话堆到 76 万 token。
+describe('补话只许投给还在跑的会话（已停下 → 拒投，要新任务就新开会话）', () => {
+  const opts = { ledger: TEST_LEDGER }
+
+  test('宿主报 idle → 拒投，什么都不发，并指向 create_session', async () => {
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => ({ agent: { session: { id: 'session-old' }, status: 'idle' } }),
+    })
+    const error = await messageSessionIn(ctx, { sessionId: 'session-old', message: '接着做第 15 轮' }, opts).catch(e => e)
+    expect(error).toBeInstanceOf(SessionCreateError)
+    expect(error.code).toBe('session-idle')
+    expect(error.message).toContain('create_session')
+    expect(calls.prompt).toEqual([])
+  })
+
+  test('宿主报 running → 照投，回执写清是投给在飞那一轮', async () => {
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => ({ agent: { session: { id: 'session-live' }, status: 'running' } }),
+    })
+    const result = await messageSessionIn(ctx, { sessionId: 'session-live', message: '别动 F:/defws 那个分支' }, opts)
+    expect(result.targetState).toBe('running')
+    expect(calls.prompt).toHaveLength(1)
+    expect(calls.prompt[0]).toMatchObject({ sessionId: 'session-live', mode: 'queue' })
+  })
+
+  test('宿主没报状态 → 照投，但如实标 unreported（不冒充「它在跑」）', async () => {
+    const { ctx } = fakeCtx({ resolveAgent: () => ({ agent: { session: { id: 'session-x' } } }) })
+    const result = await messageSessionIn(ctx, { sessionId: 'session-x', message: 'm' }, opts)
+    expect(result.targetState).toBe('unreported')
+  })
+
+  test('宿主不认识的会话 → 拒投', async () => {
+    const { ctx, calls } = fakeCtx({ resolveAgent: () => ({ error: { message: 'not found' } }) })
+    await expect(messageSessionIn(ctx, { sessionId: 'nope', message: 'm' }, opts)).rejects.toMatchObject({ code: 'session-unknown' })
+    expect(calls.prompt).toEqual([])
   })
 })

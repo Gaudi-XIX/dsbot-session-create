@@ -668,6 +668,11 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
   if (!resolved || "error" in resolved || resolved.agent?.session === undefined || resolved.agent.session === null) {
     throw new SessionCreateError("session-unknown", `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ""}; nothing was sent.`);
   }
+  const hostStatus = resolved.agent?.status;
+  if (hostStatus === "idle") {
+    throw new SessionCreateError("session-idle", `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`);
+  }
+  const targetState = hostStatus === "running" ? "running" : "unreported";
   let outcome;
   try {
     outcome = await controller.prompt?.({
@@ -682,7 +687,7 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
   if (outcome === false) {
     throw new SessionCreateError("message-refused", `the harness refused the message for Session "${sessionId}"; nothing was delivered.`);
   }
-  return { sessionId, ...title === undefined ? {} : { title }, ...placement === undefined ? {} : { placement }, ...ledgerError === undefined ? {} : { ledgerError } };
+  return { sessionId, targetState, ...title === undefined ? {} : { title }, ...placement === undefined ? {} : { placement }, ...ledgerError === undefined ? {} : { ledgerError } };
 }
 async function listDispatchedIn(ctx, args = {}, opts = {}) {
   const ledgerPath = opts.ledger ?? defaultLedgerPath();
@@ -1111,7 +1116,8 @@ var CREATE_DESCRIPTION = [
 var MESSAGE_DESCRIPTION = [
   "Send one more message into a Session that already exists, by its session id. No new Session is created.",
   "This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.",
-  "The message is queued: it does not interrupt the turn that is running, it is picked up after it (or when the Session starts one).",
+  "Only a Session that is still working accepts it: when the harness reports the Session idle (its turn has finished), the message is refused and nothing is sent — a dispatch that has stopped is a new task, so send it a new Session with create_session.",
+  "The message is queued: it does not interrupt the turn that is running, it is picked up after it.",
   "A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.",
   "Read what the Session did with it afterwards using read_session_transcript."
 ].join(" ");
@@ -1155,10 +1161,12 @@ function formatTranscript(transcript) {
 function formatMessage(result) {
   const head = `Queued a message into Session ${result.sessionId}${result.title === undefined ? "" : ` · "${result.title}"`}.`;
   const place = result.placement === undefined ? "" : `place: ${result.placement}`;
+  const state = result.targetState === "running" ? "The harness reports this Session as still running, so this goes into the turn that is in flight." : "The harness did not report this Session's state; it was taken as still in flight. If its turn had already ended, this should have gone to a new Session instead.";
   const ledger = result.ledgerError === undefined ? "" : `(the dispatch ledger could not be read, so this Session was not matched to a dispatch: ${result.ledgerError})`;
   return [
     head,
     ...place === "" ? [] : [place],
+    state,
     `The host took it into the Session's queue (mode "queue"): it does not interrupt the turn that is running, and the Session picks it up after it. Nothing yet proves the Session has read it — read_session_transcript shows that.`,
     ...ledger === "" ? [] : [ledger]
   ].join(`
