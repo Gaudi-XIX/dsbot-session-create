@@ -8,6 +8,7 @@ import { installAutoResume } from './autoresume'
 import {
   SessionCreateError,
   createSessionIn,
+  deadlineSamples,
   dispatcherSessionOf,
   installDispatchNotify,
   listDispatchedIn,
@@ -16,8 +17,10 @@ import {
   preflightMessage,
   preflightOptions,
   preflightRead,
+  readLedger,
   readSessionIn,
   resolveServices,
+  suggestDeadlineSeconds,
   stamp,
   type CreateArgs,
   type HostCtx,
@@ -43,6 +46,8 @@ const CREATE_DESCRIPTION = [
   'The Session\'s model is pinned explicitly and is never the host\'s global default: it is the model the dispatching Bot\'s own Session runs on, unless `model` names another one as `provider/model`. If neither can be read, no Session is started.',
   'The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.',
   'Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot.',
+  'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched".',
+  'After dispatching, arm one one-shot deadline for it with schedule_create(after_seconds=…) using the value this tool returns, and delete it with schedule_delete once its terminal receipt arrives (one-shot only; never a periodic check).',
 ].join(' ') + '\n' + [
   '派会话前先自问三句：',
   '① 要落盘还是回传？落盘就在 prompt 里写死输出路径，只回摘要+路径。',
@@ -191,6 +196,27 @@ export function apply(ctx: HostCtx): void {
             : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`
           const permissionNote = result.permissionNote === undefined ? '' : `NOTE: ${result.permissionNote}`
           const modelNote = result.modelNote === undefined ? '' : `NOTE: ${result.modelNote}`
+          // 一次性 deadline 的建议值（2026-11-03）：插件只算这个数，不碰调度系统 ——
+          // 建与删都由派活方在会话里调 schedule_create / schedule_delete 完成。
+          // 口径＝台账近 30 条有效样本派活时长的 p95 × 1.2（core.suggestDeadlineSeconds）。
+          let deadlineNote: string | undefined
+          if (result.ledgerError === undefined && result.ledgerPath !== undefined) {
+            try {
+              const records = await readLedger(result.ledgerPath)
+              const seconds = suggestDeadlineSeconds(records)
+              if (seconds === undefined) {
+                deadlineNote = `- No one-shot deadline suggested: only ${deadlineSamples(records).length} completed ledger records carry both timestamps (need 5).`
+              } else {
+                const minutes = seconds / 60
+                deadlineNote = `- Suggested one-shot deadline: ${minutes} minutes — if this Session has the schedule tool (standard/ptc presets mount it; minimal does not), call schedule_create(after_seconds=${minutes * 60}) for this dispatch and schedule_delete once its terminal receipt arrives.`
+              }
+            } catch (error) {
+              // 台账刚落过一条又读不出来：不新增第三种用户可见文案（同一处失败上面那行
+              // ledgerNote / 台账本身会报），但也不许静默 —— 从插件的诊断面出声。
+              const reason = error instanceof Error ? error.message : String(error)
+              console.warn(`[dsbot-session-create] the dispatch ledger could not be read right after dispatching, so no one-shot deadline was suggested (${reason}).`)
+            }
+          }
           return [
             `Started a new Session in ${result.placement}.`,
             `- title: ${result.title}${renameNote}`,
@@ -201,6 +227,7 @@ export function apply(ctx: HostCtx): void {
             ...(modelNote === '' ? [] : [modelNote]),
             'The prompt is queued in the Session.',
             ledgerNote,
+            ...(deadlineNote === undefined ? [] : [deadlineNote]),
           ].join('\n')
         } catch (error) {
           if (error instanceof SessionCreateError) return `Could not start the Session: ${error.message}`
@@ -294,7 +321,8 @@ export function apply(ctx: HostCtx): void {
   )
 
   // 完成回执：监听宿主的会话事件面（turn/start · turn/end），只认台账里本插件派出去的会话；
-  // 安静满 120 秒且宿主复核为 idle 时，用 controller.prompt(mode:'queue') 投一条短回执给派活人。
+  // 安静满 120 秒、宿主复核为 idle、它自己派的活都停了，**且被派会话最终答复里有终态标记**时，
+  // 用 controller.prompt(mode:'queue') 投一条短回执给派活人。
   // 这一处挂在 ctx 上而不是工具里 —— 没人调用工具时也要有东西替我们盯着（用户 2026-10-28 要求）。
   installDispatchNotify(ctx)
 

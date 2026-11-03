@@ -126,15 +126,48 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### 派完自动回执
 
-派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`，并且**它自己派出去的活都已经停下来**，插件才用 `controller.prompt(mode: 'queue')` 投一条短回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts:299` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
+派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`、**它自己派出去的活都已经停下来**，并且**它的最终答复里写了终态标记**，插件才用 `controller.prompt(mode: 'queue')` 投一条回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
 
-投递面是收窄过的：把**假回执**（关停、重启掐断、报错、卡住）和**分段派工**（还在等自己派出去的活）这两大类挡掉。但要说清楚——`turn/end` 这一层看不出「这一单」的边界，**收窄不等于只剩整单完成**。2026-11-03 拿本机派单台账 126 单逐条回溯（含静默窗口与三道门）：旧口径会投 160 条回执，新口径 154 条（少 3.75%，其中真正被门三拦下的是 0 条）；120 单仍会收到至少一条，11 单会收到多条，最多的一单 11 条。想再降只能改协议（例如一次派单只投一条回执），不在这一版里。
+投不投由**派活方在最终答复里写的标记**决定，插件只认标记：
+
+| 最终答复里的标记 | 回执 | 含义 |
+| --- | --- | --- |
+| `[DISPATCH DONE]` | 投 | 整单完成 |
+| `[NEEDS USER]` | 投 | 需要人拍板 |
+| `[DISPATCH BLOCKED]` | 投 | 受阻停手，要人来救 |
+| 三个都没有 | **不投** | 中间收工，还在等自己派的活 |
+
+判定只读**该会话最后一条 `assistant` 消息的正文**，不看整篇 transcript；大小写敏感，全角括号或错拼一律不算标记。
+
+回执正文只有一行（不含换行符），末尾不再带「去读 transcript / 无需回复」那类句子——要细节就用 `read_session_transcript` 自取：
+
+```
+[Dispatch receipt · <title>] <mark> · session <sessionId> · ended <stamp> (turn N, reason: X)
+```
+
+`<title>` 是派单时给的标题，`<mark>` 是命中的那个标记，`<stamp>` 是这一轮结束的时刻，括号里仍是 `turn N, reason: X`。
 
 - **只认正常收尾**：`aborted`（关停/叫停）、`interrupted`（重启掐断）、`error`、`blocked`、`max-tokens`，以及认不出来的取值，一律不进静默窗口、一个回执都不发（`COMPLETED_REASON`，门一）。取值来自 2026-11-03 全扫本机 `<DSH_HOME>/data/sessions/**`（当日 1,740 份文件、7,851 条 `turn/end`）的统计：`completed` 6,914 / `aborted` 464 / `error` 171 / `blocked` 153 / `interrupted` 121 / `max-tokens` 29。
 - **还在等自己派的活就不算收口**：台账里 `dispatcherSessionId` 指向它、宿主又报着没停的子会话，说明它是在等它们（`firstBusyChild`，门三）。等的时候不投；子会话停下、它被叫醒再跑一轮、这一轮没有在跑的子会话，才投。
-- **机械区分不了的那一类**：自己没派人、也没出错，就是这一轮干完了停下——这与「整单完成」在宿主事件面上同形，插件不替派活方猜，照旧投一条；由派活方自己按纪律决定要不要理它。
+- **无标记一律不投**：既包括「这一轮干完了、还在等自己派出去的活」，也包括「忘了写标记」。另外，`page` 不在宿主服务面、`page` 抛错或超时、拿不到 `seq`、末条 `assistant` 正文为空——都发声一行日志后**不投**。宁可漏一条，也不投一条假回执。
 
 回执走 `queue` 不走 `steer`：它是给派活人的旁路通报，排到下一轮，不去打断他手头正在跑的那一轮。
+
+#### 一次性 deadline 兜底
+
+回执永远不来时，兜底靠**派活方自己建的一次性提醒**，插件只给数值、不碰调度系统（不写 `schedule.json`、不取 `ctx.schedule`、不新增任何常驻定时器）。
+
+- **谁建谁删**：派活方在派单那一轮调 `schedule_create`，收到那一单的终态回执后调 `schedule_delete`。
+- **数值哪来**：`create_session` 的结果里多一行 `Suggested one-shot deadline: <N> minutes`；算法是台账里**近 30 条**「派送时刻与首次回执时刻都有」的有效样本，取派活时长的 **p95 × 1.2**，线性插值后向上取整到分钟。样本不足 5 条时不出数，改说 `No one-shot deadline suggested: only <k> completed ledger records carry both timestamps (need 5).`
+- **怎么建**：`schedule_create(after_seconds = N × 60)`，`after_seconds` 形态只响一次，没有周期巡检。
+- **前提**：`schedule` 工具由 `standard` / `ptc` 预设挂载，`minimal` 没有——建议行里写明这一点，插件不做检测。
+
+#### 残余四条
+
+1. **漏投是刻意的**：末条正文读不到、或正文里没有标记，一律不投；漏一条的代价是派活方多等一次 deadline。
+2. **插件不替派活方建提醒**：只给建议秒数，建和删都由派活方在会话里做；`minimal` 预设下这个工具根本不在。
+3. **宿主重启的缺口**：派单成功到 `schedule_create` 成功之间宿主重启，既没有回执也没有提醒，只能由派活方按台账自查。
+4. **到期不保证补投**：提醒到期而宿主长期不重启时，宿主调度器没有自动重试定时器，补投不可保证。
 
 ### 宿主启动自检（重启后自动接续）
 
@@ -196,7 +229,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ```bash
 bun run build   # src/*.ts → index.js（@deepseek-ai/dsh-tools 保持 external）
-bun test        # 165 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
+bun test        # 190 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
 ```
 
 类型检查（本仓不带 `typescript` 与 `@types/node` 依赖，用现成的那份就行）：
@@ -219,14 +252,14 @@ node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一�
 
 **已验证（2026-11-03 实测）**
 
-- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（64,495 字节，sha256 `040124bb…989`）。
-- `bun test`：176 pass / 0 fail / 654 次断言，5 个文件（bun 1.3.13）。
+- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（69,033 B / sha256 cbc2b6c6cd7af2b61f321556007b8953a5837724d158fbf4e7f6089f823ae010）。
+- `bun test`：193 pass / 0 fail / 703 次断言，5 个文件（bun 1.3.13）。
 - `tsc --noEmit -p . --typeRoots <现成的 node_modules>/@types`（借一份现成的 `typescript` 与 `@types/node`，见「开发」）：0 个错误。**不带 `--typeRoots` 会报 `error TS2688: Cannot find type definition file for 'node'.` 并退出码 2**——本仓没有自己的 `node_modules`。
-- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0 与 0.5.0 的改动都要重启宿主之后才生效（重启只能由用户执行）。
+- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0、0.5.0 与 0.6.0 的改动都要重启宿主之后才生效（重启只能由用户执行）。
 
 **尚未验证**
 
-1. `ctx.sessionController.page` 在真宿主里是否真按 `{ records, hasMore }` 返回（参数形状抄的是 DS Bot 生产代码，不是官方文档）。
+1. `ctx.sessionController.page` 在真宿主里是否真按 `{ records, hasMore }` 返回（参数形状抄的是 DS Bot 生产代码，不是官方文档）。**本版把回执判定挂到了这条读回通道上，这一项仍未核**——假载体全绿的测试不能证明真宿主可用。
 2. `steer` 插队以后，目标会话是否真在下一步就读到（只验到「宿主受理」这一层）。
 3. `auto` 档写 `approval/policy: never` 在真宿主里是否被认（单测覆盖的是「写不进去就归档并报错」这条路）。
 4. 启动自检的**真重启投递**：注册、延迟序列、幂等判据都有单测，但没在真重启里收过那条唤醒消息。

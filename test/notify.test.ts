@@ -6,11 +6,13 @@ import { mkdir, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
   QUIET_WINDOW_MS,
+  TERMINAL_MARKS,
   appendDispatch,
   createDispatchNotifier,
   installDispatchNotify,
   readLedger,
   receiptText,
+  suggestDeadlineSeconds,
   type DispatchRecord,
   type HostCtx,
 } from '../src/core'
@@ -32,6 +34,21 @@ type Scenario = {
   dispatcherGone?: boolean
   /** 宿主拒收这条提示词。 */
   promptThrows?: boolean
+  /**
+   * 门四读到的**末条** assistant 文本。缺省是一个带 [DISPATCH DONE] 的合成答复，
+   * 让「应当投出」的既有用例继续成立；`null` = 一条带文本的 assistant 消息都没有。
+   */
+  lastText?: string | null
+  /** 宿主没有 sessionController.page（老宿主 / 假载体）。 */
+  pageMissing?: boolean
+  /** page 抛错（宿主拒答）。 */
+  pageThrows?: boolean
+  /** page 返回空 records。 */
+  emptyPage?: boolean
+  /** page 返回的 8 条事件里没有 assistant 文本（更早那条 assistant 文本落在窗口之外）。 */
+  windowWithoutAssistant?: boolean
+  /** resolveAgent 回的 session.seq（缺省 1；给 undefined 造「拿不到 seq」）。 */
+  seq?: unknown
 }
 
 function ledgerFor(name: string): string {
@@ -61,6 +78,40 @@ function harness(name: string, scenario: Scenario = {}) {
   const logs: string[] = []
   let clock = 2_000_000
 
+  // 门四的读回通道：形状照真实存储（assistant/message 的文本在 data.message.content 的 text 块里，
+  // 与 fixtures/events.ts 同口径）；默认给一个带 [DISPATCH DONE] 的合成答复。
+  const page = async () => {
+    if (scenario.pageThrows === true) throw new Error('the harness would not page this Session')
+    if (scenario.emptyPage === true) return { records: [], hasMore: false }
+    if (scenario.windowWithoutAssistant === true) {
+      // 窗口只装得下 8 条事件，这里整窗都是非 assistant 事件；更早那条带文本的 assistant 落在窗口之外。
+      return {
+        records: Array.from({ length: 8 }, (_, index) => ({
+          event: { type: 'tool/call', seq: 11 + index, time: 1, data: { turn: 1, step: 1, name: 'read' } },
+        })),
+        hasMore: false,
+      }
+    }
+    const text = scenario.lastText === undefined ? '改完了，结论是 A。\n[DISPATCH DONE]' : scenario.lastText
+    if (text === null) {
+      return { records: [{ event: { type: 'turn/end', seq: 12, data: { turn: 1, reason: { kind: 'completed' } } } }], hasMore: false }
+    }
+    return {
+      records: [
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 10,
+            time: 1,
+            data: { turn: 1, step: 1, message: { role: 'assistant', content: [{ type: 'reasoning', text: '先想一下' }, { type: 'text', text }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 12, time: 1, data: { turn: 1, reason: { kind: 'completed' } } } },
+      ],
+      hasMore: false,
+    }
+  }
+
   const controller = {
     async resolveAgent(sessionId: string) {
       resolvedIds.push(sessionId)
@@ -74,13 +125,14 @@ function harness(name: string, scenario: Scenario = {}) {
             : 'status' in scenario
               ? scenario.status
               : 'idle'
-      return { agent: { session: { id: sessionId, seq: 1 }, status } }
+      return { agent: { session: { id: sessionId, seq: 'seq' in scenario ? scenario.seq : 1 }, status } }
     },
     async prompt(options: Record<string, unknown>) {
       if (scenario.promptThrows === true) throw new Error('the host refused the prompt')
       prompts.push(options)
       return true
     },
+    ...(scenario.pageMissing === true ? {} : { page }),
   }
 
   const notifier = createDispatchNotifier({
@@ -163,7 +215,10 @@ describe('完成回执：投递通道与正文', () => {
     expect(h.prompts[0].mode).toBe('queue')
     expect(typeof h.prompts[0].requestId).toBe('string')
     const text = (h.prompts[0].content as { type: string; text: string }[])[0].text
-    expect(text.split('\n')[0]).toBe('[Dispatch receipt · 投标跟进]')
+    // 正文只有一行（不含换行），标题 + 终态标记 + sessionId + 结束时刻 + 轮次/原因。
+    expect(text).not.toContain('\n')
+    expect(text.startsWith('[Dispatch receipt · 投标跟进]')).toBe(true)
+    expect(text).toContain('[DISPATCH DONE]')
     expect(text).toContain('sess-1')
     expect(text).toContain('turn 1')
     expect(text).toContain('reason: completed')
@@ -174,20 +229,19 @@ describe('完成回执：投递通道与正文', () => {
     expect(typeof (await readLedger(h.ledgerPath))[0].notifiedAt).toBe('number')
   })
 
-  test('回执正文只写：标题、sessionId、结束时间、轮次、最后一轮的 reason', () => {
-    const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, 3, 'completed')
-    const lines = text.split('\n')
-    expect(lines).toHaveLength(3)
-    expect(lines[0]).toBe('[Dispatch receipt · 投标跟进]')
-    expect(lines[1]).toContain('sess-9')
-    expect(lines[1]).toContain('turn 3')
-    expect(lines[1]).toContain('reason: completed')
-    expect(lines[1]).toContain('nothing it dispatched itself is still running')
-    expect(lines[1]).toContain('2026-')
-    expect(lines[2]).toContain('read_session_transcript')
+  test('回执正文只有一行：标题、终态标记、sessionId、结束时间、轮次、最后一轮的 reason', () => {
+    const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, '[NEEDS USER]', 3, 'completed')
+    expect(text).not.toContain('\n')
+    expect(text.startsWith('[Dispatch receipt · 投标跟进] [NEEDS USER] · session sess-9 · ended ')).toBe(true)
+    expect(text).toContain('turn 3')
+    expect(text).toContain('reason: completed')
+    expect(text).toContain('2026-')
+    // 旧第三行整句删除：细节靠 read_session_transcript 自取，不再写进回执。
+    expect(text).not.toContain('read_session_transcript')
     // 标题与轮次缺失时也要能写出话，不许出现 undefined。
-    const bare = receiptText({}, 'sess-9', 0)
-    expect(bare.split('\n')[0]).toBe('[Dispatch receipt · (untitled)]')
+    const bare = receiptText({}, 'sess-9', 0, '[DISPATCH DONE]')
+    expect(bare.startsWith('[Dispatch receipt · (untitled)] [DISPATCH DONE]')).toBe(true)
+    expect(bare).toContain('turn ?')
     expect(bare).not.toContain('undefined')
   })
 })
@@ -294,6 +348,166 @@ describe('完成回执：门三，自己派的活还没停就不算做完', () =
     await endTurn(h.notifier, 1)
     await fire(h.timers[0])
     expect(h.prompts).toHaveLength(1)
+  })
+})
+
+describe('完成回执：门四，只认派活方写在最终答复里的终态标记', () => {
+  for (const mark of TERMINAL_MARKS) {
+    test(`末条 assistant 文本里有 ${mark} → 照投，且正文里带这个标记`, async () => {
+      const h = harness(`mark-${mark.replace(/[[\]]/g, '')}`, { lastText: `这一单到这里。\n${mark}` })
+      await seed(h.ledgerPath)
+      await endTurn(h.notifier, 2)
+      await fire(h.timers[0])
+      expect(h.prompts).toHaveLength(1)
+      expect(h.prompts[0].mode).toBe('queue')
+      const text = (h.prompts[0].content as { type: string; text: string }[])[0].text
+      expect(text).toContain(mark)
+      expect(text).toContain('sess-1')
+    })
+  }
+
+  test('末条文本逐字列举三个标记、末行才是结论 → 取文本里最后出现的那个，不是声明序最后那个', async () => {
+    const h = harness('mark-multi-done', {
+      lastText: '三个标记 [DISPATCH DONE]／[NEEDS USER]／[DISPATCH BLOCKED] 都实现了。\n结论：全绿。\n[DISPATCH DONE]',
+    })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 2)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+    const text = (h.prompts[0].content as { type: string; text: string }[])[0].text
+    // 声明序实现（遍历 TERMINAL_MARKS 取最后命中）会返回数组末尾的 [DISPATCH BLOCKED]，这两条断言就是那条差异。
+    expect(text).toContain('[DISPATCH DONE]')
+    expect(text).not.toContain('[DISPATCH BLOCKED]')
+  })
+
+  test('末行写 [DISPATCH BLOCKED] → 回执文本带 [DISPATCH BLOCKED]', async () => {
+    const h = harness('mark-multi-blocked', {
+      lastText: '三个标记都实现了。\n结论：卡在第三章。\n[DISPATCH BLOCKED]',
+    })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 2)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+    const text = (h.prompts[0].content as { type: string; text: string }[])[0].text
+    expect(text).toContain('[DISPATCH BLOCKED]')
+  })
+
+  test('末条文本里一个终态标记都没有 → 不投，出声「no terminal mark」', async () => {
+    const h = harness('no-mark', { lastText: '这一轮先到这，等第三章跑完再看。' })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 2)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('no terminal mark'))).toBe(true)
+    // 没投就不许记 notifiedAt：它后来又写了标记、再安静下来时还要能投。
+    expect((await readLedger(h.ledgerPath))[0].notifiedAt).toBeUndefined()
+  })
+
+  test('末条文本超过 2000 字符、标记在最末尾 → 仍投（判定取的是未截断文本）', async () => {
+    const longText = `${'情况说明。'.repeat(400)}\n[DISPATCH DONE]`
+    expect(longText.length).toBeGreaterThan(2000)
+    const h = harness('long-text', { lastText: longText })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 3)
+    await fire(h.timers[0])
+    // clipText（MESSAGE_CLIP = 2000）会把末尾截掉；门四读的是原始事件，所以仍看得到标记。
+    expect(h.prompts).toHaveLength(1)
+    const text = (h.prompts[0].content as { text: string }[])[0].text
+    expect(text).toContain('[DISPATCH DONE]')
+  })
+
+  test('page 不在宿主服务面 → 不投、出声', async () => {
+    const h = harness('no-page', { pageMissing: true })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('no sessionController.page'))).toBe(true)
+  })
+
+  test('page 抛错 → 不投、出声', async () => {
+    const h = harness('page-throws', { pageThrows: true })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('could not be read'))).toBe(true)
+  })
+
+  test('page 里 records 为空 / 没有 assistant 文本 → 不投、出声', async () => {
+    for (const [name, scenario] of [['empty-page', { emptyPage: true }], ['no-assistant', { lastText: null }]] as const) {
+      const h = harness(name, scenario)
+      await seed(h.ledgerPath)
+      await endTurn(h.notifier, 1)
+      await fire(h.timers[0])
+      expect(h.prompts).toHaveLength(0)
+      expect(h.logs.some(line => line.includes('no assistant message with text'))).toBe(true)
+    }
+  })
+
+  test('8 条事件窗口里没有 assistant 文本（更早那条在窗口外）→ 不投、出声', async () => {
+    const h = harness('window-no-assistant', { windowWithoutAssistant: true })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('no assistant message with text was found among its last events'))).toBe(true)
+  })
+
+  test('resolveAgent 没给出有限的 seq → 不投、出声', async () => {
+    const h = harness('no-seq', { seq: undefined })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('no sequence number'))).toBe(true)
+  })
+})
+
+describe('deadline 建议值：近 30 条有效样本派活时长的 p95 × 1.2', () => {
+  function sample(index: number, minutes: number, overrides: Partial<DispatchRecord> = {}): DispatchRecord {
+    const at = 1_000_000 + index * 1_000
+    return {
+      sessionId: `sess-sample-${index}`,
+      title: '样本',
+      placement: 'workspace ws-1',
+      dispatchedAt: at,
+      promptHead: 'p',
+      notifiedAt: at + minutes * 60_000,
+      ...overrides,
+    }
+  }
+
+  test('5 个样本 [10,20,30,40,100] 分钟 → p95 88 → ×1.2 105.6 → 106 分钟 = 6360 秒', () => {
+    const records = [10, 20, 30, 40, 100].map((minutes, index) => sample(index, minutes))
+    expect(suggestDeadlineSeconds(records)).toBe(6360)
+  })
+
+  test('有效样本不足 5 条 → 不给数值（如实说样本不够）', () => {
+    expect(suggestDeadlineSeconds([10, 20, 30, 40].map((minutes, index) => sample(index, minutes)))).toBeUndefined()
+    expect(suggestDeadlineSeconds([])).toBeUndefined()
+  })
+
+  test('notifiedAt 缺失或 <= dispatchedAt 的记录被剔除', () => {
+    const valid = [10, 20, 30, 40, 100].map((minutes, index) => sample(index, minutes))
+    const junk = [
+      sample(10, 50, { notifiedAt: undefined }),
+      sample(11, 50, { notifiedAt: 1_011_000 }), // 与 dispatchedAt 相等（to <= from）
+      sample(12, 50, { notifiedAt: 999 }), // 早于派活
+    ]
+    const mixed = [junk[0], valid[0], valid[1], junk[1], valid[2], valid[3], junk[2], valid[4]]
+    expect(mixed).toHaveLength(8)
+    expect(suggestDeadlineSeconds(mixed)).toBe(6360)
+  })
+
+  test('31 条有效样本、最早一条是极值 → 被 window = 30 排除（等于去掉最早一条重算）', () => {
+    const records = [sample(0, 1), ...Array.from({ length: 30 }, (_, index) => sample(index + 1, (index + 1) * 10))]
+    expect(records).toHaveLength(31)
+    const withinWindow = suggestDeadlineSeconds(records.slice(-30))
+    expect(withinWindow).toBe(20580)
+    expect(suggestDeadlineSeconds(records.slice(1))).toBe(withinWindow)
+    // 不排除那条极值（1 分钟）时 p95 会被拉低——证明 window 真的生效了。
+    expect(suggestDeadlineSeconds(records, 31)).not.toBe(withinWindow)
   })
 })
 
@@ -484,6 +698,21 @@ describe('完成回执：接线', () => {
         prompts.push(options)
         return true
       },
+      // 门四的读回通道（真宿主里是 sessionController.page）。
+      async page() {
+        return {
+          records: [
+            {
+              event: {
+                type: 'assistant/message',
+                seq: 2,
+                data: { turn: 3, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '第三章复核完了。\n[DISPATCH DONE]' }] } },
+              },
+            },
+          ],
+          hasMore: false,
+        }
+      },
     }
     const ctx = {
       sessionController: controller,
@@ -504,35 +733,41 @@ describe('完成回执：接线', () => {
     expect((prompts[0].content as { text: string }[])[0].text).toContain('turn 3')
   })
 
+  /** 构建产物的假宿主：注册表 + 事件面，够 create_session 走完一整单。 */
+  function builtArtifact() {
+    const tools = new Map<string, { execute: (args: Record<string, unknown>, exec?: unknown) => Promise<string> }>()
+    const events: string[] = []
+    const services = {
+      tools: { register: (tool: { name: string }) => { tools.set(tool.name, tool as never) } },
+      sessionController: {
+        async create() { return { sessionId: 'sess-built' } },
+        async prompt() { return true },
+        async resolveAgent(sessionId: string) {
+          // 派活人的会话要能被读出「正在跑哪个模型」，否则 create_session 按判据整单失败、不建会话。
+          return { agent: { session: { id: sessionId, seq: 1, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) }, status: 'idle' } }
+        },
+      },
+      sessionTitle: { async rename() {} },
+      workspaceRegistry: {
+        get: () => ({ id: 'ws-1', title: '投标' }),
+        async archiveSession() {},
+      },
+    }
+    const ctx = {
+      ...services,
+      get: (name: string) => (services as Record<string, unknown>)[name],
+      on: (name: string) => { events.push(name) },
+    }
+    applyBuilt(ctx as never)
+    return { tools, events }
+  }
+
   test('构建产物：create_session 把派活人的会话 id 记进台账，并把回执监听挂上 ctx', async () => {
     const ledgerPath = ledgerFor('built')
     const previous = process.env.DSH_SESSION_CREATE_LEDGER
     try {
       process.env.DSH_SESSION_CREATE_LEDGER = ledgerPath
-      const tools = new Map<string, { execute: (args: Record<string, unknown>, exec?: unknown) => Promise<string> }>()
-      const events: string[] = []
-      const services = {
-        tools: { register: (tool: { name: string }) => { tools.set(tool.name, tool as never) } },
-        sessionController: {
-          async create() { return { sessionId: 'sess-built' } },
-          async prompt() { return true },
-          async resolveAgent(sessionId: string) {
-            // 派活人的会话要能被读出「正在跑哪个模型」，否则 create_session 按判据整单失败、不建会话。
-            return { agent: { session: { id: sessionId, seq: 1, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) }, status: 'idle' } }
-          },
-        },
-        sessionTitle: { async rename() {} },
-        workspaceRegistry: {
-          get: () => ({ id: 'ws-1', title: '投标' }),
-          async archiveSession() {},
-        },
-      }
-      const ctx = {
-        ...services,
-        get: (name: string) => (services as Record<string, unknown>)[name],
-        on: (name: string) => { events.push(name) },
-      }
-      applyBuilt(ctx as never)
+      const { tools, events } = builtArtifact()
       expect(events).toEqual(['session/event'])
 
       const spec = tools.get('create_session')
@@ -542,7 +777,36 @@ describe('完成回执：接线', () => {
         { agent: { session: { id: 'chief-1' } } },
       )
       expect(text).toContain('sess-built')
+      // 台账里只有刚这一条（没有 notifiedAt）⇒ 有效样本 0 条，如实说样本不够。
+      expect(text).toContain('- No one-shot deadline suggested: only 0 completed ledger records carry both timestamps (need 5).')
       expect((await readLedger(ledgerPath))[0].dispatcherSessionId).toBe('chief-1')
+    } finally {
+      if (previous === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
+      else process.env.DSH_SESSION_CREATE_LEDGER = previous
+    }
+  })
+
+  test('构建产物：台账够 5 条有效样本时，create_session 的返回里给出 deadline 分钟数与 after_seconds', async () => {
+    const ledgerPath = ledgerFor('built-deadline')
+    const previous = process.env.DSH_SESSION_CREATE_LEDGER
+    try {
+      process.env.DSH_SESSION_CREATE_LEDGER = ledgerPath
+      const minutes = [10, 20, 30, 40, 100]
+      for (const [index, value] of minutes.entries()) {
+        const at = 1_000_000 + index * 1_000
+        await seed(ledgerPath, { sessionId: `sess-old-${index}`, dispatchedAt: at, notifiedAt: at + value * 60_000 })
+      }
+      const { tools } = builtArtifact()
+      const spec = tools.get('create_session')
+      if (spec === undefined) throw new Error('apply() registered no create_session tool')
+      const text = await spec.execute(
+        { title: '复核单', prompt: '跑一下第三章', workspace: 'ws-1' },
+        { agent: { session: { id: 'chief-1' } } },
+      )
+      // p95 = 88 分钟 → ×1.2 = 105.6 → ceil = 106 分钟 = 6360 秒。
+      expect(text).toContain('- Suggested one-shot deadline: 106 minutes')
+      expect(text).toContain('schedule_create(after_seconds=6360)')
+      expect(text).toContain('schedule_delete once its terminal receipt arrives')
     } finally {
       if (previous === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
       else process.env.DSH_SESSION_CREATE_LEDGER = previous

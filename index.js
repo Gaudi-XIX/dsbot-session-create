@@ -728,19 +728,49 @@ function stamp(time) {
 var QUIET_WINDOW_MS = 120000;
 var COMPLETED_REASON = "completed";
 var NOTIFY_TIMEOUT_MS = 1e4;
+var TERMINAL_MARKS = ["[DISPATCH DONE]", "[NEEDS USER]", "[DISPATCH BLOCKED]"];
+var LAST_MESSAGE_PAGE = 8;
+function terminalMarkOf(text) {
+  let found;
+  let at = -1;
+  for (const mark of TERMINAL_MARKS) {
+    const index = text.lastIndexOf(mark);
+    if (index > at) {
+      at = index;
+      found = mark;
+    }
+  }
+  return found;
+}
+function deadlineSamples(records) {
+  const minutes = [];
+  for (const record of records) {
+    const from = Number(record.dispatchedAt);
+    const to = Number(record.notifiedAt);
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from)
+      continue;
+    minutes.push((to - from) / 60000);
+  }
+  return minutes;
+}
+function suggestDeadlineSeconds(records, window = 30) {
+  const sample = deadlineSamples(records).slice(-window);
+  if (sample.length < 5)
+    return;
+  const sorted = [...sample].sort((a, b) => a - b);
+  const pos = 0.95 * (sorted.length - 1);
+  const lo = Math.floor(pos);
+  const p95 = sorted[lo] + (pos - lo) * ((sorted[lo + 1] ?? sorted[lo]) - sorted[lo]);
+  return Math.ceil(p95 * 1.2) * 60;
+}
 function dispatcherSessionOf(exec) {
   const id = exec?.agent?.session?.id;
   return typeof id === "string" && id !== "" ? id : undefined;
 }
-function receiptText(record, sessionId, endTime, turn, reason) {
+function receiptText(record, sessionId, endTime, mark, turn, reason) {
   const title = typeof record?.title === "string" && record.title !== "" ? record.title : "(untitled)";
   const last = `turn ${turn === undefined ? "?" : turn}${reason === undefined ? "" : `, reason: ${reason}`}`;
-  return [
-    `[Dispatch receipt · ${title}]`,
-    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} after a normal finish (${last}), and nothing it dispatched itself is still running.`,
-    `Read what it did with read_session_transcript (sessionId "${sessionId}"). No reply needed; act only if the result calls for it.`
-  ].join(`
-`);
+  return `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`;
 }
 function createDispatchNotifier(deps = {}) {
   const ledgerPath = deps.ledger ?? defaultLedgerPath();
@@ -786,6 +816,35 @@ function createDispatchNotifier(deps = {}) {
     }
     return;
   }
+  async function lastAssistantText(controller, sessionId, seq) {
+    if (typeof controller.page !== "function") {
+      return { error: "this harness has no sessionController.page, so its last assistant message cannot be read" };
+    }
+    const at = Number(seq);
+    if (!Number.isFinite(at)) {
+      return { error: "the harness gave no sequence number for it, so its last assistant message cannot be read" };
+    }
+    let page;
+    try {
+      page = await controller.page({ address: { kind: "session", sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE }, AbortSignal.timeout(HISTORY_TIMEOUT_MS));
+    } catch (error) {
+      return { error: `its last assistant message could not be read (${reasonOf(error)})` };
+    }
+    if (page === undefined) {
+      return { error: "the harness returned nothing for it, so its last assistant message cannot be read" };
+    }
+    const events = (page.records ?? []).map((record) => record?.event);
+    for (let index = events.length - 1;index >= 0; index -= 1) {
+      const event = events[index];
+      if (event?.type !== "assistant/message")
+        continue;
+      const message = event.data?.message;
+      const text = blockText(message?.content);
+      if (text !== "")
+        return { text };
+    }
+    return { error: "no assistant message with text was found among its last events" };
+  }
   async function deliver(sessionId, endTime, turn, reason) {
     if (notified.has(sessionId))
       return;
@@ -816,6 +875,16 @@ function createDispatchNotifier(deps = {}) {
       log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`);
       return;
     }
+    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq);
+    if ("error" in lastText) {
+      log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`);
+      return;
+    }
+    const mark = terminalMarkOf(lastText.text);
+    if (mark === undefined) {
+      log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(" / ")}).`);
+      return;
+    }
     const target = await resolveQuietly(controller, dispatcher);
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
       log(`${sessionId} went quiet, but the dispatching Session ${dispatcher} is gone, so there is nowhere to send the receipt.`);
@@ -826,7 +895,7 @@ function createDispatchNotifier(deps = {}) {
         requestId: randomUUID(),
         sessionId: dispatcher,
         mode: "queue",
-        content: [{ type: "text", text: receiptText(record, sessionId, endTime, turn, reason) }]
+        content: [{ type: "text", text: receiptText(record, sessionId, endTime, mark, turn, reason) }]
       }, AbortSignal.timeout(NOTIFY_TIMEOUT_MS));
     } catch (error) {
       log(`the receipt for ${sessionId} did not go through (${reasonOf(error)}); the next turn to end will try again.`);
@@ -1142,7 +1211,9 @@ var CREATE_DESCRIPTION = [
   "Optionally set the Session's agent preset (`preset`) and permission mode (`permission`) before it starts; an omitted `permission` opens the Session at `danger-full-access`.",
   "The Session's model is pinned explicitly and is never the host's global default: it is the model the dispatching Bot's own Session runs on, unless `model` names another one as `provider/model`. If neither can be read, no Session is started.",
   "The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.",
-  "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot."
+  "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot.",
+  'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched".',
+  "After dispatching, arm one one-shot deadline for it with schedule_create(after_seconds=…) using the value this tool returns, and delete it with schedule_delete once its terminal receipt arrives (one-shot only; never a periodic check)."
 ].join(" ") + `
 ` + [
   "派会话前先自问三句：",
@@ -1248,6 +1319,22 @@ function apply(ctx) {
         const overrideNote = result.permissionOverriddenFrom === undefined ? "" : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`;
         const permissionNote = result.permissionNote === undefined ? "" : `NOTE: ${result.permissionNote}`;
         const modelNote = result.modelNote === undefined ? "" : `NOTE: ${result.modelNote}`;
+        let deadlineNote;
+        if (result.ledgerError === undefined && result.ledgerPath !== undefined) {
+          try {
+            const records = await readLedger(result.ledgerPath);
+            const seconds = suggestDeadlineSeconds(records);
+            if (seconds === undefined) {
+              deadlineNote = `- No one-shot deadline suggested: only ${deadlineSamples(records).length} completed ledger records carry both timestamps (need 5).`;
+            } else {
+              const minutes = seconds / 60;
+              deadlineNote = `- Suggested one-shot deadline: ${minutes} minutes — if this Session has the schedule tool (standard/ptc presets mount it; minimal does not), call schedule_create(after_seconds=${minutes * 60}) for this dispatch and schedule_delete once its terminal receipt arrives.`;
+            }
+          } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            console.warn(`[dsbot-session-create] the dispatch ledger could not be read right after dispatching, so no one-shot deadline was suggested (${reason}).`);
+          }
+        }
         return [
           `Started a new Session in ${result.placement}.`,
           `- title: ${result.title}${renameNote}`,
@@ -1257,7 +1344,8 @@ function apply(ctx) {
           ...permissionNote === "" ? [] : [permissionNote],
           ...modelNote === "" ? [] : [modelNote],
           "The prompt is queued in the Session.",
-          ledgerNote
+          ledgerNote,
+          ...deadlineNote === undefined ? [] : [deadlineNote]
         ].join(`
 `);
       } catch (error) {

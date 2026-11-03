@@ -80,3 +80,32 @@ export function realShapedEvents(): unknown[] {
     },
   ]
 }
+
+/**
+ * 三个终态标记各一条 `assistant/message`，形状与上面 `realShapedEvents()` 里的完全一致
+ * （文本在 `data.message.content` 的 text 块里）：完成回执的门四只认这种末条文本。
+ * 文本仍是合成的，不含任何真实对话与本机路径。
+ */
+export function terminalMarkEvents(): unknown[] {
+  const marks: { mark: string; seq: number; id: string }[] = [
+    { mark: '[DISPATCH DONE]', seq: 51, id: 'mark-done' },
+    { mark: '[NEEDS USER]', seq: 61, id: 'mark-needs-user' },
+    { mark: '[DISPATCH BLOCKED]', seq: 71, id: 'mark-blocked' },
+  ]
+  return marks.map(({ mark, seq, id }) => ({
+    type: 'assistant/message',
+    seq,
+    time: T,
+    surfaceOp: 'append',
+    data: {
+      turn: 3,
+      step: 1,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text: `这一单收口。\n${mark}` }],
+        source: { kind: 'model' },
+        id,
+      },
+    },
+  }))
+}

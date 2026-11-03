@@ -1267,6 +1267,9 @@ export function stamp(time: number): string {
 //   那些活还没停下来** ⇒ 它是在等它们，不是做完了 ⇒ 不投（`firstBusyChild`）。
 // ③其余阶段收工（自己没派人、也没出错，就是这一轮干完了停下）与「整单完成」不可区分，
 //   仍由派活方按纪律决定要不要理它——插件不替它猜。
+// ④「这一单到底算不算做完」的判定权交给派活方：被派会话在自己**最终答复**里写一个终态标记
+//   （`TERMINAL_MARKS` 三个，逐字）。门四只读该会话最后一条 assistant 文本，没有标记一律不投
+//   —— 无标记＝「中间收工、还在等自己派的活」，宁可漏一条，也不投一条假回执。
 // ---------------------------------------------------------------------------
 
 /** 静默窗口：一轮结束后等这么久仍没有新的一轮，才认定「安静下来了」。 */
@@ -1281,6 +1284,59 @@ export const QUIET_WINDOW_MS = 120_000
 export const COMPLETED_REASON = 'completed'
 /** 投一条回执是一次宿主调用；10 秒是上限而不是预期耗时。 */
 export const NOTIFY_TIMEOUT_MS = 10_000
+/**
+ * 派活方可以写在最终答复里的终态标记，逐字、大小写敏感。
+ * 全角方括号、错拼一律不算标记 ⇒ 走「不投」分支（宁可漏一条，也不投一条假回执）。
+ */
+export const TERMINAL_MARKS = ['[DISPATCH DONE]', '[NEEDS USER]', '[DISPATCH BLOCKED]'] as const
+/** 门四读末条 assistant 文本时向宿主要多少条事件：尾巴上几条足够，不要整篇转写。 */
+const LAST_MESSAGE_PAGE = 8
+
+/**
+ * 这段文本里出现的终态标记：对每个标记取它在文本里**最后一次出现**的位置（`text.lastIndexOf`），
+ * 返回位置最靠后的那个（并列时保持 `TERMINAL_MARKS` 的声明序，取先声明者）；一个都没有 ⇒
+ * `undefined`。纯函数，判定输入是该会话最后一条 assistant/message 的 text 块拼接串，
+ * 不看整篇转写、不做 trim 之外的归一化。
+ */
+export function terminalMarkOf(text: string): string | undefined {
+  let found: string | undefined
+  let at = -1
+  for (const mark of TERMINAL_MARKS) {
+    const index = text.lastIndexOf(mark)
+    if (index > at) {
+      at = index
+      found = mark
+    }
+  }
+  return found
+}
+
+/** 台账里「既有 dispatchedAt 又有 notifiedAt」的有效样本，派活时长（分钟），按台账顺序。 */
+export function deadlineSamples(records: DispatchRecord[]): number[] {
+  const minutes: number[] = []
+  for (const record of records) {
+    const from = Number(record.dispatchedAt)
+    const to = Number(record.notifiedAt)
+    if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) continue
+    minutes.push((to - from) / 60_000)
+  }
+  return minutes
+}
+
+/**
+ * 建议的一次性 deadline：近 `window` 条有效样本派活时长的 p95 × 1.2（线性插值，inclusive），
+ * 向上取整到分钟，返回秒。有效样本不足 5 条 ⇒ `undefined`（不建议数值，如实说样本不够）。
+ * 取 p95 而不是常量：台账是长尾分布，固定 90 分钟只到 p87 左右，约 13% 的正常单会被提前叫醒。
+ */
+export function suggestDeadlineSeconds(records: DispatchRecord[], window = 30): number | undefined {
+  const sample = deadlineSamples(records).slice(-window)
+  if (sample.length < 5) return undefined
+  const sorted = [...sample].sort((a, b) => a - b)
+  const pos = 0.95 * (sorted.length - 1)
+  const lo = Math.floor(pos)
+  const p95 = sorted[lo] + (pos - lo) * ((sorted[lo + 1] ?? sorted[lo]) - sorted[lo])
+  return Math.ceil(p95 * 1.2) * 60
+}
 
 /** 事件面上的会话对象：ds-bot 的三处同形监听都只取 `session?.id`。 */
 export type NotifySession = { id?: unknown }
@@ -1322,15 +1378,14 @@ export function dispatcherSessionOf(exec: unknown): string | undefined {
   return typeof id === 'string' && id !== '' ? id : undefined
 }
 
-/** 回执正文。首行必须带标题：派活人一眼认出这是哪一单。 */
-export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, turn?: number, reason?: string): string {
+/**
+ * 回执正文：**只有一行**（不含换行符）。标题 + 终态标记让派活人一眼认出这是哪一单、要不要理；
+ * 细节不带摘要——要看细节用 read_session_transcript 自取。
+ */
+export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, mark: string, turn?: number, reason?: string): string {
   const title = typeof record?.title === 'string' && record.title !== '' ? record.title : '(untitled)'
   const last = `turn ${turn === undefined ? '?' : turn}${reason === undefined ? '' : `, reason: ${reason}`}`
-  return [
-    `[Dispatch receipt · ${title}]`,
-    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} after a normal finish (${last}), and nothing it dispatched itself is still running.`,
-    `Read what it did with read_session_transcript (sessionId "${sessionId}"). No reply needed; act only if the result calls for it.`,
-  ].join('\n')
+  return `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`
 }
 
 export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifier {
@@ -1386,6 +1441,48 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     return undefined
   }
 
+  /**
+   * 门四要的那一段：该会话**最后一条** `assistant/message` 的 text 块拼接串。
+   * 直接读 `controller.page` 的原始事件、**不走 renderTranscript** —— 后者过 clipText（:912-915），
+   * 会按 MESSAGE_CLIP 截尾，长答复末尾的标记会被截掉（本设计的头号陷阱）。
+   * 读不到就返回原因，由 deliver 出声并不投（宁可漏一条，也不投一条假回执）。
+   */
+  async function lastAssistantText(
+    controller: NonNullable<HostCtx['sessionController']>,
+    sessionId: string,
+    seq: unknown,
+  ): Promise<{ text: string } | { error: string }> {
+    if (typeof controller.page !== 'function') {
+      return { error: 'this harness has no sessionController.page, so its last assistant message cannot be read' }
+    }
+    const at = Number(seq)
+    if (!Number.isFinite(at)) {
+      return { error: 'the harness gave no sequence number for it, so its last assistant message cannot be read' }
+    }
+    let page: SessionPage | undefined
+    try {
+      // 只要末条 assistant 文本：取尾巴上很少几条事件就够，不用整篇转写。
+      page = await controller.page(
+        { address: { kind: 'session', sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE },
+        AbortSignal.timeout(HISTORY_TIMEOUT_MS),
+      )
+    } catch (error) {
+      return { error: `its last assistant message could not be read (${reasonOf(error)})` }
+    }
+    if (page === undefined) {
+      return { error: 'the harness returned nothing for it, so its last assistant message cannot be read' }
+    }
+    const events = (page.records ?? []).map(record => record?.event)
+    for (let index = events.length - 1; index >= 0; index -= 1) {
+      const event = events[index] as AnyEvent | null
+      if (event?.type !== 'assistant/message') continue
+      const message = event.data?.message as { content?: unknown } | undefined
+      const text = blockText(message?.content)
+      if (text !== '') return { text }
+    }
+    return { error: 'no assistant message with text was found among its last events' }
+  }
+
   async function deliver(sessionId: string, endTime: number, turn: number | undefined, reason: string | undefined): Promise<void> {
     if (notified.has(sessionId)) return
     const record = await recordOf(sessionId)
@@ -1417,6 +1514,19 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`)
       return
     }
+    // 门四（终态标记）：这一轮收工到底算不算「这一单做完」，最懂的是派活方 —— 只有它在最终答复里
+    // 写了终态标记才算。判定输入是该会话**最后一条** assistant 文本（不是整篇转写，且不过 clipText）；
+    // 读不到或没有标记一律不投：宁可漏一条，也不投一条假回执。
+    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
+    if ('error' in lastText) {
+      log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`)
+      return
+    }
+    const mark = terminalMarkOf(lastText.text)
+    if (mark === undefined) {
+      log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(' / ')}).`)
+      return
+    }
     // 派活方会话已销毁（被关掉/归档）：没地方投，跳过 —— 这不是错误。
     const target = await resolveQuietly(controller, dispatcher)
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
@@ -1429,7 +1539,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
           requestId: randomUUID(),
           sessionId: dispatcher,
           mode: 'queue', // 回执是给派活人的旁路通报：排到下一轮，不去打断他手头正在跑的那一轮
-          content: [{ type: 'text', text: receiptText(record, sessionId, endTime, turn, reason) }],
+          content: [{ type: 'text', text: receiptText(record, sessionId, endTime, mark, turn, reason) }],
         },
         AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
       )
