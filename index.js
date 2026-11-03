@@ -726,6 +726,7 @@ function stamp(time) {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 var QUIET_WINDOW_MS = 120000;
+var COMPLETED_REASON = "completed";
 var NOTIFY_TIMEOUT_MS = 1e4;
 function dispatcherSessionOf(exec) {
   const id = exec?.agent?.session?.id;
@@ -736,7 +737,7 @@ function receiptText(record, sessionId, endTime, turn, reason) {
   const last = `turn ${turn === undefined ? "?" : turn}${reason === undefined ? "" : `, reason: ${reason}`}`;
   return [
     `[Dispatch receipt · ${title}]`,
-    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} (${last}).`,
+    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} after a normal finish (${last}), and nothing it dispatched itself is still running.`,
     `Read what it did with read_session_transcript (sessionId "${sessionId}"). No reply needed; act only if the result calls for it.`
   ].join(`
 `);
@@ -768,6 +769,23 @@ function createDispatchNotifier(deps = {}) {
       return;
     }
   }
+  async function firstBusyChild(sessionId, controller) {
+    let children;
+    try {
+      children = (await readLedger(ledgerPath)).filter((record) => record.dispatcherSessionId === sessionId && record.sessionId !== sessionId);
+    } catch (error) {
+      log(`the dispatch ledger could not be read while checking whether ${sessionId} is still waiting on its own dispatches (${reasonOf(error)}).`);
+      return;
+    }
+    for (const child of children) {
+      const resolved = await resolveQuietly(controller, child.sessionId);
+      if (resolved?.agent === undefined)
+        continue;
+      if (resolved.agent.status !== "idle")
+        return child.sessionId;
+    }
+    return;
+  }
   async function deliver(sessionId, endTime, turn, reason) {
     if (notified.has(sessionId))
       return;
@@ -791,6 +809,11 @@ function createDispatchNotifier(deps = {}) {
     const resolved = await resolveQuietly(controller, sessionId);
     if (resolved?.agent?.status !== "idle") {
       log(`${sessionId} went quiet, but the harness does not report it idle (status=${shortOf(resolved?.agent?.status)}), so no receipt was sent.`);
+      return;
+    }
+    const waitingOn = await firstBusyChild(sessionId, controller);
+    if (waitingOn !== undefined) {
+      log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`);
       return;
     }
     const target = await resolveQuietly(controller, dispatcher);
@@ -837,13 +860,15 @@ function createDispatchNotifier(deps = {}) {
       return;
     }
     const reason = typeof event?.data?.reason?.kind === "string" ? event.data.reason.kind : undefined;
-    if (reason === "aborted")
+    const turn = typeof event?.data?.turn === "number" ? event.data.turn : undefined;
+    if (reason !== COMPLETED_REASON) {
+      log(`${sessionId} ended turn ${turn === undefined ? "?" : turn} with reason ${shortOf(reason)}, which is not a normal finish, so no receipt is scheduled.`);
       return;
+    }
     const previous = pending.get(sessionId);
     if (previous !== undefined)
       clearTimer(previous.handle);
     const endTime = now();
-    const turn = typeof event?.data?.turn === "number" ? event.data.turn : undefined;
     const handle2 = setTimer(() => {
       pending.delete(sessionId);
       return deliver(sessionId, endTime, turn, reason);

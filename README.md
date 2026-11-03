@@ -126,7 +126,13 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### 派完自动回执
 
-派送时把派活人的会话 id 记进台账；目标会话安静满 **120 秒**（`QUIET_WINDOW_MS`）、且宿主复核为 `idle` 时，插件用 `controller.prompt(mode: 'queue')` 投一条短回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts:299` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
+派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`，并且**它自己派出去的活都已经停下来**，插件才用 `controller.prompt(mode: 'queue')` 投一条短回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts:299` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
+
+投递面是收窄过的：把**假回执**（关停、重启掐断、报错、卡住）和**分段派工**（还在等自己派出去的活）这两大类挡掉。但要说清楚——`turn/end` 这一层看不出「这一单」的边界，**收窄不等于只剩整单完成**。2026-11-03 拿本机派单台账 126 单逐条回溯（含静默窗口与三道门）：旧口径会投 160 条回执，新口径 154 条（少 3.75%，其中真正被门三拦下的是 0 条）；120 单仍会收到至少一条，11 单会收到多条，最多的一单 11 条。想再降只能改协议（例如一次派单只投一条回执），不在这一版里。
+
+- **只认正常收尾**：`aborted`（关停/叫停）、`interrupted`（重启掐断）、`error`、`blocked`、`max-tokens`，以及认不出来的取值，一律不进静默窗口、一个回执都不发（`COMPLETED_REASON`，门一）。取值来自 2026-11-03 全扫本机 `<DSH_HOME>/data/sessions/**`（当日 1,740 份文件、7,851 条 `turn/end`）的统计：`completed` 6,914 / `aborted` 464 / `error` 171 / `blocked` 153 / `interrupted` 121 / `max-tokens` 29。
+- **还在等自己派的活就不算收口**：台账里 `dispatcherSessionId` 指向它、宿主又报着没停的子会话，说明它是在等它们（`firstBusyChild`，门三）。等的时候不投；子会话停下、它被叫醒再跑一轮、这一轮没有在跑的子会话，才投。
+- **机械区分不了的那一类**：自己没派人、也没出错，就是这一轮干完了停下——这与「整单完成」在宿主事件面上同形，插件不替派活方猜，照旧投一条；由派活方自己按纪律决定要不要理它。
 
 回执走 `queue` 不走 `steer`：它是给派活人的旁路通报，排到下一轮，不去打断他手头正在跑的那一轮。
 
@@ -213,10 +219,10 @@ node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一�
 
 **已验证（2026-11-03 实测）**
 
-- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（63,242 字节，sha256 `8712027a…b8f`）。
-- `bun test`：163 pass / 0 fail / 614 次断言，5 个文件（bun 1.3.13）。
+- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（64,495 字节，sha256 `040124bb…989`）。
+- `bun test`：176 pass / 0 fail / 654 次断言，5 个文件（bun 1.3.13）。
 - `tsc --noEmit -p . --typeRoots <现成的 node_modules>/@types`（借一份现成的 `typescript` 与 `@types/node`，见「开发」）：0 个错误。**不带 `--typeRoots` 会报 `error TS2688: Cannot find type definition file for 'node'.` 并退出码 2**——本仓没有自己的 `node_modules`。
-- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0 这次的改动要重启宿主之后才生效（重启只能由用户执行）。
+- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0 与 0.5.0 的改动都要重启宿主之后才生效（重启只能由用户执行）。
 
 **尚未验证**
 

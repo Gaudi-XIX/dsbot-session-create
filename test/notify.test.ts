@@ -24,6 +24,10 @@ type Timer = { ms: number; fn: () => void | Promise<void>; cancelled: boolean }
 type Scenario = {
   /** 目标会话在宿主那里报的状态（缺省 'idle'）。 */
   status?: unknown
+  /** 按会话 id 单独指定状态；给了就以它为准（用来造「子会话还在跑」的场面）。 */
+  statuses?: Record<string, unknown>
+  /** 这些会话在宿主那里已经解析不出来（被销毁）。 */
+  gone?: string[]
   /** 派活方会话已被销毁（resolveAgent 返回 error）。 */
   dispatcherGone?: boolean
   /** 宿主拒收这条提示词。 */
@@ -61,7 +65,15 @@ function harness(name: string, scenario: Scenario = {}) {
     async resolveAgent(sessionId: string) {
       resolvedIds.push(sessionId)
       if (sessionId === 'chief-1' && scenario.dispatcherGone === true) return { error: { message: 'no such Session' } }
-      const status = sessionId === 'chief-1' ? 'running' : ('status' in scenario ? scenario.status : 'idle')
+      if (scenario.gone?.includes(sessionId) === true) return { error: { message: 'no such Session' } }
+      const status =
+        sessionId === 'chief-1'
+          ? 'running'
+          : scenario.statuses !== undefined && sessionId in scenario.statuses
+            ? scenario.statuses[sessionId]
+            : 'status' in scenario
+              ? scenario.status
+              : 'idle'
       return { agent: { session: { id: sessionId, seq: 1 }, status } }
     },
     async prompt(options: Record<string, unknown>) {
@@ -110,7 +122,7 @@ async function fire(timer: Timer | undefined): Promise<void> {
   await timer.fn()
 }
 
-async function endTurn(notifier: ReturnType<typeof harness>['notifier'], turn: number, kind = 'stop'): Promise<void> {
+async function endTurn(notifier: ReturnType<typeof harness>['notifier'], turn: number, kind = 'completed'): Promise<void> {
   await notifier.onEvent({ id: 'sess-1' }, { type: 'turn/end', data: { turn, reason: { kind } } })
 }
 
@@ -154,7 +166,7 @@ describe('完成回执：投递通道与正文', () => {
     expect(text.split('\n')[0]).toBe('[Dispatch receipt · 投标跟进]')
     expect(text).toContain('sess-1')
     expect(text).toContain('turn 1')
-    expect(text).toContain('reason: stop')
+    expect(text).toContain('reason: completed')
     // 复核顺序：先向宿主核目标会话是否真的空闲，再核派活方还在不在。
     expect(h.resolvedIds).toEqual(['sess-1', 'chief-1'])
     // 静默期结束、台账留痕。
@@ -163,13 +175,14 @@ describe('完成回执：投递通道与正文', () => {
   })
 
   test('回执正文只写：标题、sessionId、结束时间、轮次、最后一轮的 reason', () => {
-    const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, 3, 'stop')
+    const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, 3, 'completed')
     const lines = text.split('\n')
     expect(lines).toHaveLength(3)
     expect(lines[0]).toBe('[Dispatch receipt · 投标跟进]')
     expect(lines[1]).toContain('sess-9')
     expect(lines[1]).toContain('turn 3')
-    expect(lines[1]).toContain('reason: stop')
+    expect(lines[1]).toContain('reason: completed')
+    expect(lines[1]).toContain('nothing it dispatched itself is still running')
     expect(lines[1]).toContain('2026-')
     expect(lines[2]).toContain('read_session_transcript')
     // 标题与轮次缺失时也要能写出话，不许出现 undefined。
@@ -179,7 +192,7 @@ describe('完成回执：投递通道与正文', () => {
   })
 })
 
-describe('完成回执：两道假回执门', () => {
+describe('完成回执：门一（假回执）与门二（复核空闲）', () => {
   test('门一：turn/end 是关停或叫停（aborted）时不发回执', async () => {
     const h = harness('aborted')
     await seed(h.ledgerPath)
@@ -209,12 +222,87 @@ describe('完成回执：两道假回执门', () => {
   })
 })
 
+describe('完成回执：只有正常收尾才可能是「做完了」', () => {
+  // 2026-11-03 全扫本机会话日志（当日 1,740 份文件、7,851 条 turn/end）实测到的 reason.kind 取值。
+  for (const kind of ['aborted', 'interrupted', 'error', 'blocked', 'max-tokens', 'stop', 'whatever']) {
+    test(`reason=${kind} → 不排静默窗口，一个回执都不投`, async () => {
+      const h = harness(`reason-${kind}`)
+      await seed(h.ledgerPath)
+      await h.notifier.onEvent({ id: 'sess-1' }, { type: 'turn/start', data: { turn: 1 } })
+      await endTurn(h.notifier, 1, kind)
+      expect(h.timers).toHaveLength(0)
+      expect(h.notifier.pending()).toEqual([])
+      expect(h.prompts).toHaveLength(0)
+      expect(h.logs.some(line => line.includes('is not a normal finish'))).toBe(true)
+    })
+  }
+
+  test('reason 缺失（拿不到收尾原因）也不投', async () => {
+    const h = harness('reason-absent')
+    await seed(h.ledgerPath)
+    await h.notifier.onEvent({ id: 'sess-1' }, { type: 'turn/end', data: { turn: 1 } })
+    expect(h.timers).toHaveLength(0)
+    expect(h.prompts).toHaveLength(0)
+  })
+
+  test('正常收尾（completed）照旧进静默窗口', async () => {
+    const h = harness('reason-completed')
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1, 'completed')
+    expect(h.timers).toHaveLength(1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+  })
+})
+
+describe('完成回执：门三，自己派的活还没停就不算做完', () => {
+  test('它派出去的工人还在跑 → 不投（分段派工，不是整单完成）', async () => {
+    const h = harness('busy-child', { statuses: { 'sess-1': 'idle', 'sess-2': 'running' } })
+    await seed(h.ledgerPath)
+    await seed(h.ledgerPath, { sessionId: 'sess-2', title: '第三章', dispatcherSessionId: 'sess-1' })
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('waiting rather than finished'))).toBe(true)
+    // 没投就不许记 notifiedAt：工人停下来、它再跑一轮后还要能投。
+    expect((await readLedger(h.ledgerPath)).find(record => record.sessionId === 'sess-1')?.notifiedAt).toBeUndefined()
+  })
+
+  test('工人已经停了 → 照常投（这一单才算收口）', async () => {
+    const h = harness('idle-child', { statuses: { 'sess-1': 'idle', 'sess-2': 'idle' } })
+    await seed(h.ledgerPath)
+    await seed(h.ledgerPath, { sessionId: 'sess-2', title: '第三章', dispatcherSessionId: 'sess-1' })
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+    expect(h.prompts[0].sessionId).toBe('chief-1')
+  })
+
+  test('工人已被销毁（解析不出来）→ 按「已停」算，照常投', async () => {
+    const h = harness('gone-child', { gone: ['sess-gone'] })
+    await seed(h.ledgerPath)
+    await seed(h.ledgerPath, { sessionId: 'sess-gone', title: '第三章', dispatcherSessionId: 'sess-1' })
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+  })
+
+  test('别家派出去的会话不算它的子会话（只认 dispatcherSessionId 指向它的行）', async () => {
+    const h = harness('unrelated-child', { statuses: { 'sess-1': 'idle', 'sess-3': 'running' } })
+    await seed(h.ledgerPath)
+    await seed(h.ledgerPath, { sessionId: 'sess-3', title: '别人的活', dispatcherSessionId: 'chief-9' })
+    await endTurn(h.notifier, 1)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+  })
+})
+
 describe('完成回执：只认台账里本插件派出去的会话', () => {
   test('台账外的会话（Bot 会话、别人开的会话）一个事件都不处理', async () => {
     const h = harness('whitelist')
     await seed(h.ledgerPath)
     await h.notifier.onEvent({ id: 'bot-7' }, { type: 'turn/start', data: { turn: 1 } })
-    await h.notifier.onEvent({ id: 'bot-7' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'stop' } } })
+    await h.notifier.onEvent({ id: 'bot-7' }, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
     expect(h.timers).toHaveLength(0)
     expect(h.notifier.pending()).toEqual([])
     expect(h.prompts).toHaveLength(0)
@@ -409,7 +497,7 @@ describe('完成回执：接线', () => {
     expect(handlers).toHaveLength(1)
     expect(handlers[0].name).toBe('session/event')
 
-    await handlers[0].handler({ id: 'sess-1' }, { type: 'turn/end', data: { turn: 3, reason: { kind: 'stop' } } })
+    await handlers[0].handler({ id: 'sess-1' }, { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
     // 监听器是 fire-and-forget（宿主事件面没人接返回值），只能等窗口到点后再断言投递结果。
     await new Promise(resolve => setTimeout(resolve, 50))
     expect(prompts).toHaveLength(1)

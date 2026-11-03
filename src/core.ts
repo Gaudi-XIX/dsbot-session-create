@@ -1258,10 +1258,27 @@ export function stamp(time: number): string {
 // （mode:'queue'，排到下一轮、不打断当前轮）把一条短回执投给派活人。
 // 不 import @deepseek-ai/dsh-llm、不用 createUserMessage、不碰 ctx.sessions.flush：
 // 插件的 peerDependencies 只有 cordis 与 dsh-tools，多引一个模块就多一个装不上的可能。
+//
+// 2026-11-03 收窄投递面（用户口径：派活人只在「整单做完」或「非他拍板不可」时才被打断）：
+// ①宿主事件里 `turn/end.reason.kind` 能先否掉一大批——只有 `completed` 进静默窗口，
+//   `aborted`（关停/叫停）、`interrupted`（重启掐断）、`error`、`blocked`、`max-tokens`
+//   以及认不出的取值一律不投（认不出按不投处理：宁可漏一条，也不投一条假回执）。
+// ②剩下「阶段收工」与「整单完成」在事件面上同形，只机械区分得了一种：**它自己还派着活、
+//   那些活还没停下来** ⇒ 它是在等它们，不是做完了 ⇒ 不投（`firstBusyChild`）。
+// ③其余阶段收工（自己没派人、也没出错，就是这一轮干完了停下）与「整单完成」不可区分，
+//   仍由派活方按纪律决定要不要理它——插件不替它猜。
 // ---------------------------------------------------------------------------
 
 /** 静默窗口：一轮结束后等这么久仍没有新的一轮，才认定「安静下来了」。 */
 export const QUIET_WINDOW_MS = 120_000
+/**
+ * 唯一会转成回执的收尾原因。2026-11-03 全扫本机会话日志（`<DSH_HOME>/data/sessions/**`，
+ * 当日 1,740 份文件、7,851 条 `turn/end`）实测到的取值：`completed` 6,914 / `aborted` 464 /
+ * `error` 171 / `blocked` 153 / `interrupted` 121 / `max-tokens` 29。
+ * 只有 `completed` 可能是「这一单做完了」或「停在等人拍板」，其余一律不投。
+ * 认不出的取值同样不投 —— 宁可漏一条，也不投一条假回执。
+ */
+export const COMPLETED_REASON = 'completed'
 /** 投一条回执是一次宿主调用；10 秒是上限而不是预期耗时。 */
 export const NOTIFY_TIMEOUT_MS = 10_000
 
@@ -1311,7 +1328,7 @@ export function receiptText(record: { title?: unknown }, sessionId: string, endT
   const last = `turn ${turn === undefined ? '?' : turn}${reason === undefined ? '' : `, reason: ${reason}`}`
   return [
     `[Dispatch receipt · ${title}]`,
-    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} (${last}).`,
+    `The Session ${sessionId} you dispatched went quiet at ${stamp(endTime)} after a normal finish (${last}), and nothing it dispatched itself is still running.`,
     `Read what it did with read_session_transcript (sessionId "${sessionId}"). No reply needed; act only if the result calls for it.`,
   ].join('\n')
 }
@@ -1347,6 +1364,28 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     }
   }
 
+  /**
+   * 它自己还派着活吗？台账里 `dispatcherSessionId` 指向它、而此刻宿主报它还没停的子会话，
+   * 就是它在等的东西。等的时候这一轮结束不算做完（用户口径：分段派工人不投）。
+   * 子会话解析不出来（已被销毁）按「已停」算——那已经不会再来叫醒它了。
+   */
+  async function firstBusyChild(sessionId: string, controller: NonNullable<HostCtx['sessionController']>): Promise<string | undefined> {
+    let children: DispatchRecord[]
+    try {
+      children = (await readLedger(ledgerPath)).filter(record => record.dispatcherSessionId === sessionId && record.sessionId !== sessionId)
+    } catch (error) {
+      // 台账彻底读不出来时 recordOf 已经报过并拦下了；这里是两次读之间坏掉，按「没有子会话」放行。
+      log(`the dispatch ledger could not be read while checking whether ${sessionId} is still waiting on its own dispatches (${reasonOf(error)}).`)
+      return undefined
+    }
+    for (const child of children) {
+      const resolved = await resolveQuietly(controller, child.sessionId)
+      if (resolved?.agent === undefined) continue
+      if (resolved.agent.status !== 'idle') return child.sessionId
+    }
+    return undefined
+  }
+
   async function deliver(sessionId: string, endTime: number, turn: number | undefined, reason: string | undefined): Promise<void> {
     if (notified.has(sessionId)) return
     const record = await recordOf(sessionId)
@@ -1370,6 +1409,12 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     const resolved = await resolveQuietly(controller, sessionId)
     if (resolved?.agent?.status !== 'idle') {
       log(`${sessionId} went quiet, but the harness does not report it idle (status=${shortOf(resolved?.agent?.status)}), so no receipt was sent.`)
+      return
+    }
+    // 门三（还在等自己派的活）：阶段收工后派了工人、自己先躺下 —— 不是做完了，不投。
+    const waitingOn = await firstBusyChild(sessionId, controller)
+    if (waitingOn !== undefined) {
+      log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`)
       return
     }
     // 派活方会话已销毁（被关掉/归档）：没地方投，跳过 —— 这不是错误。
@@ -1424,14 +1469,18 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       return
     }
     const reason = typeof event?.data?.reason?.kind === 'string' ? event.data.reason.kind : undefined
-    // 门一（假回执）：关停与叫停都不算跑完。宿主关停时每个 turn 都以 aborted 收尾
-    // （resume.js:205-209 专跳这一支），用户手动叫停也是 aborted（turns.js:602/615/632）——
-    // 照字面只认 turn/end，每次重启都会给在途单发一条假回执。
-    if (reason === 'aborted') return
+    const turn = typeof event?.data?.turn === 'number' ? event.data.turn : undefined
+    // 门一（假回执 + 不该打扰）：只有正常收尾才可能是「这一单做完了」或「停在等人拍板」。
+    // 宿主关停时每个 turn 都以 aborted 收尾（resume.js:205-209 专跳这一支），用户手动叫停
+    // 也是 aborted（turns.js:602/615/632）；重启掐断是 interrupted；模型/工具出错是 error；
+    // 另有 blocked 与 max-tokens。认不出的取值同 undefined 一样按「不是正常收尾」处理。
+    if (reason !== COMPLETED_REASON) {
+      log(`${sessionId} ended turn ${turn === undefined ? '?' : turn} with reason ${shortOf(reason)}, which is not a normal finish, so no receipt is scheduled.`)
+      return
+    }
     const previous = pending.get(sessionId)
     if (previous !== undefined) clearTimer(previous.handle)
     const endTime = now()
-    const turn = typeof event?.data?.turn === 'number' ? event.data.turn : undefined
     const handle = setTimer(() => {
       pending.delete(sessionId)
       return deliver(sessionId, endTime, turn, reason)
