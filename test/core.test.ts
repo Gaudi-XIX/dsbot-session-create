@@ -416,25 +416,25 @@ describe('会话选项：agent preset 与权限模式', () => {
   const base = { title: 't', prompt: 'p', workspace: 'w' }
   const ws = { workspaces: { w: { id: 'w' } } }
 
-  test('都不给 → 缺省派单走 auto，但仍不碰 agentPresets、create 也不带 agentPreset', async () => {
+  test('都不给 → 缺省派单一律全权限，但仍不碰 agentPresets、create 也不带 agentPreset', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, base)
     expect(calls.list).toHaveLength(0)
-    // 缺省档＝auto（2026-11-01 定）：多跑一次 /permission，再把策略压成 never。
-    expect(calls.command.map(c => c[1])).toEqual(['/permission auto'])
-    expect(calls.approval).toEqual([['approval/policy', { policy: 'never' }]])
+    // 缺省档＝全权限（2026-11-03 定）：不再看名单里有没有 auto，也不再碰审批策略。
+    expect(calls.command.map(c => c[1])).toEqual(['/permission danger-full-access'])
+    expect(calls.approval).toHaveLength(0)
     expect(calls.create[0].agentPreset).toBeUndefined()
     expect(result.preset).toBeUndefined()
-    expect(result.permission).toBe('auto')
-    expect(result.approvalPolicy).toBe('never')
-    expect(result.permissionNote).toBeUndefined()
+    expect(result.permission).toBe('danger-full-access')
+    expect(result.approvalPolicy).toBeUndefined()
+    expect(result.permissionNote).toContain('was omitted')
   })
 
   test('preset 走 create 的 agentPreset 字段，且先查过宿主有没有这个预设', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc' })
     expect(calls.create[0]).toMatchObject({ workspaceId: 'w', agentPreset: 'ptc' })
-    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'approval', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'prompt'])
     expect(result.preset).toBe('ptc')
   })
 
@@ -612,30 +612,23 @@ describe('会话选项：agent preset 与权限模式', () => {
     expect(commands.seen).toEqual(['/permission danger-full-access'])
   })
 
-  // 缺省档的三态探测（2026-11-01 加）：用户要「派单一律 auto」，但别人机器上可能没有 auto 档、
-  // 或者 auto-review 集成没启用。以下五条锁住「问到就用、问不到就降级并如实说明、显式要才失败」。
-  test('缺省档：名单里没有 auto → 退回 danger-full-access 并如实说明', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'without-auto' })
-    const result = await createSessionIn(ctx, base)
-    expect(result.permission).toBe('danger-full-access')
-    expect(result.approvalPolicy).toBeUndefined()
-    expect(result.permissionNote).toContain('no `auto` permission preset')
-    expect(calls.approval).toHaveLength(0)
-  })
-
-  test('缺省档：名单根本取不到 → 也退回 danger-full-access，不猜', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, autoPreset: 'absent' })
-    const result = await createSessionIn(ctx, base)
-    expect(result.permission).toBe('danger-full-access')
-    expect(result.permissionNote).toContain('does not expose its permission presets')
-    expect(calls.command.map(c => c[1])).toEqual(['/permission danger-full-access'])
-  })
-
-  test('缺省档：有 auto 但没有审批服务 → 不选 auto（会卡在审查弹窗），退回全权限', async () => {
-    const { ctx } = fakeCtx({ ...ws, noApprovalService: true })
-    const result = await createSessionIn(ctx, base)
-    expect(result.permission).toBe('danger-full-access')
-    expect(result.permissionNote).toContain('no approval service')
+  // 缺省档（2026-11-03 改）：不管宿主名单里有没有 auto、有没有审批服务，不传 `permission` 一律全权限。
+  // 只有显式 `permission: 'auto'` 才走 auto（下面两条锁住那条路）。
+  test('缺省档：名单有 auto / 没有 auto / 根本取不到 / 没有审批服务，一律全权限并说明', async () => {
+    for (const shape of [
+      { autoPreset: 'with-auto' as const },
+      { autoPreset: 'without-auto' as const },
+      { autoPreset: 'absent' as const },
+      { noApprovalService: true },
+    ]) {
+      const { ctx, calls } = fakeCtx({ ...ws, ...shape })
+      const result = await createSessionIn(ctx, base)
+      expect(result.permission).toBe('danger-full-access')
+      expect(result.approvalPolicy).toBeUndefined()
+      expect(result.permissionNote).toContain('was omitted')
+      expect(calls.command.map(c => c[1])).toEqual(['/permission danger-full-access'])
+      expect(calls.approval).toHaveLength(0)
+    }
   })
 
   test('显式要 auto 但名单明确没有 → host-missing，且根本不建会话', async () => {
@@ -660,8 +653,8 @@ describe('会话选项：agent preset 与权限模式', () => {
     const records = (await readFile(ledger, 'utf8')).trim().split('\n').map(line => JSON.parse(line))
     expect(records[0]).toMatchObject({ preset: 'ptc', permission: 'danger-full-access', permissionOverriddenFrom: 'read-only' })
     expect(records[1].preset).toBeUndefined()
-    expect(records[1].permission).toBe('auto')
-    expect(records[1].approvalPolicy).toBe('never')
+    expect(records[1].permission).toBe('danger-full-access')
+    expect(records[1].approvalPolicy).toBeUndefined()
     expect(records[1].permissionOverriddenFrom).toBeUndefined()
     await rm(dir, { recursive: true, force: true })
   })

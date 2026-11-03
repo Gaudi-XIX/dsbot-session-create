@@ -275,23 +275,22 @@ function autoPresetState(ctx: HostCtx): 'yes' | 'no' | 'unknown' {
 }
 
 /**
- * 定这一单的权限档。缺省档＝auto（2026-10-29 2026-11-01 13:19 口述「我倒是想写成派单也一律 auto，
- * 但是我怕有些人没有这个 auto。或者有这个 auto，但是他没把插件打开」——他要的是一律 auto，但别人机器上
- * 没有 auto 时不能炸）。
+ * 定这一单的权限档。缺省档＝全权限（2026-11-03 用户口述「行，那权限就默认改为 danger for access 吧」）。
  *
- * 所以缺省值不写死成 auto：现场问一次宿主拿名单（auto 由宿主 auto-review 集成注册，没装或没启用时
- * 名单里不出现这个名字），问到什么用什么，问不到就退回全权限，并把降级原因如实写进结果——
- * 降级要看得见，不能悄悄换了档还说一切正常。
+ * 不传 `permission` 时不再去问宿主有没有 `auto` 档：`auto` 档下宿主 auto-review 审查每一次工具调用，
+ * 而派出去的会话无人值守——审查器没按约定给出判决时，宿主直接按拒绝处理，不重试也不降级
+ * （`dsh-experimental-auto-review` 的 preset 判定与 `failed(exec, review.error)` 两条在
+ * docs/dsh-permission-auto-deny-20261101.md 有留痕），会话就卡在原地。
  *
- * 调用方显式要 auto 时不降级：名单明确没有就整单失败、不建会话。名单读不到则照旧下发，让宿主的
- * `/permission` 自己去判认不认这个名字（那里才是权威）。
+ * 调用方显式要 auto 时才走 auto：名单明确没有就整单失败、不建会话。名单读不到则照旧下发，让宿主的
+ * `/permission` 自己去判认不认这个名字（那里才是权威）。显式 auto 也照旧紧跟一步把审批策略压成
+ * `never`，否则 reviewer 的 deny 会变成「等一个永远不来的答复」。
  *
- * @returns 需要写进结果的一句说明（缺省档被降级、或没有命令服务所以没设档）；正常情况返回 undefined。
+ * @returns 需要写进结果的一句说明（没设档、或缺省档生效）；正常情况返回 undefined。
  */
 function resolveDefaultPermission(ctx: HostCtx, options: SessionOptions): string | undefined {
-  const state = autoPresetState(ctx)
   if (options.permission !== undefined) {
-    if (options.permission.toLowerCase() === AUTO_PERMISSION && state === 'no') {
+    if (options.permission.toLowerCase() === AUTO_PERMISSION && autoPresetState(ctx) === 'no') {
       throw new SessionCreateError(
         'host-missing',
         'this harness lists no `auto` permission preset (auto review is off or not installed); no Session was made.',
@@ -304,20 +303,8 @@ function resolveDefaultPermission(ctx: HostCtx, options: SessionOptions): string
   if (typeof ctx.commands?.execute !== 'function') {
     return 'this harness has no commands.execute, so no permission preset was set; the Session runs at the host default.'
   }
-  if (state === 'yes' && ctx.approval === undefined) {
-    // 有 auto 档但没有审批层：压不成 never，auto 的 deny 会变成等一个永远不来的答复。
-    options.permission = FULL_PERMISSION
-    return 'this harness lists an `auto` permission preset but exposes no approval service, so an `auto` dispatch there could stall on a review prompt; the Session was opened at "' + FULL_PERMISSION + '" instead.'
-  }
-  if (state === 'yes') {
-    options.permission = AUTO_PERMISSION
-    return undefined
-  }
   options.permission = FULL_PERMISSION
-  if (state === 'no') {
-    return 'this harness lists no `auto` permission preset (auto review is off or not installed), so the Session was opened at "' + FULL_PERMISSION + '".'
-  }
-  return 'this harness does not expose its permission presets, so the `auto` default could not be confirmed; the Session was opened at "' + FULL_PERMISSION + '".'
+  return 'the `permission` option was omitted, so the Session was opened at "' + FULL_PERMISSION + '" (a permission preset is chosen only when `permission` is given).'
 }
 
 export function readOptions(args: CreateArgs): SessionOptions {

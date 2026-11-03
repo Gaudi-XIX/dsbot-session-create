@@ -12,7 +12,7 @@
 三条与普通「开个会话」不同的硬规则，先看这里：
 
 1. **派出去的会话不落到宿主的全局默认模型上**。它钉死到派活那个 Bot 自己正在用的模型；读不到派活人的模型就**不建这一单**。
-2. **权限档的降级要看得见**。缺省想给 `auto`；宿主没有这个档就退回全权限，并把「为什么退」写进结果——不悄悄换档还说一切正常。
+2. **缺省权限档是全权限**。不传 `permission` 时一律开在 `danger-full-access`，并把这一条写进结果；要 `auto` 就显式传。
 3. **补话只服务还在跑的会话**。目标会话已经停下，就拒投并让你新开一个，不往历史里一层一层堆活。
 
 ## 为什么需要它
@@ -68,16 +68,8 @@ list_dispatched_sessions(limit?)
 档名由宿主判定（`/permission` 的合法值会随宿主升级漂移），本插件不硬编码白名单，只做三件事：
 
 - **显式传 `read-only` / `workspace-write` 会被改写成 `danger-full-access`**，并在结果里如实标出 `permissionOverriddenFrom`。理由：这两档带 `approval: ask`，派单会话无人应答就整轮卡死，而宿主没有「给已存在会话提权」的入口。要放行只读探针，在宿主环境里设 `DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1`（值必须严格等于 `1`）。
-- **没传 `permission` 时现场问一次宿主**，看它的权限档名单里有没有 `auto`，按三态处理：
-
-| 宿主此刻的样子 | 这一单用哪个档 | 是否在结果里说明 |
-| --- | --- | --- |
-| 名单有 `auto`，也有审批服务 | `auto`，随后把审批策略压成 `never` | 正常，不额外说明 |
-| 名单有 `auto`，但没有审批服务 | `danger-full-access` | 说明（`auto` 的 deny 会变成等一个永远不来的答复） |
-| 名单读得到、里面没有 `auto` | `danger-full-access` | 说明（auto review 没装或没启用） |
-| 名单根本读不到（老宿主／别的客户端） | `danger-full-access` | 说明（默认档无法确认） |
-| 没有 `commands.execute` | 不设档，吃宿主默认 | 说明 |
-
+- **没传 `permission` 时一律开在 `danger-full-access`**，并在结果里带 `permissionNote` 说明。理由：`auto` 档下宿主 auto-review 审查每一次工具调用，而派出去的会话无人值守——审查器没按约定给出判决时，宿主直接按拒绝处理、不重试也不降级，会话就卡在原地。要 `auto` 就**显式传**。
+- **没有 `commands.execute` 时**设不了档：保持不传，吃宿主默认（本机默认就是全权限），并在结果里说明。
 - **显式要 `auto` 时**：宿主名单明确没有就整单失败、不建会话（`host-missing`）；名单读不到就照旧下发，让宿主的 `/permission` 自己去判认不认这个名字。
 - `auto` 档的第二步是把审批策略写成 `never`：`auto` 自带 `ask`，无人值守时 reviewer 判 deny 会变成整晚卡死。这一步走 `session.append('approval/policy', { policy: 'never' })`，不调 `ApprovalService.setPolicy`（后者会往会话里注入一条假消息）；写不进去就**归档这个会话并整单失败**——让会话带着 `ask` 活下去，等于埋一颗整晚卡死的雷。
 - 有一处宿主机制产物要知道：`/permission auto` 那一步自己会写一条 `ask`，并往会话里注入一句「changed from "never" to "ask"」的 user 消息；本插件紧跟其后写 `never`，最终生效的是 `never`，但读 transcript 时会看到那条消息。
@@ -219,12 +211,12 @@ node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一�
 
 ## 已验证 / 尚未验证
 
-**已验证（2026-11-02 实测）**
+**已验证（2026-11-03 实测）**
 
-- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（63,920 字节）。
-- `bun test`：165 pass / 0 fail / 603 次断言，5 个文件（bun 1.3.13）。
+- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（63,242 字节，sha256 `8712027a…b8f`）。
+- `bun test`：163 pass / 0 fail / 614 次断言，5 个文件（bun 1.3.13）。
 - `tsc --noEmit -p . --typeRoots <现成的 node_modules>/@types`（借一份现成的 `typescript` 与 `@types/node`，见「开发」）：0 个错误。**不带 `--typeRoots` 会报 `error TS2688: Cannot find type definition file for 'node'.` 并退出码 2**——本仓没有自己的 `node_modules`。
-- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.3.0 这次的改动要重启宿主之后才生效（重启只能由用户执行）。
+- 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0 这次的改动要重启宿主之后才生效（重启只能由用户执行）。
 
 **尚未验证**
 
