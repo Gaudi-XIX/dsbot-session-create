@@ -67,12 +67,13 @@ const MESSAGE_DESCRIPTION = [
 
 const READ_DESCRIPTION = [
   'Read back what a Session has said and where it stands, by session id: its latest messages (oldest first) and whether its current turn has already ended.',
-  'This is how a dispatched Session\'s result is collected without opening it by hand. Omit `sessionId` to read the most recent dispatch from the ledger.',
+  'This is how a dispatched Session\'s result is collected without opening it by hand: pass the id from create_session or from the dispatch ledger.',
   '`last` sets how many messages to bring back (1..200, default 40); older ones remain readable with a bigger value.',
 ].join(' ')
 
 const LIST_DESCRIPTION = [
   'List the Sessions this plugin dispatched, newest first, with each one\'s state right now: still working, its last turn finished, or a read error.',
+  'By default only the dispatches made by the calling Session are listed; pass `all: true` to see every dispatch in the ledger.',
   'Use it to see which dispatches are ready to collect; read_session_transcript then gives the content.',
 ].join(' ')
 
@@ -243,7 +244,7 @@ export function apply(ctx: HostCtx): void {
       name: 'read_session_transcript',
       description: READ_DESCRIPTION,
       parameters: {
-        sessionId: { type: 'string', description: 'The Session to read. Omit to read the most recent dispatch in the ledger.' },
+        sessionId: { type: 'string', required: true, description: 'The Session to read: the id create_session returned, or one listed by list_dispatched_sessions. It cannot be omitted — a dispatch can never be guessed.' },
         last: { type: 'number', description: 'How many of the newest messages to bring back (1..200; default 40).' },
       },
       output,
@@ -265,20 +266,27 @@ export function apply(ctx: HostCtx): void {
       description: LIST_DESCRIPTION,
       parameters: {
         limit: { type: 'number', description: 'How many of the newest dispatches to show (1..20; default 5).' },
+        all: { type: 'boolean', description: 'List every dispatch in the ledger instead of only the ones made by the calling Session (default false; for auditing).' },
       },
       output,
-      async execute(args: { limit?: number }) {
+      async execute(args: { limit?: number; all?: boolean }, exec?: unknown) {
         const live = resolveServices(ctx)
         const missing = preflightRead(live)
         // 台账读不出来时如实带出原因，绝不换一句笼统的话，更不许当成「还没有派送过」。
         let ledger: Awaited<ReturnType<typeof listDispatchedIn>>
         try {
-          ledger = await listDispatchedIn(live, args)
+          ledger = await listDispatchedIn(live, args, { exec })
         } catch (error) {
           const reason = error instanceof Error ? error.message : String(error)
           return `Could not read the dispatch ledger: ${reason}`
         }
-        if (ledger.lines.length === 0) return `No Session has been dispatched from this plugin yet (ledger: ${ledger.ledgerPath}).`
+        if (ledger.lines.length === 0) {
+          // 隔离后「没有」有两种含义，不许混成一句：本调用方没派过，与整份台账都是空的。
+          const caller = args.all === true ? undefined : dispatcherSessionOf(exec)
+          return caller === undefined
+            ? `No Session has been dispatched from this plugin yet (ledger: ${ledger.ledgerPath}).`
+            : `No Session has been dispatched by this Session yet (ledger: ${ledger.ledgerPath}; pass all: true to see every dispatch).`
+        }
         const header = missing.length === 0
           ? `Dispatched Sessions, newest first (ledger: ${ledger.ledgerPath})`
           : `Dispatched Sessions, newest first (ledger: ${ledger.ledgerPath}; this harness cannot read them back — missing ${missing.join(', ')})`

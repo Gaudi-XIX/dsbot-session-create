@@ -2,6 +2,14 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.7.0 — 2026-11-05
+
+**三处不向后兼容的行为变更（多会话并发缺陷）**
+
+- `read_session_transcript` 的 `sessionId` 改为**必填**：不给或给空直接报 `no-session`（`give a session id: sessionId is required and cannot be omitted.`），不再「不给就取台账里最近一条」。理由：多条派活线并存时，缺省读到的可能是别人的单，读回结论会张冠李戴。
+- `list_dispatched_sessions` **默认只列本调用方自己派的单子**：拿 `exec` 里的会话 id 与台账的 `dispatcherSessionId` 比对；要看全量传 `all: true`，取不到调用方上下文时不过滤并在输出里写明。
+- 台账的「已读/已通知」标记改为**追加式**：`markRead` / `markNotified` 不再「全量读入 → 内存改写 → 写临时文件 → rename 覆盖」，改为追加一条带新字段的同行记录，靠 `readLedger` 按 `sessionId` 后写覆盖先写合并。消除并发写覆盖与 `.tmp-` 孤儿文件。
+
 ## 0.6.0 — 2026-11-03
 
 **行为变更**

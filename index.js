@@ -3,13 +3,13 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 
 // src/autoresume.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile2, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
+import { mkdir as mkdir2, readFile as readFile2, rename, writeFile } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
 import { dirname as dirname2, join as join2 } from "node:path";
 
 // src/core.ts
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 var PROMPT_TIMEOUT_MS = 30000;
@@ -478,29 +478,17 @@ async function readLedger(ledgerPath) {
   return records;
 }
 async function markRead(ledgerPath, sessionId, seq, at = Date.now()) {
-  const records = await readLedger(ledgerPath);
-  const at_ = records.findIndex((record) => record.sessionId === sessionId);
-  if (at_ < 0)
+  const record = (await readLedger(ledgerPath)).find((item) => item.sessionId === sessionId);
+  if (record === undefined)
     return false;
-  records[at_] = { ...records[at_], lastReadSeq: seq, lastReadAt: at };
-  const body = records.map((record) => `${JSON.stringify(record)}
-`).join("");
-  const temp = `${ledgerPath}.tmp-${randomUUID()}`;
-  await writeFile(temp, body, "utf8");
-  await rename(temp, ledgerPath);
+  await appendDispatch(ledgerPath, { ...record, lastReadSeq: seq, lastReadAt: at });
   return true;
 }
 async function markNotified(ledgerPath, sessionId, at = Date.now()) {
-  const records = await readLedger(ledgerPath);
-  const index = records.findIndex((record) => record.sessionId === sessionId);
-  if (index < 0)
+  const record = (await readLedger(ledgerPath)).find((item) => item.sessionId === sessionId);
+  if (record === undefined)
     return false;
-  records[index] = { ...records[index], notifiedAt: at };
-  const body = records.map((record) => `${JSON.stringify(record)}
-`).join("");
-  const temp = `${ledgerPath}.tmp-${randomUUID()}`;
-  await writeFile(temp, body, "utf8");
-  await rename(temp, ledgerPath);
+  await appendDispatch(ledgerPath, { ...record, notifiedAt: at });
   return true;
 }
 function blockText(content) {
@@ -567,23 +555,16 @@ async function readSessionIn(ctx, args = {}, opts = {}) {
     throw new SessionCreateError("host-missing", `this harness cannot read a Session's history: it is missing ${missing.join(", ")}.`);
   }
   const ledgerPath = opts.ledger ?? defaultLedgerPath();
-  const wanted = (args.sessionId ?? "").trim();
-  let fromLedger;
-  let sessionId = wanted;
-  let ledgerError;
+  const sessionId = (args.sessionId ?? "").trim();
   if (sessionId === "") {
-    const records = await readLedger(ledgerPath);
-    fromLedger = records.at(-1);
-    if (fromLedger === undefined) {
-      throw new SessionCreateError("no-session", `give a session id: the dispatch ledger ${ledgerPath} has no entry yet.`);
-    }
-    sessionId = fromLedger.sessionId;
-  } else {
-    try {
-      fromLedger = (await readLedger(ledgerPath)).find((record) => record.sessionId === sessionId);
-    } catch (error) {
-      ledgerError = reasonOf(error);
-    }
+    throw new SessionCreateError("no-session", "give a session id: sessionId is required and cannot be omitted.");
+  }
+  let fromLedger;
+  let ledgerError;
+  try {
+    fromLedger = (await readLedger(ledgerPath)).find((record) => record.sessionId === sessionId);
+  } catch (error) {
+    ledgerError = reasonOf(error);
   }
   const controller = ctx.sessionController;
   const resolved = await controller.resolveAgent?.(sessionId);
@@ -696,7 +677,8 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
 async function listDispatchedIn(ctx, args = {}, opts = {}) {
   const ledgerPath = opts.ledger ?? defaultLedgerPath();
   const limit = clamp(args.limit ?? 5, 1, 20);
-  const records = (await readLedger(ledgerPath)).slice(-limit).reverse();
+  const caller = args.all === true ? undefined : dispatcherSessionOf(opts.exec);
+  const records = (await readLedger(ledgerPath)).filter((record) => caller === undefined || record.dispatcherSessionId === caller).slice(-limit).reverse();
   const lines = [];
   for (const record of records) {
     try {
@@ -990,8 +972,8 @@ async function writeAtomicDefault(path, text) {
   const dir = dirname2(path);
   await mkdir2(dir, { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile2(tmp, text, "utf8");
-  await rename2(tmp, path);
+  await writeFile(tmp, text, "utf8");
+  await rename(tmp, path);
 }
 function isStrictlyNewer(candidate, acked) {
   const fresh = Date.parse(candidate);
@@ -1233,11 +1215,12 @@ var MESSAGE_DESCRIPTION = [
 ].join(" ");
 var READ_DESCRIPTION = [
   "Read back what a Session has said and where it stands, by session id: its latest messages (oldest first) and whether its current turn has already ended.",
-  "This is how a dispatched Session's result is collected without opening it by hand. Omit `sessionId` to read the most recent dispatch from the ledger.",
+  "This is how a dispatched Session's result is collected without opening it by hand: pass the id from create_session or from the dispatch ledger.",
   "`last` sets how many messages to bring back (1..200, default 40); older ones remain readable with a bigger value."
 ].join(" ");
 var LIST_DESCRIPTION = [
   "List the Sessions this plugin dispatched, newest first, with each one's state right now: still working, its last turn finished, or a read error.",
+  "By default only the dispatches made by the calling Session are listed; pass `all: true` to see every dispatch in the ledger.",
   "Use it to see which dispatches are ready to collect; read_session_transcript then gives the content."
 ].join(" ");
 function statusLine(transcript) {
@@ -1360,7 +1343,7 @@ function apply(ctx) {
     name: "read_session_transcript",
     description: READ_DESCRIPTION,
     parameters: {
-      sessionId: { type: "string", description: "The Session to read. Omit to read the most recent dispatch in the ledger." },
+      sessionId: { type: "string", required: true, description: "The Session to read: the id create_session returned, or one listed by list_dispatched_sessions. It cannot be omitted — a dispatch can never be guessed." },
       last: { type: "number", description: "How many of the newest messages to bring back (1..200; default 40)." }
     },
     output,
@@ -1379,21 +1362,24 @@ function apply(ctx) {
     name: "list_dispatched_sessions",
     description: LIST_DESCRIPTION,
     parameters: {
-      limit: { type: "number", description: "How many of the newest dispatches to show (1..20; default 5)." }
+      limit: { type: "number", description: "How many of the newest dispatches to show (1..20; default 5)." },
+      all: { type: "boolean", description: "List every dispatch in the ledger instead of only the ones made by the calling Session (default false; for auditing)." }
     },
     output,
-    async execute(args) {
+    async execute(args, exec) {
       const live = resolveServices(ctx);
       const missing = preflightRead(live);
       let ledger;
       try {
-        ledger = await listDispatchedIn(live, args);
+        ledger = await listDispatchedIn(live, args, { exec });
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         return `Could not read the dispatch ledger: ${reason}`;
       }
-      if (ledger.lines.length === 0)
-        return `No Session has been dispatched from this plugin yet (ledger: ${ledger.ledgerPath}).`;
+      if (ledger.lines.length === 0) {
+        const caller = args.all === true ? undefined : dispatcherSessionOf(exec);
+        return caller === undefined ? `No Session has been dispatched from this plugin yet (ledger: ${ledger.ledgerPath}).` : `No Session has been dispatched by this Session yet (ledger: ${ledger.ledgerPath}; pass all: true to see every dispatch).`;
+      }
       const header = missing.length === 0 ? `Dispatched Sessions, newest first (ledger: ${ledger.ledgerPath})` : `Dispatched Sessions, newest first (ledger: ${ledger.ledgerPath}; this harness cannot read them back — missing ${missing.join(", ")})`;
       const lines = ledger.lines.map((line, index) => {
         const head = `${index + 1}. ${line.record.sessionId} · "${line.record.title}" · ${line.record.placement}`;

@@ -28,8 +28,8 @@ DS Bot 的 Chief 能把活派给别的 Bot（`message_bot`），但派不进「�
 ```
 create_session(title, prompt, workspace? | folder?, preset?, permission?, model?)
 session_message(sessionId, message)
-read_session_transcript(sessionId?, last?)
-list_dispatched_sessions(limit?)
+read_session_transcript(sessionId, last?)
+list_dispatched_sessions(limit?, all?)
 ```
 
 ### `create_session`
@@ -86,6 +86,8 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 台账写失败**不会**让整次派送算失败（会话已经建出来了），但结果里会带 `ledgerError`，并写明「自己手动记下这个 session id」。
 
+读回回执与「已读/已通知」标记**也是追加**：不重写整份台账，只在末尾再追加一条带新字段的同行记录，读取时按 `sessionId` 后写的覆盖先写的（`readLedger`）。并发的两条派活线因此不会互相覆盖，也不会留下 `.tmp-` 孤儿文件。
+
 落点为什么在 `bot/` 下：这份账是 **Bot ↔ 人的交接记录**，属于 DS Bot 自己的数据，所以跟在 DS Bot 的 home（`<DSH_HOME>/bot`）里。若 ds-bot 的 home 被它自己的 profile 配置改到别处，用 `DSH_SESSION_CREATE_LEDGER` 对齐。
 
 ### `session_message`
@@ -105,13 +107,15 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### `read_session_transcript`
 
-按 id 取回一个会话说了什么、现在什么状态（最新若干条消息 + 当前这一轮结束没有）。**不给 `sessionId` 就取台账里最近一条派送**，所以「刚派完那单跑完没」不需要手动找 id。
+按 id 取回一个会话说了什么、现在什么状态（最新若干条消息 + 当前这一轮结束没有）。`sessionId` **必填**：不给或给空就报 `no-session`，什么都不读。台账里记着好几单，猜「最近那一单」会读错别人的活。
 
 `last` 给取回多少条（1..200，默认 40），更早的用更大的值再读。历史读回超时 20 秒（`HISTORY_TIMEOUT_MS`）。
 
 ### `list_dispatched_sessions`
 
 倒序列出台账里的派送，每条带**此刻**的状态：还在跑 / 上一轮已结束 / 还没起跑（`not started`）/ 读失败。用来挑「哪些可以收了」。
+
+**默认只列本调用方自己派的单子**：调用方会话 id 从 `exec` 取，与台账里的 `dispatcherSessionId` 比对。要看全部就传 `all: true`；取不到调用方上下文（手工调用、别的宿主形态）时不过滤，输出里会写开。
 
 ### 状态是怎么来的
 

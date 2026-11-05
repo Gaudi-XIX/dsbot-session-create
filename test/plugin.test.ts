@@ -2,7 +2,7 @@
 // 跑之前先 `bun run build`。宿主 SDK 由 tsconfig paths 指到 test/stubs/dsh-tools.ts。
 // 台账落点被指到 .tmp 下：本测试**不许**碰用户真实的 $DSH_HOME/session-create（见 beforeAll）。
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { apply, inject, name } from '../index.js'
 import { realShapedEvents } from './fixtures/events'
@@ -335,12 +335,12 @@ describe('派送 → 读回（构建产物）', () => {
     }
   })
 
-  test('不给 ID 就读台账里最近那一单', async () => {
+  test('不给 ID → 明确拒绝，绝不去猜台账里最近那一单', async () => {
     const { tools } = load()
     await (tools.get('create_session') as Spec).execute({ title: '最近一单', prompt: 'p', workspace: 'ws-1' })
     const read = await (tools.get('read_session_transcript') as Spec).execute({})
-    expect(read).toContain('sess-9')
-    expect(read).toContain('最近一单')
+    expect(read).toContain('give a session id')
+    expect(read).toContain('required')
   })
 
   test('宿主直给状态时，读回写明这个状态来自宿主', async () => {
@@ -358,6 +358,34 @@ describe('派送 → 读回（构建产物）', () => {
     expect(listed).toContain('Dispatched Sessions, newest first')
     expect(listed).toContain('sess-9')
     expect(listed).toContain('still working')
+  })
+
+  test('台账一览默认只列本调用方派的单子；all: true 才列全量', async () => {
+    const dir = await mkdtemp(join(TMP_ROOT, 'dsc-list-'))
+    const ledger = join(dir, 'ledger.jsonl')
+    process.env.DSH_SESSION_CREATE_LEDGER = ledger
+    try {
+      // 直接铺台账：假宿主每次 create_session 都返回同一个 sess-9，两单会按 sessionId 合并成一条，
+      // 测不到「两个派活人各有一单」这个形状。
+      const at = Date.parse('2026-11-05T20:00:00+08:00')
+      await writeFile(ledger, [
+        { sessionId: 'sess-mine', title: '我的单', placement: 'workspace 投标', dispatchedAt: at, promptHead: 'p', dispatcherSessionId: 'session-bot-1' },
+        { sessionId: 'sess-other', title: '别人的单', placement: 'workspace 投标', dispatchedAt: at + 1_000, promptHead: 'p', dispatcherSessionId: 'session-bot-2' },
+      ].map(record => `${JSON.stringify(record)}\n`).join(''), 'utf8')
+      const { tools } = load()
+      const mine = await (tools.get('list_dispatched_sessions') as Spec).execute({})
+      expect(mine).toContain('我的单')
+      expect(mine).not.toContain('别人的单')
+      const every = await (tools.get('list_dispatched_sessions') as Spec).execute({ all: true })
+      expect(every).toContain('我的单')
+      expect(every).toContain('别人的单')
+      const stranger = await (tools.get('list_dispatched_sessions') as Spec).execute({}, { agent: { session: { id: 'session-bot-3' } } })
+      expect(stranger).toContain('No Session has been dispatched by this Session yet')
+      expect(stranger).not.toContain('我的单')
+    } finally {
+      process.env.DSH_SESSION_CREATE_LEDGER = AMBIENT_LEDGER
+      await rm(dir, { recursive: true, force: true })
+    }
   })
 
   test('宿主没有读历史的能力 → 读回工具给出可读说明，列表工具说明缺什么', async () => {
@@ -395,8 +423,8 @@ describe('派送 → 读回（构建产物）', () => {
       expect(listed).toContain('Could not read the dispatch ledger')
       expect(listed).toContain('could not be read')
       expect(listed).not.toContain('No Session has been dispatched')
-      const read = await (tools.get('read_session_transcript') as Spec).execute({})
-      expect(read).toContain('Could not read the Session')
+      const read = await (tools.get('read_session_transcript') as Spec).execute({ sessionId: 'sess-9' })
+      expect(read).toContain('the dispatch ledger could not be used')
       expect(read).toContain('could not be read')
       expect(read).not.toContain('give a session id')
     } finally {

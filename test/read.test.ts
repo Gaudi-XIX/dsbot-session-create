@@ -222,12 +222,18 @@ describe('台账', () => {
     }
   })
 
-  test('markRead 记下读到的位置；未登记的会话返回 false', async () => {
+  test('markRead 记下读到的位置；未登记的会话返回 false；只追加、不重写整份台账', async () => {
     const dir = await tempDir()
     try {
       const ledger = await newLedger(dir, ['s1', 's2'])
+      const before = (await readFile(ledger, 'utf8')).trim().split('\n')
       expect(await markRead(ledger, 's1', 41, 1234)).toBe(true)
       expect(await markRead(ledger, 'nope', 1)).toBe(false)
+      const after = (await readFile(ledger, 'utf8')).trim().split('\n')
+      // 原有两行一字不动，只在末尾多一行 —— 并发写的另一方不会被整份覆写抹掉。
+      expect(after.slice(0, before.length)).toEqual(before)
+      expect(after).toHaveLength(before.length + 1)
+      expect(after.at(-1)).toContain('"lastReadSeq":41')
       const records = await readLedger(ledger)
       expect(records.map(record => record.sessionId)).toEqual(['s1', 's2'])
       expect(records[0]).toMatchObject({ lastReadSeq: 41, lastReadAt: 1234 })
@@ -331,14 +337,13 @@ describe('readSessionIn', () => {
     }
   })
 
-  test('不给 ID 就读台账里最后派送的那一单', async () => {
+  test('不给 ID → no-session 拒绝，绝不去猜台账里最后一条（并发下会跨会话串台）', async () => {
     const dir = await tempDir()
     try {
       const ledger = await newLedger(dir, ['sess-1', 'sess-2'])
       const { ctx, calls } = fakeCtx({ events: realShapedEvents(), seq: 42 })
-      const transcript = await readSessionIn(ctx, {}, { ledger, signal: new AbortController().signal })
-      expect(transcript.sessionId).toBe('sess-2')
-      expect(calls.page[0]).toMatchObject({ address: { kind: 'session', sessionId: 'sess-2' } })
+      expect(await codeOf(() => readSessionIn(ctx, {}, { ledger, signal: new AbortController().signal }))).toBe('no-session')
+      expect(calls.page).toHaveLength(0)
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
@@ -388,13 +393,13 @@ describe('readSessionIn', () => {
     }
   })
 
-  test('不给 ID 且台账读不出来 → ledger-unreadable，而不是「还没派送过」', async () => {
+  test('不给 ID 时连台账都不读 → no-session（缺省直接拒绝，不再借台账定位）', async () => {
     const dir = await tempDir()
     try {
       const asDir = join(dir, 'ledger-as-dir')
       await mkdir(asDir, { recursive: true })
       const { ctx, calls } = fakeCtx()
-      expect(await codeOf(() => readSessionIn(ctx, {}, { ledger: asDir }))).toBe('ledger-unreadable')
+      expect(await codeOf(() => readSessionIn(ctx, {}, { ledger: asDir }))).toBe('no-session')
       expect(calls.page).toHaveLength(0)
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -520,6 +525,31 @@ describe('listDispatchedIn', () => {
       expect(listed.lines.map(line => line.record.sessionId)).toEqual(['s3', 's2', 's1'])
       const one = await listDispatchedIn(ctx, { limit: 0 }, { ledger, signal: new AbortController().signal })
       expect(one.lines.map(line => line.record.sessionId)).toEqual(['s3'])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('默认只列本调用方自己派的单子；all: true 或无调用方上下文才列全量', async () => {
+    const dir = await tempDir()
+    try {
+      const ledger = join(dir, 'dispatched-sessions.jsonl')
+      const at = Date.parse('2026-11-05T20:00:00+08:00')
+      for (const [sessionId, dispatcherSessionId] of [['a-1', 'caller-a'], ['b-1', 'caller-b'], ['a-2', 'caller-a']] as const) {
+        await appendDispatch(ledger, { sessionId, title: sessionId, placement: 'folder F:\\x', dispatchedAt: at, dispatcherSessionId })
+      }
+      const { ctx } = fakeCtx({ events: realShapedEvents(), seq: 42 })
+      const execA = { agent: { session: { id: 'caller-a' } } }
+      const mine = await listDispatchedIn(ctx, {}, { ledger, exec: execA })
+      expect(mine.lines.map(line => line.record.sessionId)).toEqual(['a-2', 'a-1'])
+      const all = await listDispatchedIn(ctx, { all: true }, { ledger, exec: execA })
+      expect(all.lines.map(line => line.record.sessionId)).toEqual(['a-2', 'b-1', 'a-1'])
+      // 没有调用方上下文（直接调 core）时保持原来的全量口径。
+      const noCaller = await listDispatchedIn(ctx, {}, { ledger })
+      expect(noCaller.lines).toHaveLength(3)
+      // 本调用方一单都没派过 → 空列表，而不是把别人的单子端出来。
+      const stranger = await listDispatchedIn(ctx, {}, { ledger, exec: { agent: { session: { id: 'caller-c' } } } })
+      expect(stranger.lines).toEqual([])
     } finally {
       await rm(dir, { recursive: true, force: true })
     }

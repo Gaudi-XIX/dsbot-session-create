@@ -3,7 +3,7 @@
 //   ① 位置不成立 → 不建会话、显式报错（fail-closed），不继承 ds-bot 的「悄悄换到团队工作区」回落。
 //   ② 派送时把会话 ID 写进台账；事后用同一个 ID 读回该会话的转写（用户 2026-10-26 要求）。
 import { randomUUID } from 'node:crypto'
-import { appendFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 
@@ -849,33 +849,28 @@ export async function readLedger(ledgerPath: string): Promise<DispatchRecord[]> 
   return records
 }
 
-/** 记下「这个会话读到第几号事件了」。返回是否找到了这条记录。 */
+/**
+ * 记下「这个会话读到第几号事件了」。返回是否找到了这条记录。
+ *
+ * **追加式**（2026-11-05 改，多会话并发缺陷）：读台账找出这一单，
+ * 把带上新字段的整条记录追加到文件末尾，不重写整份文件。`readLedger` 按 sessionId 去重、
+ * 以后出现的那条为准，所以追加天然被解析成最新状态；也不再产生临时文件与改名失败留下的孤儿。
+ */
 export async function markRead(ledgerPath: string, sessionId: string, seq: number, at: number = Date.now()): Promise<boolean> {
-  const records = await readLedger(ledgerPath)
-  const at_ = records.findIndex(record => record.sessionId === sessionId)
-  if (at_ < 0) return false
-  records[at_] = { ...records[at_], lastReadSeq: seq, lastReadAt: at }
-  const body = records.map(record => `${JSON.stringify(record)}\n`).join('')
-  // 同目录临时文件 + 改名：避免读到写了一半的台账。
-  const temp = `${ledgerPath}.tmp-${randomUUID()}`
-  await writeFile(temp, body, 'utf8')
-  await rename(temp, ledgerPath)
+  const record = (await readLedger(ledgerPath)).find(item => item.sessionId === sessionId)
+  if (record === undefined) return false
+  await appendDispatch(ledgerPath, { ...record, lastReadSeq: seq, lastReadAt: at })
   return true
 }
 
 /**
- * 记下「这个会话在这一段静默期已经回过执了」（与 markRead 同形：同目录临时文件 + 改名）。
+ * 记下「这个会话在这一段静默期已经回过执了」（与 markRead 同为追加式写入）。
  * 同一实例内的重复投递由内存集合挡住，这一项管的是**跨实例/重启后**的幂等，也是事后可审计的凭据。
  */
 export async function markNotified(ledgerPath: string, sessionId: string, at: number = Date.now()): Promise<boolean> {
-  const records = await readLedger(ledgerPath)
-  const index = records.findIndex(record => record.sessionId === sessionId)
-  if (index < 0) return false
-  records[index] = { ...records[index], notifiedAt: at }
-  const body = records.map(record => `${JSON.stringify(record)}\n`).join('')
-  const temp = `${ledgerPath}.tmp-${randomUUID()}`
-  await writeFile(temp, body, 'utf8')
-  await rename(temp, ledgerPath)
+  const record = (await readLedger(ledgerPath)).find(item => item.sessionId === sessionId)
+  if (record === undefined) return false
+  await appendDispatch(ledgerPath, { ...record, notifiedAt: at })
   return true
 }
 
@@ -977,7 +972,11 @@ export type Transcript = RenderedTranscript & {
   ledgerError?: string
 }
 
-/** 按会话 ID 取回转写；不给 ID 就取台账里最后一条派送的会话。 */
+/**
+ * 按会话 ID 取回转写。**ID 必填**（2026-11-05 改）：
+ * 允许缺省时它会去读台账最后一条派送，多会话并发下读到的是别人刚派的那一单（跨会话串台），
+ * 所以缺省不再兜底、直接拒绝。
+ */
 export async function readSessionIn(
   ctx: HostCtx,
   args: ReadArgs = {},
@@ -989,26 +988,18 @@ export async function readSessionIn(
   }
 
   const ledgerPath = opts.ledger ?? defaultLedgerPath()
-  const wanted = (args.sessionId ?? '').trim()
-  let fromLedger: DispatchRecord | undefined
-  let sessionId = wanted
-  let ledgerError: string | undefined
+  const sessionId = (args.sessionId ?? '').trim()
   if (sessionId === '') {
-    // 不给 ID 就只能靠台账定位会话——台账读不出来必须当场报错（ledger-unreadable），不去猜一个。
-    const records = await readLedger(ledgerPath)
-    fromLedger = records.at(-1)
-    if (fromLedger === undefined) {
-      throw new SessionCreateError('no-session', `give a session id: the dispatch ledger ${ledgerPath} has no entry yet.`)
-    }
-    sessionId = fromLedger.sessionId
-  } else {
-    // 给了 ID 时，台账只是附加信息（标题 / 落位 / 派送时刻）：它读不出来不该挡住读会话本身，
-    // 但也**不许静默**——如实记下原因，随结果一起带出去（Truth-Guard 闸门二退回 2）。
-    try {
-      fromLedger = (await readLedger(ledgerPath)).find(record => record.sessionId === sessionId)
-    } catch (error) {
-      ledgerError = reasonOf(error)
-    }
+    throw new SessionCreateError('no-session', 'give a session id: sessionId is required and cannot be omitted.')
+  }
+  let fromLedger: DispatchRecord | undefined
+  let ledgerError: string | undefined
+  // 台账只是附加信息（标题 / 落位 / 派送时刻）：它读不出来不该挡住读会话本身，
+  // 但也**不许静默**——如实记下原因，随结果一起带出去（Truth-Guard 闸门二退回 2）。
+  try {
+    fromLedger = (await readLedger(ledgerPath)).find(record => record.sessionId === sessionId)
+  } catch (error) {
+    ledgerError = reasonOf(error)
   }
 
   const controller = ctx.sessionController as NonNullable<HostCtx['sessionController']>
@@ -1205,15 +1196,25 @@ export type DispatchLine = {
   error?: string
 }
 
-/** 台账 + 每一条此刻的状态：哪几条跑完了、哪几条有新内容。最新的排最前。 */
+/**
+ * 台账 + 每一条此刻的状态：哪几条跑完了、哪几条有新内容。最新的排最前。
+ *
+ * **默认按调用方隔离**（2026-11-05 改，多会话并发缺陷）：
+ * 传了 `exec` 且没传 `all: true` 时，只列当前调用方自己派出去的单子；
+ * 没有调用方上下文（直接调 core）或显式 `all: true` 时才列全量（管理审计用）。
+ */
 export async function listDispatchedIn(
   ctx: HostCtx,
-  args: { limit?: number } = {},
-  opts: { ledger?: string; signal?: AbortSignal; timeoutMs?: number } = {},
+  args: { limit?: number; all?: boolean } = {},
+  opts: { ledger?: string; signal?: AbortSignal; timeoutMs?: number; exec?: unknown } = {},
 ): Promise<{ ledgerPath: string; lines: DispatchLine[] }> {
   const ledgerPath = opts.ledger ?? defaultLedgerPath()
   const limit = clamp(args.limit ?? 5, 1, 20)
-  const records = (await readLedger(ledgerPath)).slice(-limit).reverse()
+  const caller = args.all === true ? undefined : dispatcherSessionOf(opts.exec)
+  const records = (await readLedger(ledgerPath))
+    .filter(record => caller === undefined || record.dispatcherSessionId === caller)
+    .slice(-limit)
+    .reverse()
   const lines: DispatchLine[] = []
   for (const record of records) {
     try {
