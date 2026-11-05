@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test'
 import { mkdir, readdir, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import {
-  CONCLUSION_CLIP,
+  CONCLUSION_LINE_CLIP,
   QUIET_WINDOW_MS,
   TERMINAL_MARKS,
   appendDispatch,
@@ -14,6 +14,7 @@ import {
   readLedger,
   receiptText,
   suggestDeadlineSeconds,
+  terminalMarkOf,
   type DispatchRecord,
   type HostCtx,
 } from '../src/core'
@@ -196,7 +197,7 @@ afterAll(async () => {
 })
 
 describe('完成回执：投递通道与正文', () => {
-  test('安静到点后，用 controller.prompt(queue) 把回执投给派活方：首行认单，第二段就是结论', async () => {
+  test('安静到点后，用 controller.prompt(queue) 把回执投给派活方：首行认单，第二段只有一行结论加指针（不再塞全文）', async () => {
     const h = harness('delivers')
     await seed(h.ledgerPath)
     await h.notifier.onEvent({ id: 'sess-1' }, { type: 'turn/start', data: { turn: 1 } })
@@ -221,9 +222,11 @@ describe('完成回执：投递通道与正文', () => {
     expect(lines[0].startsWith('[Dispatch receipt · 投标跟进] [DISPATCH DONE] · session sess-1 · ended ')).toBe(true)
     expect(lines[0]).toContain('turn 1')
     expect(lines[0]).toContain('reason: completed')
-    expect(text).toContain('[DISPATCH DONE]')
-    // 第二段起是被派会话最终答复的原文：派活人拿到回执就有结论，不必读盘、不必调工具。
-    expect(lines[1]).toBe('改完了，结论是 A。')
+    // 第二段只有一行：结论取最终答复的第一个有内容的行，再接上取全文的指针。
+    // 为什么不再带全文：每次派单最多往派活人上下文里塞 2000 字符，省不下来；结论一行足够判断。
+    expect(lines).toHaveLength(2)
+    expect(lines[1]).toBe('改完了，结论是 A。 · session sess-1 · read_session_transcript 取全文')
+    expect(lines[1]).not.toContain('先想一下')
     // 复核顺序：先向宿主核目标会话是否真的空闲，再核派活方还在不在。
     expect(h.resolvedIds).toEqual(['sess-1', 'chief-1'])
     // 静默期结束、台账留痕。
@@ -231,38 +234,49 @@ describe('完成回执：投递通道与正文', () => {
     expect(typeof (await readLedger(h.ledgerPath))[0].notifiedAt).toBe('number')
   })
 
-  test('回执正文：首行是标题与终态标记；给了结论就换行接上原文', () => {
+  test('回执正文：首行是标题与终态标记；第二段只留一行结论加指针，不塞全文（省 token 是改动目的）', () => {
     const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, '[NEEDS USER]', 3, 'completed')
-    expect(text).not.toContain('\n')
     expect(text.startsWith('[Dispatch receipt · 投标跟进] [NEEDS USER] · session sess-9 · ended ')).toBe(true)
     expect(text).toContain('turn 3')
     expect(text).toContain('reason: completed')
     expect(text).toContain('2026-')
-    // 结论缺省（或只有空白）时不写第二段，回执仍只有那行头。
-    expect(receiptText({ title: '投标跟进' }, 'sess-9', 0, '[DISPATCH DONE]', 1, 'completed', '   ')).not.toContain('\n')
+    // 硬约束：第二段不许退化回「只有首行」。结论缺省（或只有空白）时退回标记本身 + 指针。
+    const blank = receiptText({ title: '投标跟进' }, 'sess-9', 0, '[DISPATCH DONE]', 1, 'completed', '   ')
+    expect(blank.split('\n')).toHaveLength(2)
+    expect(blank.split('\n')[1]).toBe('[DISPATCH DONE] · session sess-9 · read_session_transcript 取全文')
     // 标题与轮次缺失时也要能写出话，不许出现 undefined。
     const bare = receiptText({}, 'sess-9', 0, '[DISPATCH DONE]')
     expect(bare.startsWith('[Dispatch receipt · (untitled)] [DISPATCH DONE]')).toBe(true)
     expect(bare).toContain('turn ?')
     expect(bare).not.toContain('undefined')
-    // 给了结论：第二行起原样接上，中间不插任何包装行，也不做任何改写。
-    const withBody = receiptText({ title: '投标跟进' }, 'sess-9', 0, '[DISPATCH DONE]', 1, 'completed', '改完了，结论是 A。\n[DISPATCH DONE]')
-    expect(withBody.split('\n')).toHaveLength(3)
-    expect(withBody.split('\n')[1]).toBe('改完了，结论是 A。')
-    expect(withBody.split('\n')[2]).toBe('[DISPATCH DONE]')
+    // 结论行取第一个有内容的行，并去掉行首 markdown 标记与多余空白；正文其余部分不进回执。
+    const withBody = receiptText(
+      { title: '投标跟进' },
+      'sess-9',
+      0,
+      '[DISPATCH DONE]',
+      1,
+      'completed',
+      '# 结论：全绿\n- 明细见报告\n[DISPATCH DONE]',
+    )
+    expect(withBody.split('\n')).toHaveLength(2)
+    expect(withBody.split('\n')[1]).toBe('结论：全绿 · session sess-9 · read_session_transcript 取全文')
   })
 
-  test('结论超过上限：只截第二段并写明原本多少字符，首行（终态标记所在）不受影响', () => {
+  test('结论行超过 200 字符：只截这一行并加省略号，首行与指针不受影响（不再搬 2000 字符全文）', () => {
     const long = `${'情况说明。'.repeat(600)}\n[DISPATCH DONE]`
-    expect(long.length).toBeGreaterThan(CONCLUSION_CLIP)
+    expect(long.length).toBeGreaterThan(CONCLUSION_LINE_CLIP)
     const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, '[DISPATCH DONE]', 2, 'completed', long)
     const parts = text.split('\n')
-    expect(parts).toHaveLength(3)
+    expect(parts).toHaveLength(2)
     expect(parts[0]).toContain('[DISPATCH DONE]')
     expect(parts[0]).not.toContain('情况说明。')
-    expect(parts[1]).toHaveLength(CONCLUSION_CLIP)
-    expect(parts[1]).toBe(long.slice(0, CONCLUSION_CLIP))
-    expect(parts[2]).toBe(`[conclusion cut; ${long.length} characters in all]`)
+    const [line] = parts[1].split(' · session ')
+    expect(line).toHaveLength(CONCLUSION_LINE_CLIP)
+    expect(line.endsWith('…')).toBe(true)
+    expect(parts[1]).toContain('· session sess-9 · read_session_transcript 取全文')
+    // 旧的 `[conclusion cut; N characters in all]` 提示随全文搬运一起删除。
+    expect(text).not.toContain('conclusion cut')
   })
 })
 
@@ -372,6 +386,25 @@ describe('完成回执：门三，自己派的活还没停就不算做完', () =
 })
 
 describe('完成回执：门四，只认派活方写在最终答复里的终态标记', () => {
+  test('终态标记只认正文末尾：正文中间引用 [DISPATCH DONE] 不算（session-126369fb 那种误判）', () => {
+    expect(terminalMarkOf('报告里写了一句「末行恰一个 [DISPATCH DONE]」，但这一条正文并没有以标记结尾。')).toBeUndefined()
+  })
+
+  test('终态标记只认正文末尾：最后一个非空行就是标记 → 命中，允许行尾少量标点', () => {
+    expect(terminalMarkOf('改完了。\n[DISPATCH DONE]')).toBe('[DISPATCH DONE]')
+    expect(terminalMarkOf('改完了。\n[NEEDS USER]。')).toBe('[NEEDS USER]')
+    expect(terminalMarkOf('改完了。\n[DISPATCH BLOCKED]\n')).toBe('[DISPATCH BLOCKED]')
+  })
+
+  test('终态标记只认正文末尾：末行标记前后带空白（含空行）→ 仍命中', () => {
+    expect(terminalMarkOf('  改完了。 \n\n  [NEEDS USER]  \n\n')).toBe('[NEEDS USER]')
+    expect(terminalMarkOf('\t[DISPATCH DONE]\t')).toBe('[DISPATCH DONE]')
+  })
+
+  test('终态标记只认正文末尾：末行标记后面还跟着别的文字 → 不算', () => {
+    expect(terminalMarkOf('改完了。\n[DISPATCH DONE] 但还没推送')).toBeUndefined()
+  })
+
   for (const mark of TERMINAL_MARKS) {
     test(`末条 assistant 文本里有 ${mark} → 照投，且正文里带这个标记`, async () => {
       const h = harness(`mark-${mark.replace(/[[\]]/g, '')}`, { lastText: `这一单到这里。\n${mark}` })
@@ -386,7 +419,7 @@ describe('完成回执：门四，只认派活方写在最终答复里的终态�
     })
   }
 
-  test('末条文本逐字列举三个标记、末行才是结论 → 取文本里最后出现的那个，不是声明序最后那个', async () => {
+  test('末条文本逐字列举三个标记、末行才是结论 → 只认末行的 [DISPATCH DONE]，正文里提到的其它标记不参与', async () => {
     const h = harness('mark-multi-done', {
       lastText: '三个标记 [DISPATCH DONE]／[NEEDS USER]／[DISPATCH BLOCKED] 都实现了。\n结论：全绿。\n[DISPATCH DONE]',
     })
@@ -395,10 +428,20 @@ describe('完成回执：门四，只认派活方写在最终答复里的终态�
     await fire(h.timers[0])
     expect(h.prompts).toHaveLength(1)
     const text = (h.prompts[0].content as { type: string; text: string }[])[0].text
-    // 声明序实现（遍历 TERMINAL_MARKS 取最后命中）会返回数组末尾的 [DISPATCH BLOCKED]，这两条断言就是那条差异。
-    // 只看首行：第二段是被派会话答复的原文，里面本来就可能逐字提到别的标记。
+    // 末行是 [DISPATCH DONE]；首行认单只带这一个标记。
     expect(text.split('\n')[0]).toContain('[DISPATCH DONE]')
     expect(text.split('\n')[0]).not.toContain('[DISPATCH BLOCKED]')
+  })
+
+  test('末条正文只是引用了一句标记（没有以标记结尾）→ 不投，出声「no terminal mark」', async () => {
+    const h = harness('quoted-mark', {
+      lastText: '报告里写了一句「末行恰一个 [DISPATCH DONE]」，但这一条正文并没有以标记结尾。',
+    })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 2)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('no terminal mark'))).toBe(true)
   })
 
   test('末行写 [DISPATCH BLOCKED] → 回执文本带 [DISPATCH BLOCKED]', async () => {
@@ -434,11 +477,13 @@ describe('完成回执：门四，只认派活方写在最终答复里的终态�
     // clipText（MESSAGE_CLIP = 2000）会把末尾截掉；门四读的是原始事件，所以仍看得到标记。
     expect(h.prompts).toHaveLength(1)
     const text = (h.prompts[0].content as { text: string }[])[0].text
-    // 截断只切第二段：终态标记在首行，回执认单不受影响。
+    // 首行认单不受影响；第二段只带结论行（截到 200 字符）+ 指针，不再搬 2000 字符全文。
     const parts = text.split('\n')
+    expect(parts).toHaveLength(2)
     expect(parts[0]).toContain('[DISPATCH DONE]')
-    expect(text).toContain('conclusion cut;')
-    expect(text).toContain(`${longText.length} characters in all`)
+    expect(parts[1].startsWith(`${'情况说明。'.repeat(40).slice(0, CONCLUSION_LINE_CLIP - 1)}…`)).toBe(true)
+    expect(parts[1]).toContain('· session sess-1 · read_session_transcript 取全文')
+    expect(text).not.toContain('conclusion cut')
   })
 
   test('page 不在宿主服务面 → 不投、出声', async () => {

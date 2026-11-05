@@ -17,7 +17,7 @@ var HISTORY_TIMEOUT_MS = 20000;
 var SESSION_OPTION_TIMEOUT_MS = 1e4;
 var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
-var CONCLUSION_CLIP = MESSAGE_CLIP;
+var CONCLUSION_LINE_CLIP = 200;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
 function pickService(ctx, name) {
@@ -713,17 +713,27 @@ var COMPLETED_REASON = "completed";
 var NOTIFY_TIMEOUT_MS = 1e4;
 var TERMINAL_MARKS = ["[DISPATCH DONE]", "[NEEDS USER]", "[DISPATCH BLOCKED]"];
 var LAST_MESSAGE_PAGE = 8;
+var TERMINAL_TRAILING_PUNCT = ".。!！?？,，;；:：";
 function terminalMarkOf(text) {
-  let found;
-  let at = -1;
-  for (const mark of TERMINAL_MARKS) {
-    const index = text.lastIndexOf(mark);
-    if (index > at) {
-      at = index;
-      found = mark;
+  const lines = text.split(/\r?\n/);
+  let last = "";
+  for (let index = lines.length - 1;index >= 0; index -= 1) {
+    const line = lines[index].trim();
+    if (line !== "") {
+      last = line;
+      break;
     }
   }
-  return found;
+  if (last === "")
+    return;
+  for (const mark of TERMINAL_MARKS) {
+    if (!last.startsWith(mark))
+      continue;
+    const rest = last.slice(mark.length).trim();
+    if (rest === "" || [...rest].every((char) => TERMINAL_TRAILING_PUNCT.includes(char)))
+      return mark;
+  }
+  return;
 }
 function deadlineSamples(records) {
   const minutes = [];
@@ -754,18 +764,27 @@ function receiptText(record, sessionId, endTime, mark, turn, reason, conclusion)
   const title = typeof record?.title === "string" && record.title !== "" ? record.title : "(untitled)";
   const last = `turn ${turn === undefined ? "?" : turn}${reason === undefined ? "" : `, reason: ${reason}`}`;
   const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`;
-  const body = conclusionBody(conclusion);
-  return body === "" ? head : `${head}
-${body}`;
+  return `${head}
+${conclusionLine(conclusion, sessionId, mark)}`;
 }
-function conclusionBody(conclusion) {
-  const text = conclusion ?? "";
-  if (text.trim() === "")
-    return "";
-  if (text.length <= CONCLUSION_CLIP)
-    return text;
-  return `${text.slice(0, CONCLUSION_CLIP)}
-[conclusion cut; ${text.length} characters in all]`;
+function conclusionLine(conclusion, sessionId, mark) {
+  const line = firstContentLine(conclusion);
+  const text = line === "" ? mark : clipConclusionLine(line);
+  return `${text} · session ${sessionId} · read_session_transcript 取全文`;
+}
+function firstContentLine(conclusion) {
+  for (const raw of (conclusion ?? "").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === "" || line.startsWith("```"))
+      continue;
+    const stripped = line.replace(/^[\s\u3000#>*+\-|]+/, "").trim();
+    if (stripped !== "")
+      return stripped;
+  }
+  return "";
+}
+function clipConclusionLine(line) {
+  return line.length <= CONCLUSION_LINE_CLIP ? line : `${line.slice(0, CONCLUSION_LINE_CLIP - 1)}…`;
 }
 function createDispatchNotifier(deps = {}) {
   const ledgerPath = deps.ledger ?? defaultLedgerPath();

@@ -16,10 +16,10 @@ export const SESSION_OPTION_TIMEOUT_MS = 10_000
 export const MESSAGE_TIMEOUT_MS = 10_000
 // 单条消息在工具输出里的上限：够看清结论，又不至于把一整篇文档灌进上下文。
 export const MESSAGE_CLIP = 2_000
-// 回执里带的结论正文上限。与 MESSAGE_CLIP 同值是**推导**，不是顺手复用：renderTranscript 对
-// 每条消息都按 MESSAGE_CLIP 截，所以回执带满这么多字符时，派活人已经拿到了任何工具调用能取回
-// 这条消息的全部内容，不必再调工具。样本依据见 CHANGELOG 0.8.0（三支真实会话 1543/1854/1961 字符）。
-export const CONCLUSION_CLIP = MESSAGE_CLIP
+// 回执第二段那行结论的上限（字符）。2026-11-06 用户定的口径：回执改「传指针」——第二段只带
+// 一行结论，全文让派活人用 read_session_transcript 自取。200 是「够看清结论、又不往派活人
+// 上下文里塞整篇」的折中；它不是从 MESSAGE_CLIP 推出来的，二者不再同源。
+export const CONCLUSION_LINE_CLIP = 200
 // 一次最多取多少条消息（宿主 page 的 maxMessages）。
 export const MESSAGES_MAX = 200
 export const MESSAGES_DEFAULT = 40
@@ -1297,23 +1297,39 @@ export const TERMINAL_MARKS = ['[DISPATCH DONE]', '[NEEDS USER]', '[DISPATCH BLO
 /** 门四读末条 assistant 文本时向宿主要多少条事件：尾巴上几条足够，不要整篇转写。 */
 const LAST_MESSAGE_PAGE = 8
 
+/** 终态标记行允许的**行尾**标点：标记之后只允许空白与这些标点，出现别的文字就不算。 */
+const TERMINAL_TRAILING_PUNCT = '.。!！?？,，;；:：'
+
 /**
- * 这段文本里出现的终态标记：对每个标记取它在文本里**最后一次出现**的位置（`text.lastIndexOf`），
- * 返回位置最靠后的那个（并列时保持 `TERMINAL_MARKS` 的声明序，取先声明者）；一个都没有 ⇒
- * `undefined`。纯函数，判定输入是该会话最后一条 assistant/message 的 text 块拼接串，
- * 不看整篇转写、不做 trim 之外的归一化。
+ * 这段文本**末尾**的终态标记：只认正文末尾，不做全篇子串扫描。
+ *
+ * 判据（逐条照做，别放宽）：
+ *   1. 按行切（`\r?\n`），从后往前找**最后一个非空行**（每行先 trim）；没有非空行 ⇒ `undefined`。
+ *   2. 这一行必须以某个标记开头，且标记之后的剩余部分（trim 后）要么为空、要么只由行尾标点
+ *      `.。!！?？,，;；:：` 组成，才算命中。
+ *   3. 一行同时命中多个标记时按 `TERMINAL_MARKS` 的声明序取先声明者。
+ *   4. 其余一律不算：标记出现在正文中间、只是被引文提到、标记前面还有别的文字、标记后面还跟着
+ *      别的文字，都不算。实测样本 `session-126369fb-7b6e-47f5-a75b-fa607bc16578` 的末条正文只是
+ *      引用了一句「末行恰一个 [DISPATCH DONE]」，旧的全篇子串扫描据此误判成已结束——这一条就是修它。
+ * 纯函数；判定输入是该会话最后一条 assistant/message 的 text 块拼接串，不看整篇转写。
  */
 export function terminalMarkOf(text: string): string | undefined {
-  let found: string | undefined
-  let at = -1
-  for (const mark of TERMINAL_MARKS) {
-    const index = text.lastIndexOf(mark)
-    if (index > at) {
-      at = index
-      found = mark
+  const lines = text.split(/\r?\n/)
+  let last = ''
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index].trim()
+    if (line !== '') {
+      last = line
+      break
     }
   }
-  return found
+  if (last === '') return undefined
+  for (const mark of TERMINAL_MARKS) {
+    if (!last.startsWith(mark)) continue
+    const rest = last.slice(mark.length).trim()
+    if (rest === '' || [...rest].every(char => TERMINAL_TRAILING_PUNCT.includes(char))) return mark
+  }
+  return undefined
 }
 
 /** 台账里「既有 dispatchedAt 又有 notifiedAt」的有效样本，派活时长（分钟），按台账顺序。 */
@@ -1384,27 +1400,44 @@ export function dispatcherSessionOf(exec: unknown): string | undefined {
 }
 
 /**
- * 回执正文。**首行**是标题 + 终态标记，派活人一眼认出这是哪一单、要不要理；拿得到被派会话的
- * 最终答复时，**换行接上这段结论原文**，派活人不必读盘、不必调工具就有内容可复述。
- * 首行永远原样输出、不参与截断——终态标记就在首行，所以任何截断都切不掉它。
+ * 回执正文。**首行**是标题 + 终态标记，派活人一眼认出这是哪一单、要不要理；**第二段**只有
+ * 一行结论 + 一个指针：结论取自被派会话最终答复里第一个有内容的行（最多
+ * `CONCLUSION_LINE_CLIP` 字符），全文由派活人沿指针用 `read_session_transcript` 自取。
+ * 第二段不会退化成空——取不到结论行时至少给出标记本身，派活人永远看得到这一单的结果。
+ * 首行永远原样输出、不参与截断：终态标记就在首行，所以任何截断都切不掉它。
  */
 export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, mark: string, turn?: number, reason?: string, conclusion?: string): string {
   const title = typeof record?.title === 'string' && record.title !== '' ? record.title : '(untitled)'
   const last = `turn ${turn === undefined ? '?' : turn}${reason === undefined ? '' : `, reason: ${reason}`}`
   const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`
-  const body = conclusionBody(conclusion)
-  return body === '' ? head : `${head}\n${body}`
+  return `${head}\n${conclusionLine(conclusion, sessionId, mark)}`
 }
 
 /**
- * 回执第二段：被派会话的最终答复原文。超长只截正文，并写明原本多少字符——截掉的部分在盘上的
- * 会话记录里，但 `read_session_transcript` 同样按 `MESSAGE_CLIP` 截每条消息，工具取不回全篇。
+ * 回执第二段：一行结论 + 指针。结论行 = 最终答复里第一个有内容的行，去掉行首 markdown 标记与
+ * 多余空白，超过 `CONCLUSION_LINE_CLIP` 就截断；结论缺失（直接调用、没有文本）时退回标记本身，
+ * 保证第二段永远有一行可读的内容。全文不塞进回执：派活人按同一行末尾的指针自取。
  */
-function conclusionBody(conclusion: string | undefined): string {
-  const text = conclusion ?? ''
-  if (text.trim() === '') return ''
-  if (text.length <= CONCLUSION_CLIP) return text
-  return `${text.slice(0, CONCLUSION_CLIP)}\n[conclusion cut; ${text.length} characters in all]`
+function conclusionLine(conclusion: string | undefined, sessionId: string, mark: string): string {
+  const line = firstContentLine(conclusion)
+  const text = line === '' ? mark : clipConclusionLine(line)
+  return `${text} · session ${sessionId} · read_session_transcript 取全文`
+}
+
+/** 取第一个有内容的行：跳过空行与纯代码围栏，去掉行首 markdown 标记（`#`、`-`、`>`、`|` 等）与空白。 */
+function firstContentLine(conclusion: string | undefined): string {
+  for (const raw of (conclusion ?? '').split(/\r?\n/)) {
+    const line = raw.trim()
+    if (line === '' || line.startsWith('```')) continue
+    const stripped = line.replace(/^[\s\u3000#>*+\-|]+/, '').trim()
+    if (stripped !== '') return stripped
+  }
+  return ''
+}
+
+/** 截到 `CONCLUSION_LINE_CLIP` 以内；被截掉时用省略号收口，保证不超上限。 */
+function clipConclusionLine(line: string): string {
+  return line.length <= CONCLUSION_LINE_CLIP ? line : `${line.slice(0, CONCLUSION_LINE_CLIP - 1)}…`
 }
 
 export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifier {
@@ -1533,11 +1566,12 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`)
       return
     }
-    // 门四（终态标记）：这一轮收工到底算不算「这一单做完」，最懂的是派活方 —— 只有它在最终答复里
-    // 写了终态标记才算。判定输入是该会话**最后一条** assistant 文本（不是整篇转写，且不过 clipText）；
-    // 读不到或没有标记一律不投：宁可漏一条，也不投一条假回执。
-    // 同一段文本接着当回执正文带上（见 receiptText）：投出去的是「哪一单」+「结论是什么」，
-    // 派活人不需要读盘或调工具。正文截断只切第二段，标记所在的头一行原样保留。
+    // 门四（终态标记）：这一轮收工到底算不算「这一单做完」，最懂的是派活方 —— 只有它在最终答复
+    // 的**末尾**写了终态标记才算（判定见 terminalMarkOf：只看最后一个非空行）。判定输入是该会话
+    // **最后一条** assistant 文本（不是整篇转写，且不过 clipText）；读不到或末尾没有标记一律不投：
+    // 宁可漏一条，也不投一条假回执。
+    // 同一段文本接着当回执的结论来源（见 receiptText 与 conclusionLine）：回执只带「哪一单」+
+    // 一行结论 + 指针，全文不塞进派活人的上下文，由它按指针自取。
     const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
     if ('error' in lastText) {
       log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`)
