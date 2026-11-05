@@ -17,6 +17,7 @@ var HISTORY_TIMEOUT_MS = 20000;
 var SESSION_OPTION_TIMEOUT_MS = 1e4;
 var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
+var CONCLUSION_CLIP = MESSAGE_CLIP;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
 function pickService(ctx, name) {
@@ -749,10 +750,22 @@ function dispatcherSessionOf(exec) {
   const id = exec?.agent?.session?.id;
   return typeof id === "string" && id !== "" ? id : undefined;
 }
-function receiptText(record, sessionId, endTime, mark, turn, reason) {
+function receiptText(record, sessionId, endTime, mark, turn, reason, conclusion) {
   const title = typeof record?.title === "string" && record.title !== "" ? record.title : "(untitled)";
   const last = `turn ${turn === undefined ? "?" : turn}${reason === undefined ? "" : `, reason: ${reason}`}`;
-  return `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`;
+  const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`;
+  const body = conclusionBody(conclusion);
+  return body === "" ? head : `${head}
+${body}`;
+}
+function conclusionBody(conclusion) {
+  const text = conclusion ?? "";
+  if (text.trim() === "")
+    return "";
+  if (text.length <= CONCLUSION_CLIP)
+    return text;
+  return `${text.slice(0, CONCLUSION_CLIP)}
+[conclusion cut; ${text.length} characters in all]`;
 }
 function createDispatchNotifier(deps = {}) {
   const ledgerPath = deps.ledger ?? defaultLedgerPath();
@@ -877,7 +890,7 @@ function createDispatchNotifier(deps = {}) {
         requestId: randomUUID(),
         sessionId: dispatcher,
         mode: "queue",
-        content: [{ type: "text", text: receiptText(record, sessionId, endTime, mark, turn, reason) }]
+        content: [{ type: "text", text: receiptText(record, sessionId, endTime, mark, turn, reason, lastText.text) }]
       }, AbortSignal.timeout(NOTIFY_TIMEOUT_MS));
     } catch (error) {
       log(`the receipt for ${sessionId} did not go through (${reasonOf(error)}); the next turn to end will try again.`);

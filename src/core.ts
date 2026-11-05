@@ -16,6 +16,10 @@ export const SESSION_OPTION_TIMEOUT_MS = 10_000
 export const MESSAGE_TIMEOUT_MS = 10_000
 // 单条消息在工具输出里的上限：够看清结论，又不至于把一整篇文档灌进上下文。
 export const MESSAGE_CLIP = 2_000
+// 回执里带的结论正文上限。与 MESSAGE_CLIP 同值是**推导**，不是顺手复用：renderTranscript 对
+// 每条消息都按 MESSAGE_CLIP 截，所以回执带满这么多字符时，派活人已经拿到了任何工具调用能取回
+// 这条消息的全部内容，不必再调工具。样本依据见 CHANGELOG 0.8.0（三支真实会话 1543/1854/1961 字符）。
+export const CONCLUSION_CLIP = MESSAGE_CLIP
 // 一次最多取多少条消息（宿主 page 的 maxMessages）。
 export const MESSAGES_MAX = 200
 export const MESSAGES_DEFAULT = 40
@@ -1380,13 +1384,27 @@ export function dispatcherSessionOf(exec: unknown): string | undefined {
 }
 
 /**
- * 回执正文：**只有一行**（不含换行符）。标题 + 终态标记让派活人一眼认出这是哪一单、要不要理；
- * 细节不带摘要——要看细节用 read_session_transcript 自取。
+ * 回执正文。**首行**是标题 + 终态标记，派活人一眼认出这是哪一单、要不要理；拿得到被派会话的
+ * 最终答复时，**换行接上这段结论原文**，派活人不必读盘、不必调工具就有内容可复述。
+ * 首行永远原样输出、不参与截断——终态标记就在首行，所以任何截断都切不掉它。
  */
-export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, mark: string, turn?: number, reason?: string): string {
+export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, mark: string, turn?: number, reason?: string, conclusion?: string): string {
   const title = typeof record?.title === 'string' && record.title !== '' ? record.title : '(untitled)'
   const last = `turn ${turn === undefined ? '?' : turn}${reason === undefined ? '' : `, reason: ${reason}`}`
-  return `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`
+  const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`
+  const body = conclusionBody(conclusion)
+  return body === '' ? head : `${head}\n${body}`
+}
+
+/**
+ * 回执第二段：被派会话的最终答复原文。超长只截正文，并写明原本多少字符——截掉的部分在盘上的
+ * 会话记录里，但 `read_session_transcript` 同样按 `MESSAGE_CLIP` 截每条消息，工具取不回全篇。
+ */
+function conclusionBody(conclusion: string | undefined): string {
+  const text = conclusion ?? ''
+  if (text.trim() === '') return ''
+  if (text.length <= CONCLUSION_CLIP) return text
+  return `${text.slice(0, CONCLUSION_CLIP)}\n[conclusion cut; ${text.length} characters in all]`
 }
 
 export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifier {
@@ -1518,6 +1536,8 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     // 门四（终态标记）：这一轮收工到底算不算「这一单做完」，最懂的是派活方 —— 只有它在最终答复里
     // 写了终态标记才算。判定输入是该会话**最后一条** assistant 文本（不是整篇转写，且不过 clipText）；
     // 读不到或没有标记一律不投：宁可漏一条，也不投一条假回执。
+    // 同一段文本接着当回执正文带上（见 receiptText）：投出去的是「哪一单」+「结论是什么」，
+    // 派活人不需要读盘或调工具。正文截断只切第二段，标记所在的头一行原样保留。
     const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
     if ('error' in lastText) {
       log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`)
@@ -1540,7 +1560,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
           requestId: randomUUID(),
           sessionId: dispatcher,
           mode: 'queue', // 回执是给派活人的旁路通报：排到下一轮，不去打断他手头正在跑的那一轮
-          content: [{ type: 'text', text: receiptText(record, sessionId, endTime, mark, turn, reason) }],
+          content: [{ type: 'text', text: receiptText(record, sessionId, endTime, mark, turn, reason, lastText.text) }],
         },
         AbortSignal.timeout(NOTIFY_TIMEOUT_MS),
       )

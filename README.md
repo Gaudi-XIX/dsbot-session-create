@@ -143,13 +143,18 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 判定只读**该会话最后一条 `assistant` 消息的正文**，不看整篇 transcript；大小写敏感，全角括号或错拼一律不算标记。
 
-回执正文只有一行（不含换行符），末尾不再带「去读 transcript / 无需回复」那类句子——要细节就用 `read_session_transcript` 自取：
+回执正文分两段：首行说清「哪一单」，第二段起直接接上被派会话最终答复的原文——派活人拿到回执就有结论，不必读盘、不必再调工具：
 
 ```
 [Dispatch receipt · <title>] <mark> · session <sessionId> · ended <stamp> (turn N, reason: X)
+<被派会话最终答复原文>
 ```
 
-`<title>` 是派单时给的标题，`<mark>` 是命中的那个标记，`<stamp>` 是这一轮结束的时刻，括号里仍是 `turn N, reason: X`。
+`<title>` 是派单时给的标题，`<mark>` 是命中的那个标记，`<stamp>` 是这一轮结束的时刻，括号里仍是 `turn N, reason: X`。首行**永远原样、不参与截断**：终态标记就在首行，所以第二段再长也切不掉它。
+
+第二段就是判定用的那一条文本（同样不过 `clipText`），上限 `CONCLUSION_CLIP`（与 `MESSAGE_CLIP` 同值，2000 字符）。取这个值不是顺手复用：`read_session_transcript` 对每条消息也按 `MESSAGE_CLIP` 截，所以带满 2000 字符就已经覆盖了任何工具调用能取回这条消息的上限。超长时只截第二段，并补一行 `[conclusion cut; N characters in all]`，`N` 是原本的字符数；实测三支真实审查会话的最终答复为 1543 / 1854 / 1961 字符，都不触发截断。结论为空或缺省时，回执就只有那行首行。
+
+**投递面没变**：回执仍只投给台账里的 `dispatcherSessionId`（派遣者）那一侧。插件够不着派遣者的上游——它只拿得到调用方会话 id，而「这一回合的答复自动回流给发消息的 Bot」是宿主对 `[Message from …]` 类回合的行为。结论送到派遣者之后怎么转给最初的请求方，由宿主的回合路由决定，不在本插件内。
 
 - **只认正常收尾**：`aborted`（关停/叫停）、`interrupted`（重启掐断）、`error`、`blocked`、`max-tokens`，以及认不出来的取值，一律不进静默窗口、一个回执都不发（`COMPLETED_REASON`，门一）。取值来自 2026-11-03 全扫本机 `<DSH_HOME>/data/sessions/**`（当日 1,740 份文件、7,851 条 `turn/end`）的统计：`completed` 6,914 / `aborted` 464 / `error` 171 / `blocked` 153 / `interrupted` 121 / `max-tokens` 29。
 - **还在等自己派的活就不算收口**：台账里 `dispatcherSessionId` 指向它、宿主又报着没停的子会话，说明它是在等它们（`firstBusyChild`，门三）。等的时候不投；子会话停下、它被叫醒再跑一轮、这一轮没有在跑的子会话，才投。
