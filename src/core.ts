@@ -1137,8 +1137,9 @@ export async function messageSessionIn(
   let title: string | undefined
   let placement: string | undefined
   let ledgerError: string | undefined
+  let record: DispatchRecord | undefined
   try {
-    const record = (await readLedger(ledgerPath)).find(entry => entry.sessionId === sessionId)
+    record = (await readLedger(ledgerPath)).find(entry => entry.sessionId === sessionId)
     title = record?.title
     placement = record?.placement
   } catch (error) {
@@ -1150,19 +1151,30 @@ export async function messageSessionIn(
     throw new SessionCreateError('session-unknown', `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ''}; nothing was sent.`)
   }
 
-  // 派任务是「新会话」，补话只服务「还在跑的那一轮」。
-  // 目标会话的 turn 已经结束（宿主直给 idle）时，再往这条历史里投一件新活就是复用：
-  // 不同轮次的活会一层层堆在同一条会话上。2026-11-01 那单正是这么堆的——同一条会话被补了
-  // 16 轮裁决，历史涨到约 76 万 token，第二天宿主把它从 1,048,576 窗口的模型切到 512,000
-  // 窗口的免费池后立刻放不下，10:52 报 preflight_compress_failed。
-  // 判据只用宿主直给的状态，不替调用方判断「这条消息算新任务还是纠偏」（那是语义判断）：
-  // running = 还在跑，允许补；idle = 已停下，要接着干就新开一个会话。
+  // running 还是「这一轮在跑」，补话用 steer 插进当前回合。
+  // idle 表示宿主报这一轮停下了：可能是正常收口，也可能是宿主重启把在途会话掐断。
+  // 只放行后者——末条答复没有终态标记、台账里这条确实是本插件派出且还没投过回执、
+  // 台账也读得出来。满足时用 queue 把调用方原话重新排进这条会话接续，不另开会话
+  // （重开会重放整段历史，上下文代价很大）。其余 idle 一律按「这一轮已收口」拒投，
+  // 要接着干就新开会话。判定只看末尾标记与台账状态，不替调用方判断这条消息的语义。
   const hostStatus = resolved.agent?.status
+  let mode: 'steer' | 'queue' = 'steer'
   if (hostStatus === 'idle') {
-    throw new SessionCreateError(
-      'session-idle',
-      `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`,
-    )
+    // C2：分步取末条 assistant 文本，读不出或有终态标记都按已收口处理，不猜。
+    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
+    const noTerminalMark = !('error' in lastText) && terminalMarkOf(lastText.text) === undefined
+    // C3：台账在途四项，任一不成立都按已收口处理；直接用函数级 record 与 ledgerError，不重读台账。
+    const inFlight = record !== undefined
+      && typeof record.notifiedAt !== 'number'
+      && ledgerError === undefined
+      && typeof record.dispatchedAt === 'number'
+    if (!noTerminalMark || !inFlight) {
+      throw new SessionCreateError(
+        'session-idle',
+        `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`,
+      )
+    }
+    mode = 'queue'
   }
   const targetState: 'running' | 'unreported' = hostStatus === 'running' ? 'running' : 'unreported'
 
@@ -1172,7 +1184,7 @@ export async function messageSessionIn(
       {
         requestId: randomUUID(),
         sessionId,
-        mode: 'steer',
+        mode,
         content: [{ type: 'text', text: message }],
       },
       opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS),
@@ -1330,6 +1342,48 @@ export function terminalMarkOf(text: string): string | undefined {
     if (rest === '' || [...rest].every(char => TERMINAL_TRAILING_PUNCT.includes(char))) return mark
   }
   return undefined
+}
+
+/**
+ * 门四要的那一段：该会话**最后一条** `assistant/message` 的 text 块拼接串。
+ * 直接读 `controller.page` 的原始事件、**不走 renderTranscript** —— 后者过 clipText（:912-915），
+ * 会按 MESSAGE_CLIP 截尾，长答复末尾的标记会被截掉（本设计的头号陷阱）。
+ * 读不到就返回原因，由 deliver 出声并不投（宁可漏一条，也不投一条假回执）。
+ */
+async function lastAssistantText(
+  controller: NonNullable<HostCtx['sessionController']>,
+  sessionId: string,
+  seq: unknown,
+): Promise<{ text: string } | { error: string }> {
+  if (typeof controller.page !== 'function') {
+    return { error: 'this harness has no sessionController.page, so its last assistant message cannot be read' }
+  }
+  const at = Number(seq)
+  if (!Number.isFinite(at)) {
+    return { error: 'the harness gave no sequence number for it, so its last assistant message cannot be read' }
+  }
+  let page: SessionPage | undefined
+  try {
+    // 只要末条 assistant 文本：取尾巴上很少几条事件就够，不用整篇转写。
+    page = await controller.page(
+      { address: { kind: 'session', sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE },
+      AbortSignal.timeout(HISTORY_TIMEOUT_MS),
+    )
+  } catch (error) {
+    return { error: `its last assistant message could not be read (${reasonOf(error)})` }
+  }
+  if (page === undefined) {
+    return { error: 'the harness returned nothing for it, so its last assistant message cannot be read' }
+  }
+  const events = (page.records ?? []).map(record => record?.event)
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index] as AnyEvent | null
+    if (event?.type !== 'assistant/message') continue
+    const message = event.data?.message as { content?: unknown } | undefined
+    const text = blockText(message?.content)
+    if (text !== '') return { text }
+  }
+  return { error: 'no assistant message with text was found among its last events' }
 }
 
 /** 台账里「既有 dispatchedAt 又有 notifiedAt」的有效样本，派活时长（分钟），按台账顺序。 */
@@ -1491,48 +1545,6 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       if (resolved.agent.status !== 'idle') return child.sessionId
     }
     return undefined
-  }
-
-  /**
-   * 门四要的那一段：该会话**最后一条** `assistant/message` 的 text 块拼接串。
-   * 直接读 `controller.page` 的原始事件、**不走 renderTranscript** —— 后者过 clipText（:912-915），
-   * 会按 MESSAGE_CLIP 截尾，长答复末尾的标记会被截掉（本设计的头号陷阱）。
-   * 读不到就返回原因，由 deliver 出声并不投（宁可漏一条，也不投一条假回执）。
-   */
-  async function lastAssistantText(
-    controller: NonNullable<HostCtx['sessionController']>,
-    sessionId: string,
-    seq: unknown,
-  ): Promise<{ text: string } | { error: string }> {
-    if (typeof controller.page !== 'function') {
-      return { error: 'this harness has no sessionController.page, so its last assistant message cannot be read' }
-    }
-    const at = Number(seq)
-    if (!Number.isFinite(at)) {
-      return { error: 'the harness gave no sequence number for it, so its last assistant message cannot be read' }
-    }
-    let page: SessionPage | undefined
-    try {
-      // 只要末条 assistant 文本：取尾巴上很少几条事件就够，不用整篇转写。
-      page = await controller.page(
-        { address: { kind: 'session', sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE },
-        AbortSignal.timeout(HISTORY_TIMEOUT_MS),
-      )
-    } catch (error) {
-      return { error: `its last assistant message could not be read (${reasonOf(error)})` }
-    }
-    if (page === undefined) {
-      return { error: 'the harness returned nothing for it, so its last assistant message cannot be read' }
-    }
-    const events = (page.records ?? []).map(record => record?.event)
-    for (let index = events.length - 1; index >= 0; index -= 1) {
-      const event = events[index] as AnyEvent | null
-      if (event?.type !== 'assistant/message') continue
-      const message = event.data?.message as { content?: unknown } | undefined
-      const text = blockText(message?.content)
-      if (text !== '') return { text }
-    }
-    return { error: 'no assistant message with text was found among its last events' }
   }
 
   async function deliver(sessionId: string, endTime: number, turn: number | undefined, reason: string | undefined): Promise<void> {

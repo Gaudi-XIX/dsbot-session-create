@@ -2,6 +2,17 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.9.0 — 2026-11-06
+
+**不兼容变更：停下的会话不再一律拒投，按末尾标记 + 台账在途分流**
+
+- **`session_message` 对宿主直报 `idle` 的会话改成按条件续投**。三个条件同时成立才放行：① 末尾最后一条 assistant 文本里没有终态标记（`[DISPATCH DONE]` / `[NEEDS USER]` / `[DISPATCH BLOCKED]`，只认最后一个非空行开头）；② 派单台账里这条是本插件派出且还在途——`dispatchedAt` 有值、`notifiedAt` 还没写、台账读得出；③ 末条文本读得出来（`controller.page` 可用、seq 有限、page 不抛错、找得到 assistant message）。全成立 → `controller.prompt(mode: 'queue')` 把调用方原话排回这条会话接着做，不另开会话、不重灌上下文，结果与 `unreported` 一样标 `targetState: 'unreported'`。任一不成立 → 照旧抛 `session-idle` 并指向 `create_session`。动机：宿主重启掐断在途会话后，重开一支要把整段历史重灌一遍；末尾没终态标记说明这一轮是被动停下的，续投才不浪费上下文。
+- **这是对旧行为的不兼容变更**：0.8.1 里 `idle` 一律 `session-idle`，调用方若靠「抛错」判断会话收口，现在末尾无标记且在途的 `idle` 会改成成功投递。有终态标记仍拒投，2026-11-01 那单事故（同一会话被补 16 轮裁决、历史涨到约 76 万 token）的防线不变。
+- `running` 仍走 `mode: 'steer'`；宿主没报状态仍照投并标 `unreported`；`session-unknown` 仍拒投。`formatMessage` 的回执文案未改，续投成功时它仍只说「宿主已收下」，不冒充会话已经看过。
+- **实现边界**：`lastAssistantText` 从 `installDispatchNotify` 闭包里提到模块级、与 `deliver` 共用同一份，函数体与五重 fail-closed 语义原样不动；`DispatchRecord` 没加字段；没加「只放行一次」的一次性戳；`notifiedAt` 语义没动；`deliver` 门四语义、`TERMINAL_MARKS`、`terminalMarkOf`、`blockText`、`SessionPage` 全未动。
+- `MESSAGE_DESCRIPTION`（工具说明）与 `package.json` 的 description 同步改成新口径；`src/index.ts` 的 `session_message` 注册段未动。
+- **尚未验证**：真机端到端（宿主重启后对在途 `idle` 会话发一条「继续」、确认续投成功且回执不断链）属实现后首验，本单未做，须重启装载后单独验。
+
 ## 0.8.1 — 2026-11-06
 
 **行为变更：回执改传指针；终态标记只认正文末尾**

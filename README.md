@@ -3,7 +3,7 @@
 给 DSH 加四个工具：
 
 - **`create_session`** —— 在指定的 DSH 工作区、或任意一个已存在的文件夹里开一个新会话，并把一段提示词投进去。开之前先把**模型**和**权限档**定下来。
-- **`session_message`** —— 给一个**还在跑**的会话插一条消息（插队投放，它下一步就读到）。
+- **`session_message`** —— 给**还在跑**的会话插一条消息（插队投放，它下一步就读到）；停下的会话若末条没有终态标记、且台账里是还在途的派单，就把这条消息排回它自己接着做，不另开会话。
 - **`read_session_transcript`** —— 按会话 id 把它说过的话和当前状态读回来。
 - **`list_dispatched_sessions`** —— 看这个插件派过哪些会话、各自此刻什么状态。
 
@@ -13,7 +13,7 @@
 
 1. **派出去的会话不落到宿主的全局默认模型上**。它钉死到派活那个 Bot 自己正在用的模型；读不到派活人的模型就**不建这一单**。
 2. **缺省权限档是全权限**。不传 `permission` 时一律开在 `danger-full-access`，并把这一条写进结果；要 `auto` 就显式传。
-3. **补话只服务还在跑的会话**。目标会话已经停下，就拒投并让你新开一个，不往历史里一层一层堆活。
+3. **停下的会话看末尾标记决定能不能续投**。宿主直报 `idle` 时，先读这条会话末尾最后一条 assistant 文本和派单台账：末尾没有终态标记（`[DISPATCH DONE]` / `[NEEDS USER]` / `[DISPATCH BLOCKED]`）、台账里这条是本插件派出且还在途（有 `dispatchedAt`、还没有 `notifiedAt`、台账读得出），才用 `mode: 'queue'` 把原话排回这条会话接着做，不另开会话、不重灌上下文。有终态标记或不在途，照旧拒投并指向 `create_session`。
 
 ## 为什么需要它
 
@@ -92,16 +92,16 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### `session_message`
 
-给一个**已经存在、且还在跑**的会话插一条消息，不新建会话：
+给一个**已经存在**的会话插一条消息，不新建会话：还在跑的插队进当前这一轮；停下的按末尾标记和台账决定续投还是拒投。
 
 | 参数 | 必填 | 说明 |
 | --- | --- | --- |
 | `sessionId` | 是 | 目标会话的 id（`create_session` 或 `list_dispatched_sessions` 给的） |
 | `message` | 是 | 插进去的那段话 |
 
-- 走 `controller.prompt(mode: 'steer')`（宿主 `agent.steer`）：**插进正在跑的那一轮**，会话下一步就读到，不等这一轮结束。
-- 目标会话的 turn 已经结束（宿主直报 `idle`）时**拒投**（`session-idle`），并指向 `create_session`。判据只用宿主直给的状态，不替调用方判断「这条消息算新任务还是纠偏」——那是语义判断。这条是 2026-11-01 那单事故的防线：同一条会话被补了 16 轮裁决，历史涨到约 76 万 token，第二天宿主把它切到 512,000 窗口的模型后立刻放不下。
-- 宿主没报状态时按「还在跑」处理，结果里如实标 `targetState: unreported`。
+- 宿主报 `running`：走 `controller.prompt(mode: 'steer')`（宿主 `agent.steer`），**插进正在跑的那一轮**，会话下一步就读到，不等这一轮结束。
+- 宿主报 `idle`：读这条会话末尾最后一条 assistant 文本（终态标记 `[DISPATCH DONE]` / `[NEEDS USER]` / `[DISPATCH BLOCKED]` 只认最后一个非空行开头）和派单台账。**末尾没有终态标记、且台账里这条是本插件派出且还在途**（有 `dispatchedAt`、没有 `notifiedAt`、台账读得出）→ 用 `controller.prompt(mode: 'queue')` 把原话排回这条会话接着做，不另开会话、不重灌上下文。反之（末尾有终态标记／台账查不到／已投过回执／台账读失败／末条读不出）→ **拒投**（`session-idle`），并指向 `create_session`。有终态标记仍拒投，是 2026-11-01 那单事故的防线：同一条会话被补了 16 轮裁决，历史涨到约 76 万 token，第二天宿主把它切到 512,000 窗口的模型后立刻放不下。分流只看末尾标记与台账状态，不替调用方判断「这条消息算新任务还是纠偏」——那是语义判断。
+- 宿主没报状态时按「还在跑」处理，照投，结果里如实标 `targetState: unreported`；`idle` 续投成功时同样标 `unreported`，不冒充宿主说它还在跑。
 - 只说「已插进正在跑的那一轮」，不说「它看过了」——后者只有读回才能证明。
 - 单次投递超时 10 秒（`MESSAGE_TIMEOUT_MS`）。
 
@@ -207,7 +207,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 | 权限档设不上 | 归档这个会话，整单报错 |
 | `auto` 的审批策略写不进 | 归档这个会话，整单报错 |
 | 提示词投递失败 | 归档这个会话，如实报错，不对外说成功 |
-| 补话给已经停下的会话 | 拒投（`session-idle`），什么都不发 |
+| 补话给停下的会话，但末尾有终态标记／台账不在途／读不出末条／台账读不了 | 拒投（`session-idle`），什么都不发 |
 
 那张「宿主缺服务」的报错要能真的报出来，靠的是**服务不写进 `inject` 硬声明**：插件只 `inject: ['tools']`，其余服务都走 `ctx.get()` 宽容路径（`src/core.ts` 的 `resolveServices`）。写成硬 inject 的话，宿主缺服务时整棵插件树会加载失败，`preflight` 那句可读报错根本没有机会执行——用户只会看到「工具不存在」。
 
@@ -255,7 +255,7 @@ node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一�
 - 宿主 API 的形状（`create` 返回 `{ sessionId }`、`prompt` 要 `requestId` + `mode` + `content:[{type:'text',text}]`）是从 DS Bot 的源码**读出来**的，不是从官方文档抄的。上游没有这层文档。
 - **代码与文档里不许出现本机路径**（2026-11-02 用户定）：源码、测试、注释、配置一律不许写盘符路径、用户名或本机目录名。唯一例外是单元测试里验证「Windows 路径怎么处理」用的**虚构样本**（`test/read.test.ts`、`test/core.test.ts` 与 `test/autoresume.test.ts` 里那几个），它们跟这台机器的实际目录无关。默认落点由 `DSH_HOME` / `homedir()` 在运行时算，要换就加一个 env 覆盖；`test/autoresume.test.ts` 有一条用例扫 `src/` 下全部 `.ts`（不递归子目录），命中盘符形式的路径就判红。
 - 启动自检的落点跟随上面的规则：换机器、换 `DSH_HOME` 都不用改代码；要把指针接到某个固定目录，设 `DSH_AUTORESUME_STATE_DIR`。
-- 派出去的**提示词**走 `queue`，**补话**走 `steer`，**回执**走 `queue`——三个通道口径不同，改的时候别顺手统一。
+- 派出去的**提示词**走 `queue`，**补话**在会话还在跑时走 `steer`、停下续投时走 `queue`，**回执**走 `queue`——口径不同，改的时候别顺手统一。
 
 ## 已验证 / 尚未验证
 

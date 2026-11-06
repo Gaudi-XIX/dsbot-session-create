@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SessionCreateError, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type HostCtx, type WorkspaceEntry } from '../src/core'
+import { SessionCreateError, appendDispatch, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type DispatchRecord, type HostCtx, type SessionPage, type WorkspaceEntry } from '../src/core'
 
 type Calls = {
   create: Record<string, unknown>[]
@@ -65,6 +65,10 @@ function fakeCtx(options: {
   noSelectModel?: boolean
   /** selectModel 抛这个错 */
   selectModelThrows?: Error
+  /** sessionController.page 的假实现（测末条 assistant 文本 / fail-closed）；不传就完全没有 page */
+  page?: (args: unknown, signal?: AbortSignal) => SessionPage
+  /** 给 resolveAgent 返回值的 agent.session 补一个有限 seq，供读末条文本用 */
+  sessionSeq?: number
 } = {}) {
   const calls: Calls = { create: [], prompt: [], rename: [], archive: [], signals: [], list: [], command: [], approval: [], selectModel: [], order: [] }
   let notifyPromptStarted: (() => void) | undefined
@@ -92,7 +96,7 @@ function fakeCtx(options: {
         return true
       },
       async resolveAgent(id?: string) {
-        return (options.resolveAgent
+        const resolved = (options.resolveAgent
           ? options.resolveAgent(id)
           : {
               agent: {
@@ -108,8 +112,17 @@ function fakeCtx(options: {
                     : { requestHeader: () => ({ config: options.dispatcherHeader ?? DISPATCHER_HEADER }) }),
                 },
               },
-            }) as never
+            })
+        // 不传 sessionSeq 时逐字保持原来的返回；传了才往 agent.session 上补一个有限 seq。
+        if (options.sessionSeq !== undefined) {
+          const holder = resolved as { agent?: { session?: Record<string, unknown> } } | null | undefined
+          if (holder?.agent?.session !== undefined) {
+            holder.agent.session.seq = options.sessionSeq
+          }
+        }
+        return resolved as never
       },
+      ...(options.page === undefined ? {} : { page: options.page }),
       ...(options.noSelectModel
         ? {}
         : {
@@ -746,20 +759,133 @@ describe('派出去的会话钉死模型（跟派任务的 bot，或有显式指
   })
 })
 
-// 派出去的任务必须开新会话。补话通道只服务「还在跑的那一轮」——
-// 目标会话已经停下（宿主直给 idle）时再投一件活就是复用，实测能把同一条会话堆到 76 万 token。
-describe('补话只许投给还在跑的会话（已停下 → 拒投，要新任务就新开会话）', () => {
+// 补话通道的分流口径：running 是「这一轮在跑」，用 steer 插进当前回合；
+// idle 是这一轮停下了，可能是正常收口，也可能是宿主重启把在途会话掐断——
+// 末条答复没有终态标记、且台账里这条确实是本插件派出、还没投过回执、台账也读得出时，
+// 用 mode 'queue' 把原话排回本会话接续（不另开会话，重开会重放整段历史）；
+// 其余 idle 一律按「这一轮已收口」拒投，要接着干就新开会话。
+// 不认识的会话拒投、不冒充「它在跑」这两项口径不变。
+describe('补话分流：running 走 steer；idle 按末尾标记 + 台账在途决定 queue 续投或拒投', () => {
   const opts = { ledger: TEST_LEDGER }
-
-  test('宿主报 idle → 拒投，什么都不发，并指向 create_session', async () => {
-    const { ctx, calls } = fakeCtx({
-      resolveAgent: () => ({ agent: { session: { id: 'session-old' }, status: 'idle' } }),
+  let caseNo = 0
+  // 台账 append-only、跨用例累积（本文件无 beforeAll/afterAll 清理）：每条用唯一 sessionId，
+  // readLedger 按 sessionId 去重只认最后一条，避免历史行互相干扰。
+  const uniq = (tag: string) => `idle-resume-${tag}-${Date.now()}-${caseNo++}`
+  const seed = (sessionId: string, extra: Partial<DispatchRecord> = {}) =>
+    appendDispatch(TEST_LEDGER, {
+      sessionId, title: 'idle resume', placement: 'work', dispatchedAt: Date.now(), promptHead: 'test', ...extra,
     })
-    const error = await messageSessionIn(ctx, { sessionId: 'session-old', message: '接着做第 15 轮' }, opts).catch(e => e)
+  // 末条 assistant/message 的 text 块；blockText 只认 content 数组里的 type:'text' + text:string。
+  const pageOf = (text: string): SessionPage => ({
+    records: [{ event: { type: 'assistant/message', data: { message: { content: [{ type: 'text', text }] } } } }],
+  })
+  const idleAgent = (sessionId: string) => ({ agent: { session: { id: sessionId }, status: 'idle' } })
+  const expectIdleRejected = async (ctx: HostCtx, calls: Calls, sessionId: string, ledger = TEST_LEDGER) => {
+    const error = await messageSessionIn(ctx, { sessionId, message: '继续' }, { ledger }).catch(e => e)
     expect(error).toBeInstanceOf(SessionCreateError)
     expect(error.code).toBe('session-idle')
     expect(error.message).toContain('create_session')
     expect(calls.prompt).toEqual([])
+  }
+
+  test('A1 idle + 台账在途 + 末条无终态标记 → queue 续投原话，targetState 如实标 unreported', async () => {
+    const sessionId = uniq('a1')
+    await seed(sessionId)
+    const message = '继续把上一轮没做完的做完'
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => pageOf('还在查，未收口'),
+    })
+    const result = await messageSessionIn(ctx, { sessionId, message }, opts)
+    expect(result.targetState).toBe('unreported')
+    expect(calls.prompt).toHaveLength(1)
+    expect(calls.prompt[0]).toMatchObject({ sessionId, mode: 'queue' })
+    expect(calls.prompt[0].content).toEqual([{ type: 'text', text: message }])
+  })
+
+  test('A2 末条以 [DISPATCH DONE] 收口 → 拒投，什么都不发', async () => {
+    const sessionId = uniq('a2')
+    await seed(sessionId)
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => pageOf('[DISPATCH DONE]。'),
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A3 台账无该 sessionId → 拒投，什么都不发', async () => {
+    const sessionId = uniq('a3')
+    await seed(uniq('a3-other')) // 台账非空，但确实没有目标 sessionId
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => pageOf('还在查，未收口'),
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A4 台账该记录 notifiedAt 已有值 → 拒投，什么都不发', async () => {
+    const sessionId = uniq('a4')
+    await seed(sessionId, { notifiedAt: Date.now() })
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => pageOf('还在查，未收口'),
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  // A5 五项 fail-closed：C2 读不出末条、C3 台账读不出，都按已收口拒投，不猜、不投。
+  test('A5-1 宿主没有 sessionController.page → 拒投', async () => {
+    const sessionId = uniq('a5-1')
+    await seed(sessionId)
+    const { ctx, calls } = fakeCtx({ resolveAgent: () => idleAgent(sessionId), sessionSeq: 10 })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A5-2 page 抛错 → 拒投', async () => {
+    const sessionId = uniq('a5-2')
+    await seed(sessionId)
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: (): SessionPage => { throw new Error('page boom') },
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A5-3 page 里没有 assistant/message 事件 → 拒投', async () => {
+    const sessionId = uniq('a5-3')
+    await seed(sessionId)
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => ({ records: [{ event: { type: 'user/message' } }] }),
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A5-4 末条 seq 缺失（非有限数）→ 拒投', async () => {
+    const sessionId = uniq('a5-4')
+    await seed(sessionId)
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      page: () => pageOf('还在查，未收口'),
+    })
+    await expectIdleRejected(ctx, calls, sessionId)
+  })
+
+  test('A5-5 台账读失败（ledger 指向目录）→ 拒投', async () => {
+    await mkdir(TMP_ROOT, { recursive: true })
+    const sessionId = uniq('a5-5')
+    const { ctx, calls } = fakeCtx({
+      resolveAgent: () => idleAgent(sessionId),
+      sessionSeq: 10,
+      page: () => pageOf('还在查，未收口'),
+    })
+    await expectIdleRejected(ctx, calls, sessionId, TMP_ROOT)
   })
 
   test('宿主报 running → 照投，回执写清是投给在飞那一轮', async () => {

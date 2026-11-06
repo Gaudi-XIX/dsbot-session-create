@@ -643,8 +643,9 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
   let title;
   let placement;
   let ledgerError;
+  let record;
   try {
-    const record = (await readLedger(ledgerPath)).find((entry) => entry.sessionId === sessionId);
+    record = (await readLedger(ledgerPath)).find((entry) => entry.sessionId === sessionId);
     title = record?.title;
     placement = record?.placement;
   } catch (error) {
@@ -655,8 +656,15 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
     throw new SessionCreateError("session-unknown", `no Session "${sessionId}" is known to this harness${resolved?.error?.message ? ` (${resolved.error.message})` : ""}; nothing was sent.`);
   }
   const hostStatus = resolved.agent?.status;
+  let mode = "steer";
   if (hostStatus === "idle") {
-    throw new SessionCreateError("session-idle", `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`);
+    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq);
+    const noTerminalMark = !("error" in lastText) && terminalMarkOf(lastText.text) === undefined;
+    const inFlight = record !== undefined && typeof record.notifiedAt !== "number" && ledgerError === undefined && typeof record.dispatchedAt === "number";
+    if (!noTerminalMark || !inFlight) {
+      throw new SessionCreateError("session-idle", `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`);
+    }
+    mode = "queue";
   }
   const targetState = hostStatus === "running" ? "running" : "unreported";
   let outcome;
@@ -664,7 +672,7 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
     outcome = await controller.prompt?.({
       requestId: randomUUID(),
       sessionId,
-      mode: "steer",
+      mode,
       content: [{ type: "text", text: message }]
     }, opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? MESSAGE_TIMEOUT_MS));
   } catch (error) {
@@ -734,6 +742,35 @@ function terminalMarkOf(text) {
       return mark;
   }
   return;
+}
+async function lastAssistantText(controller, sessionId, seq) {
+  if (typeof controller.page !== "function") {
+    return { error: "this harness has no sessionController.page, so its last assistant message cannot be read" };
+  }
+  const at = Number(seq);
+  if (!Number.isFinite(at)) {
+    return { error: "the harness gave no sequence number for it, so its last assistant message cannot be read" };
+  }
+  let page;
+  try {
+    page = await controller.page({ address: { kind: "session", sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE }, AbortSignal.timeout(HISTORY_TIMEOUT_MS));
+  } catch (error) {
+    return { error: `its last assistant message could not be read (${reasonOf(error)})` };
+  }
+  if (page === undefined) {
+    return { error: "the harness returned nothing for it, so its last assistant message cannot be read" };
+  }
+  const events = (page.records ?? []).map((record) => record?.event);
+  for (let index = events.length - 1;index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type !== "assistant/message")
+      continue;
+    const message = event.data?.message;
+    const text = blockText(message?.content);
+    if (text !== "")
+      return { text };
+  }
+  return { error: "no assistant message with text was found among its last events" };
 }
 function deadlineSamples(records) {
   const minutes = [];
@@ -829,35 +866,6 @@ function createDispatchNotifier(deps = {}) {
         return child.sessionId;
     }
     return;
-  }
-  async function lastAssistantText(controller, sessionId, seq) {
-    if (typeof controller.page !== "function") {
-      return { error: "this harness has no sessionController.page, so its last assistant message cannot be read" };
-    }
-    const at = Number(seq);
-    if (!Number.isFinite(at)) {
-      return { error: "the harness gave no sequence number for it, so its last assistant message cannot be read" };
-    }
-    let page;
-    try {
-      page = await controller.page({ address: { kind: "session", sessionId }, throughSeq: at - 1, maxMessages: LAST_MESSAGE_PAGE }, AbortSignal.timeout(HISTORY_TIMEOUT_MS));
-    } catch (error) {
-      return { error: `its last assistant message could not be read (${reasonOf(error)})` };
-    }
-    if (page === undefined) {
-      return { error: "the harness returned nothing for it, so its last assistant message cannot be read" };
-    }
-    const events = (page.records ?? []).map((record) => record?.event);
-    for (let index = events.length - 1;index >= 0; index -= 1) {
-      const event = events[index];
-      if (event?.type !== "assistant/message")
-        continue;
-      const message = event.data?.message;
-      const text = blockText(message?.content);
-      if (text !== "")
-        return { text };
-    }
-    return { error: "no assistant message with text was found among its last events" };
   }
   async function deliver(sessionId, endTime, turn, reason) {
     if (notified.has(sessionId))
@@ -1239,8 +1247,9 @@ var CREATE_DESCRIPTION = [
 var MESSAGE_DESCRIPTION = [
   "Send one more message into a Session that already exists, by its session id. No new Session is created.",
   "This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.",
-  "Only a Session that is still working accepts it: when the harness reports the Session idle (its turn has finished), the message is refused and nothing is sent — a dispatch that has stopped is a new task, so send it a new Session with create_session.",
-  "The message steers the turn that is running: the host splices it into that turn at once, so the Session reads it on its next step instead of waiting for the turn to end.",
+  'When the harness reports the Session idle (its turn has finished), the call checks its last assistant message and the dispatch ledger: if that last message has no terminal mark and the ledger still has this dispatch in flight (dispatched, not yet receipted, readable), the message is queued into the same Session (mode "queue") to resume it after a host restart cut it short — no new Session is made.',
+  "An idle Session that has written a terminal mark, or is no longer an in-flight dispatch, is a closed turn: taking that work further is a new task and takes a new Session, so send it with create_session instead; nothing is sent into the idle one.",
+  'A running Session gets the message spliced into the turn that is in flight (mode "steer"): the host delivers it at once, so the Session reads it on its next step instead of waiting for the turn to end.',
   "Nothing yet proves the Session read it — read_session_transcript shows that.",
   "A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.",
   "Read what the Session did with it afterwards using read_session_transcript."

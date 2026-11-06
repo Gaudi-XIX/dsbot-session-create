@@ -58,8 +58,9 @@ const CREATE_DESCRIPTION = [
 const MESSAGE_DESCRIPTION = [
   'Send one more message into a Session that already exists, by its session id. No new Session is created.',
   'This is how a dispatch that is already running gets corrected or added to, when handing it a file is not enough.',
-  'Only a Session that is still working accepts it: when the harness reports the Session idle (its turn has finished), the message is refused and nothing is sent — a dispatch that has stopped is a new task, so send it a new Session with create_session.',
-  'The message steers the turn that is running: the host splices it into that turn at once, so the Session reads it on its next step instead of waiting for the turn to end.',
+  'When the harness reports the Session idle (its turn has finished), the call checks its last assistant message and the dispatch ledger: if that last message has no terminal mark and the ledger still has this dispatch in flight (dispatched, not yet receipted, readable), the message is queued into the same Session (mode "queue") to resume it after a host restart cut it short — no new Session is made.',
+  'An idle Session that has written a terminal mark, or is no longer an in-flight dispatch, is a closed turn: taking that work further is a new task and takes a new Session, so send it with create_session instead; nothing is sent into the idle one.',
+  'A running Session gets the message spliced into the turn that is in flight (mode "steer"): the host delivers it at once, so the Session reads it on its next step instead of waiting for the turn to end.',
   'Nothing yet proves the Session read it — read_session_transcript shows that.',
   'A session id this harness does not know is refused and nothing is sent; the call reports what it actually did.',
   'Read what the Session did with it afterwards using read_session_transcript.',
