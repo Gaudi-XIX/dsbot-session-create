@@ -24,6 +24,23 @@ export const CONCLUSION_LINE_CLIP = 200
 export const MESSAGES_MAX = 200
 export const MESSAGES_DEFAULT = 40
 
+/**
+ * 派送时随 prompt 一起投给新会话的「终态标记要求」段（2026-11-11 修 session-53036242
+ * 那单静默丢回执）。成因：这条契约原先只写在派单方可见的 CREATE_DESCRIPTION 里，
+ * 被派会话看不到工具说明；派单方没转述时它根本不知道要写标记，门四便按设计压下回执。
+ * 文案逐字点明门四的判定口径（只认最后一个非空行、只写标记本身），顺带缓解「要求已送达
+ * 但把标记写在正文首行」那一类失效面；模型是否照做不在插件保证范围内，门四语义不动。
+ */
+export const TERMINAL_MARK_INSTRUCTION = '[派单回执要求] 你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+
+/**
+ * 把要求段追加到 prompt 末尾：prompt 逐字不变作前缀，空一行加分隔线，要求段在全文最末。
+ * 纯函数，供 createSessionIn 的投递点与单测共用；台账 promptHead 仍取原 prompt。
+ */
+export function withTerminalMarkInstruction(prompt: string): string {
+  return `${prompt}\n\n---\n${TERMINAL_MARK_INSTRUCTION}`
+}
+
 export type ResolvedAgent = {
   agent?: {
     session?: { seq?: number } & Record<string, unknown>
@@ -714,7 +731,7 @@ export async function createSessionIn(
         requestId: randomUUID(),
         sessionId,
         mode: 'queue', // 新会话还没跑起来：steer 只往「正在跑的轮」里插，起不动这一轮，必须用 queue
-        content: [{ type: 'text', text: prompt }],
+        content: [{ type: 'text', text: withTerminalMarkInstruction(prompt) }],
       },
       // opts.signal 优先：调用方自带取消信号时用它（也让它可被单测 —— bun 1.3.13 的
       // AbortSignal.timeout 在没有其它待办定时器时不触发，只有它一个 pending 时会永久挂住）。

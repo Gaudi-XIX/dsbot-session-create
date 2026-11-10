@@ -130,7 +130,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ### 派完自动回执
 
-派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`、**它自己派出去的活都已经停下来**，并且**它的最终答复里写了终态标记**，插件才用 `controller.prompt(mode: 'queue')` 投一条回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。
+派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`、**它自己派出去的活都已经停下来**，并且**它的最终答复里写了终态标记**，插件才用 `controller.prompt(mode: 'queue')` 投一条回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。终态标记的写法要求由插件在 `create_session` 投递时自动追加到 prompt 末尾（`withTerminalMarkInstruction`），派活人不必自己转述——工具说明只对派活人可见，被派会话看不到。
 
 投不投由**派活方在最终答复里写的标记**决定，插件只认标记：
 
@@ -141,7 +141,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 | `[DISPATCH BLOCKED]` | 投 | 受阻停手，要人来救 |
 | 三个都没有 | **不投** | 中间收工，还在等自己派的活 |
 
-判定只读**该会话最后一条 `assistant` 消息的正文**，不看整篇 transcript；大小写敏感，全角括号或错拼一律不算标记。而且只认**正文末尾**：从后往前第一个非空行必须恰好是标记（允许该行前后有空白、行尾少量标点），正文中间引用的标记不算——`session-126369fb-7b6e-47f5-a75b-fa607bc16578` 那单的末条正文只是引用了「末行恰一个 `[DISPATCH DONE]`」，旧的全篇子串扫描据此误判成已结束。
+判定只读**该会话最后一条 `assistant` 消息的正文**，不看整篇 transcript；大小写敏感，全角括号或错拼一律不算标记。而且只认**正文末尾**：从后往前第一个非空行必须恰好是标记（允许该行前后有空白、行尾少量标点），正文中间引用的标记不算——`session-126369fb-7b6e-47f5-a75b-fa607bc16578` 那单的末条正文只是引用了「末行恰一个 `[DISPATCH DONE]`」，旧的全篇子串扫描据此误判成已结束。插件随 prompt 追加的要求段逐字点明了这条口径（最后一个非空行、只写标记本身、正文开头或段落中间写不算），顺带缓解「要求已送达但把标记写在正文首行」那一类失效面；模型是否照做不在插件保证范围内，门四语义不动。
 
 回执正文分两段：首行说清「哪一单」，第二段只有**一行结论加一个指针**——派活人一眼看到结果，要看全文再按指针自取，整篇不搬进它的上下文：
 

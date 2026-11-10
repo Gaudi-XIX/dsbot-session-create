@@ -2,7 +2,7 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SessionCreateError, appendDispatch, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, readLedger, resolveReturnTo, resolveServices, type DispatchRecord, type HostCtx, type SessionPage, type WorkspaceEntry } from '../src/core'
+import { SessionCreateError, TERMINAL_MARK_INSTRUCTION, appendDispatch, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, readLedger, resolveReturnTo, resolveServices, terminalMarkOf, withTerminalMarkInstruction, type DispatchRecord, type HostCtx, type SessionPage, type WorkspaceEntry } from '../src/core'
 
 type Calls = {
   create: Record<string, unknown>[]
@@ -297,7 +297,8 @@ describe('folder 落位', () => {
       expect(calls.rename[0][1]).toBe('工作线')
       expect(calls.prompt).toHaveLength(1)
       expect(calls.prompt[0]).toMatchObject({ sessionId: 'sess-1', mode: 'queue' })
-      expect(calls.prompt[0].content).toEqual([{ type: 'text', text: '干活' }])
+      // A1：投递文本 = 原 prompt 逐字前缀 + 固定要求段；台账 promptHead 仍取原 prompt（见下节）。
+      expect(calls.prompt[0].content).toEqual([{ type: 'text', text: withTerminalMarkInstruction('干活') }])
       expect(result).toMatchObject({ sessionId: 'sess-1', title: '工作线', renamed: true })
     } finally {
       await rm(dir, { recursive: true, force: true })
@@ -311,6 +312,58 @@ describe('folder 落位', () => {
     })
     expect(calls.create).toHaveLength(0)
     expect(calls.prompt).toHaveLength(0)
+  })
+})
+
+// 2026-11-11 R1：派送时把终态标记要求随 prompt 投给新会话。
+// 期望文本写死在这里，不用被测常量自己断言自己 —— 源码文案漂移就必须让这些用例变红。
+const R1_INSTRUCTION = '[派单回执要求] 你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+
+describe('派送时自动追加终态标记要求（R1）', () => {
+  test('A1 要求段全文逐字固定；拼接只做「原 prompt + 空行 + 分隔线 + 要求段」', () => {
+    expect(TERMINAL_MARK_INSTRUCTION).toBe(R1_INSTRUCTION)
+    const prompt = '查清这个 bug\n不要改别的文件'
+    expect(withTerminalMarkInstruction(prompt)).toBe(`${prompt}\n\n---\n${R1_INSTRUCTION}`)
+    expect(withTerminalMarkInstruction(prompt).startsWith(prompt)).toBe(true)
+  })
+
+  test('A1 实跑 createSessionIn：投递文本逐字 = 原 prompt 前缀 + 要求段', async () => {
+    const dir = await tempFolder()
+    try {
+      const { ctx, calls } = fakeCtx()
+      const prompt = '把这一单做完'
+      await createSessionIn(ctx, { title: 'R1', prompt, folder: dir })
+      expect(calls.prompt[0].content).toEqual([{ type: 'text', text: `${prompt}\n\n---\n${R1_INSTRUCTION}` }])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('A4 台账 promptHead 仍是原 prompt，不含要求段', async () => {
+    const dir = await tempFolder()
+    try {
+      const ledger = join(dir, 'ledger.jsonl')
+      const { ctx } = fakeCtx()
+      const prompt = '把这一单做完'
+      await createSessionIn(ctx, { title: 'R1', prompt, folder: dir }, { ledger })
+      const records = await readLedger(ledger)
+      expect(records[0].promptHead).toBe(prompt)
+      expect(records[0].promptHead).not.toContain('[派单回执要求]')
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
+  test('A5 要求段逐字点明门四的判定口径', () => {
+    expect(TERMINAL_MARK_INSTRUCTION).toContain('最后一个非空行')
+    expect(TERMINAL_MARK_INSTRUCTION).toContain('只写标记本身')
+    expect(TERMINAL_MARK_INSTRUCTION).toContain('正文开头或段落中间写、引用、列举这些标记都不算')
+  })
+
+  test('A8 追加段本身不会被误判成终态标记；按它作答则命中；标记写在首行不命中', () => {
+    expect(terminalMarkOf(TERMINAL_MARK_INSTRUCTION)).toBeUndefined()
+    expect(terminalMarkOf('查完了，报告已落盘\n[DISPATCH DONE]')).toBe('[DISPATCH DONE]')
+    expect(terminalMarkOf('[DISPATCH DONE]\n查完了，报告已落盘')).toBeUndefined()
   })
 })
 

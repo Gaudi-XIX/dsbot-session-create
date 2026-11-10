@@ -129,6 +129,22 @@ describe('端到端（构建产物）', () => {
     }
   })
 
+  // A2：构建产物投递时把要求段随 prompt 一起投出去。字面量写死，
+  // 不引 '../src/core' 的常量自证；构建产物漏了这一步就必须变红。
+  const R1_INSTRUCTION = '[派单回执要求] 你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+
+  test('A2 构建产物投递文本逐字 = 原 prompt 前缀 + 终态标记要求段', async () => {
+    const dir = await mkdtemp(join(TMP_ROOT, 'dsc-'))
+    try {
+      const { spec, calls } = load()
+      const prompt = '把 XX 做完'
+      await spec.execute({ title: 't', prompt, folder: dir })
+      expect(calls.prompt[0].content).toEqual([{ type: 'text', text: `${prompt}\n\n---\n${R1_INSTRUCTION}` }])
+    } finally {
+      await rm(dir, { recursive: true, force: true })
+    }
+  })
+
   test('workspace 落位', async () => {
     const { spec, calls } = load()
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1' })

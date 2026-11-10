@@ -19,6 +19,13 @@ var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
+var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
+function withTerminalMarkInstruction(prompt) {
+  return `${prompt}
+
+---
+${TERMINAL_MARK_INSTRUCTION}`;
+}
 function pickService(ctx, name) {
   try {
     const direct = ctx?.[name];
@@ -408,7 +415,7 @@ async function createSessionIn(ctx, args, opts = {}) {
       requestId: randomUUID(),
       sessionId,
       mode: "queue",
-      content: [{ type: "text", text: prompt }]
+      content: [{ type: "text", text: withTerminalMarkInstruction(prompt) }]
     }, opts.signal ?? AbortSignal.timeout(opts.timeoutMs ?? PROMPT_TIMEOUT_MS));
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -1279,7 +1286,7 @@ var CREATE_DESCRIPTION = [
   "The Session's model is pinned explicitly and is never the host's global default: it is the model the dispatching Bot's own Session runs on, unless `model` names another one as `provider/model`. If neither can be read, no Session is started.",
   "The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.",
   "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot.",
-  'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched".',
+  'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched". The plugin appends that requirement to the prompt automatically, so you do not need to repeat it; if your prompt already names a specific mark, the Session follows yours.',
   "After dispatching, arm one one-shot deadline for it with schedule_create(after_seconds=…) using the value this tool returns, and delete it with schedule_delete once its terminal receipt arrives (one-shot only; never a periodic check)."
 ].join(" ") + `
 ` + [

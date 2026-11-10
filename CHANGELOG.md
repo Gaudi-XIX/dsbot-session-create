@@ -2,6 +2,15 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.10.1 · 2026-11-11
+
+**修复：被派会话跑完写出结论、派活窗口却静默收不到回执（终态标记要求没送到被派会话）**
+
+- **成因**：「最终答复必须写终态标记」这条契约只写在派活人可见的 `CREATE_DESCRIPTION` 里，`create_session` 投递时原样投 prompt，被派会话看不到工具说明；派活人的 prompt 没转述时它根本不知道要写标记，门四按设计压下回执。另有一个独立失效面：prompt 已写明要求、模型却把标记写在正文首行，门四只认最后一个非空行。
+- **改动**：新增导出常量 `TERMINAL_MARK_INSTRUCTION` 与纯函数 `withTerminalMarkInstruction(prompt)`，投递文本改为「原 prompt 逐字作前缀 + `\n\n---\n` + 要求段」。要求段逐字点明门四口径（最后一个非空行、只写标记本身、正文开头或段落中间写不算）；`src/index.ts:52` 的工具说明补一句「插件会自动追加，派活人不必重复」。台账 `promptHead` 仍取原 prompt，`DispatchRecord` 不加字段。
+- **边界**：门一~门四、`QUIET_WINDOW_MS`、`TERMINAL_MARKS`/`terminalMarkOf`、回执载荷、`return_to`、`session_message`、autoresume 一律不动；要求段只是文案层缓解，模型是否照做不在插件保证范围内。规则层（`ops-dispatch.md`、`AGENTS.md`、技能正文）未改。
+- **未验**：真机端到端需宿主重启装载 0.10.1 后新派一单验「末行恰一个标记 → 回执到达 + 台账写 `notifiedAt`」；本单按红线不重启宿主，留作实现后首验。离线替代判据（投递文本逐字、`terminalMarkOf` 命中形状、`bun test` 全绿）已过。
+
 ## 0.10.0 · 2026-11-10
 
 **减摩大版本：跨 Bot 直投回执 (return_to)、解除 idle 拦截支持继续原调研会话、回执透传完整末轮结论**
