@@ -192,14 +192,11 @@ export type CreateArgs = {
   prompt?: string
   folder?: string
   workspace?: string
-  /** 会话开跑前要设的 agent 预设（宿主那四个：standard / minimal / ptc / creator）。 */
   preset?: string
-  /** 会话的权限模式（宿主三档：read-only / workspace-write / danger-full-access）。 */
   permission?: string
-  /** 显式指定新会话的模型，`provider/model`。不写它就与派活的那个 Bot 一致。**不写死任何模型名**。 */
   model?: string
+  return_to?: string
 }
-/** 这一单用到的会话选项：preset 在建会话时写进 header；permission 是**实际下发值**（无回读）。 */
 export type SessionOptions = {
   preset?: string
   permission?: string
@@ -209,32 +206,34 @@ export type SessionOptions = {
   /** 显式钉死给这个会话的模型（`provider/model`）。不写它，新会话会落到宿主的「全局默认模型」。 */
   model?: string
 }
+export type CreateSessionOptions = {
+  timeoutMs?: number
+  signal?: AbortSignal
+  ledger?: string
+  dispatcherSessionId?: string
+  botStatePath?: string
+  env?: Record<string, string | undefined>
+  home?: string
+}
+
 export type CreateResult = {
   sessionId: string
   title: string
   placement: string
   renamed: boolean
-  /** 实际用的 agent 预设：建会话时写进 header，宿主不接受就是没建成。 */
   preset?: string
-  /** **实际下发**的权限模式。宿主没有回读通道证实它生效，所以这里只敢写「下发值」。 */
   permission?: string
-  /** 调用方原本请求、被守卫改写掉的权限档；没被改写就没有这个字段。 */
   permissionOverriddenFrom?: string
-  /** auto 档压下去的审批策略（`never`）：auto reviewer 判 deny 时直接拒绝、不弹审批窗。 */
   approvalPolicy?: string
-  /** 显式钉死给这个会话的模型（`provider/model`）；派出去的会话不再落到宿主全局默认。 */
   model?: string
-  /** 模型钉死失败或发生回落时的如实说明：有值 = 这一重保护没按预期生效。 */
   modelNote?: string
-  /** 权限档被降级或没设时的如实说明：有值 = 结果不是调用方可能以为的那个档。 */
   permissionNote?: string
-  /** 台账写入失败时的原因；有值 = 会话已建但没记上 ID，调用方必须如实说出来。 */
   ledgerError?: string
-  /** 台账路径（成功写入时给出），便于调用方事后自己去看。 */
   ledgerPath?: string
+  returnTo?: string
+  returnToSessionId?: string
 }
 
-// 纯校验：不做任何 I/O，全部 fail-closed。
 export function validate(args: CreateArgs): { title: string; prompt: string; folder?: string; workspace?: string } {
   const title = (args?.title ?? '').trim()
   const prompt = (args?.prompt ?? '').trim()
@@ -576,10 +575,21 @@ export function parseModelRef(ref: string): { provider: string; model: string } 
 export async function createSessionIn(
   ctx: HostCtx,
   args: CreateArgs,
-  // opts.signal 一旦给了，就等于把超时责任交给调用方——本函数不再自建上限（通往宿主的调用只传两个实参，故生产路径仍是 30 秒）。
-  // opts.dispatcherSessionId 记进台账，供完成回执投回派活人（2026-10-28 加；缺省不写）。
-  opts: { timeoutMs?: number; signal?: AbortSignal; ledger?: string; dispatcherSessionId?: string } = {},
+  opts: CreateSessionOptions = {},
 ): Promise<CreateResult> {
+  let targetDispatcherSessionId = opts.dispatcherSessionId
+  let returnToBot: string | undefined
+  let returnToSessionId: string | undefined
+  if (args.return_to !== undefined && args.return_to.trim() !== '') {
+    const resolved = await resolveReturnTo(args.return_to, {
+      botStatePath: opts.botStatePath,
+      env: opts.env,
+      home: opts.home,
+    })
+    targetDispatcherSessionId = resolved.sessionId
+    returnToBot = resolved.botName ?? args.return_to.trim()
+    returnToSessionId = resolved.sessionId
+  }
   const missing = preflight(ctx)
   if (missing.length > 0) {
     throw new SessionCreateError('host-missing', `this harness is missing ${missing.join(', ')}; no Session was made.`)
@@ -678,7 +688,8 @@ export async function createSessionIn(
         ...(options.permissionOverriddenFrom === undefined
           ? {}
           : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
-        ...(opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }),
+        ...(targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId }),
+        ...(returnToBot === undefined ? {} : { returnTo: returnToBot }),
       })
       const note = ledgerNote === undefined
         ? ` It was recorded in the dispatch ledger (${ledgerPath}) so it can be found later.`
@@ -734,7 +745,8 @@ export async function createSessionIn(
         ? {}
         : { permissionOverriddenFrom: applied.permissionOverriddenFrom }),
       ...(applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy }),
-      ...(opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }),
+      ...(targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId }),
+      ...(returnToBot === undefined ? {} : { returnTo: returnToBot }),
     })
   } catch (error) {
     ledgerError = error instanceof Error ? error.message : String(error)
@@ -750,12 +762,60 @@ export async function createSessionIn(
     ...(permissionNote === undefined ? {} : { permissionNote }),
     ...(modelNote === undefined ? {} : { modelNote }),
     ...(ledgerError === undefined ? {} : { ledgerError }),
+    ...(returnToBot === undefined ? {} : { returnTo: returnToBot }),
+    ...(returnToSessionId === undefined ? {} : { returnToSessionId }),
   }
 }
 
 // ---------------------------------------------------------------------------
-// 派送台账：派送时记下会话 ID（用户 2026-10-26 要求）
-// ---------------------------------------------------------------------------
+export function defaultBotStatePath(env: Record<string, string | undefined> = process.env, home: string = homedir()): string {
+  const explicit = (env.DSH_BOT_STATE_PATH ?? '').trim()
+  if (explicit !== '') return explicit
+  const root = (env.DSH_HOME ?? '').trim() || join(home, '.dsh')
+  return join(root, 'bot', 'state.json')
+}
+
+export async function resolveReturnTo(
+  target: string,
+  opts: { botStatePath?: string; env?: Record<string, string | undefined>; home?: string } = {},
+): Promise<{ sessionId: string; botName?: string }> {
+  const trimmed = (target ?? '').trim()
+  if (trimmed === '') {
+    throw new SessionCreateError('invalid-return-to', 'return_to must not be empty.')
+  }
+  const statePath = opts.botStatePath ?? defaultBotStatePath(opts.env, opts.home)
+  try {
+    const raw = await readFile(statePath, 'utf8')
+    const parsed = JSON.parse(raw) as {
+      bots?: Record<string, { id?: string; name?: string; role?: string; aliases?: string[]; sessionId?: string }>
+    }
+    const bots = parsed?.bots ?? {}
+    const lower = trimmed.toLowerCase()
+    for (const [id, bot] of Object.entries(bots)) {
+      const name = bot?.name ?? ''
+      const role = bot?.role ?? ''
+      const aliases = Array.isArray(bot?.aliases) ? bot.aliases : []
+      const matches = id.toLowerCase() === lower
+        || name.toLowerCase() === lower
+        || role.toLowerCase() === lower
+        || (bot?.sessionId ?? '').toLowerCase() === lower
+        || aliases.some(a => typeof a === 'string' && a.toLowerCase() === lower)
+      if (matches) {
+        const targetSession = bot?.sessionId || bot?.id || id
+        return { sessionId: targetSession, botName: name || id }
+      }
+    }
+  } catch {
+    // state.json cannot be read or parsed
+  }
+  if (trimmed.startsWith('session-')) {
+    return { sessionId: trimmed }
+  }
+  throw new SessionCreateError(
+    'unknown-return-target',
+    `unknown return_to Bot or Session "${trimmed}"; could not resolve to a Bot in state.json or a valid session id.`,
+  )
+}
 
 export const LEDGER_FILE = 'dispatched-sessions.jsonl'
 
@@ -784,25 +844,15 @@ export type DispatchRecord = {
   title: string
   placement: string
   dispatchedAt: number
-  /** 提示词开头，供事后认出这是哪一单活。 */
   promptHead: string
-  /** 派送时设过的 agent 预设（没设就不写）。 */
   preset?: string
-  /** 派送时实际下发的权限模式（没设就不写；宿主未回传生效值）。 */
   permission?: string
-  /** 调用方原本请求、被守卫改写掉的权限档（没被改写就不写）。 */
   permissionOverriddenFrom?: string
-  /** 这一单在建了会话之后失败了（归档不了时用它留痕，便于事后找到那个空会话）。 */
   failed?: string
-  /**
-   * 派活人的会话 id（工具执行上下文里的 `exec.agent.session.id`，2026-10-28 加）。
-   * 完成回执投给它；没有这一项的老记录不发回执（宁可漏一条，不投错人）。
-   */
   dispatcherSessionId?: string
-  /** 上次读回读到的位置（headSeq），用来判断有没有新内容。 */
+  returnTo?: string
   lastReadSeq?: number
   lastReadAt?: number
-  /** 上次把完成回执投回派活人的时刻。同一段静默期只投一次（幂等）。 */
   notifiedAt?: number
 }
 
@@ -1160,20 +1210,6 @@ export async function messageSessionIn(
   const hostStatus = resolved.agent?.status
   let mode: 'steer' | 'queue' = 'steer'
   if (hostStatus === 'idle') {
-    // C2：分步取末条 assistant 文本，读不出或有终态标记都按已收口处理，不猜。
-    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
-    const noTerminalMark = !('error' in lastText) && terminalMarkOf(lastText.text) === undefined
-    // C3：台账在途四项，任一不成立都按已收口处理；直接用函数级 record 与 ledgerError，不重读台账。
-    const inFlight = record !== undefined
-      && typeof record.notifiedAt !== 'number'
-      && ledgerError === undefined
-      && typeof record.dispatchedAt === 'number'
-    if (!noTerminalMark || !inFlight) {
-      throw new SessionCreateError(
-        'session-idle',
-        `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`,
-      )
-    }
     mode = 'queue'
   }
   const targetState: 'running' | 'unreported' = hostStatus === 'running' ? 'running' : 'unreported'
@@ -1420,21 +1456,15 @@ export type NotifyEvent = { type?: unknown; data?: { turn?: unknown; reason?: { 
 type PendingQuiet = { endTime: number; handle: unknown }
 
 export type NotifierDeps = {
-  /** 台账落点；缺省 defaultLedgerPath() —— 与派送、读回同一个账。 */
   ledger?: string
-  /** 静默窗口（毫秒），缺省 QUIET_WINDOW_MS。 */
   quietMs?: number
   now?: () => number
-  /** 定时器可注入：单测用它把 120 秒窗口变成确定性的一步。 */
   setTimer?: (fn: () => void | Promise<void>, ms: number) => unknown
   clearTimer?: (handle: unknown) => void
-  /**
-   * 每次投递时**现解析**宿主服务。不要在 apply() 时拍成快照：插件加载常常早于服务就绪，
-   * 快照会就此永久失效（同 resolveServices 的注释与 apply() 里那句 preflight 日志的成因）。
-   */
-  controllerOf?: () => HostCtx['sessionController']
-  /** 跳过与失败都从这里出声，不静默。缺省打到宿主控制台，带插件前缀。 */
+  controllerOf?: () => HostCtx['sessionController'] | undefined
   log?: (line: string) => void
+  env?: Record<string, string | undefined>
+  home?: string
 }
 
 export type DispatchNotifier = {
@@ -1460,18 +1490,22 @@ export function dispatcherSessionOf(exec: unknown): string | undefined {
  * 第二段不会退化成空——取不到结论行时至少给出标记本身，派活人永远看得到这一单的结果。
  * 首行永远原样输出、不参与截断：终态标记就在首行，所以任何截断都切不掉它。
  */
+export const MAX_RECEIPT_BODY_CHARS = 12000
+
 export function receiptText(record: { title?: unknown }, sessionId: string, endTime: number, mark: string, turn?: number, reason?: string, conclusion?: string): string {
   const title = typeof record?.title === 'string' && record.title !== '' ? record.title : '(untitled)'
   const last = `turn ${turn === undefined ? '?' : turn}${reason === undefined ? '' : `, reason: ${reason}`}`
   const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`
-  return `${head}\n${conclusionLine(conclusion, sessionId, mark)}`
+  const body = (conclusion ?? '').trim()
+  if (body === '') {
+    return `${head}\n${mark}`
+  }
+  if (body.length > MAX_RECEIPT_BODY_CHARS) {
+    return `${head}\n${body.slice(0, MAX_RECEIPT_BODY_CHARS)}\n...(truncated, ${body.length} chars total; call read_session_transcript for full text)`
+  }
+  return `${head}\n${body}`
 }
 
-/**
- * 回执第二段：一行结论 + 指针。结论行 = 最终答复里第一个有内容的行，去掉行首 markdown 标记与
- * 多余空白，超过 `CONCLUSION_LINE_CLIP` 就截断；结论缺失（直接调用、没有文本）时退回标记本身，
- * 保证第二段永远有一行可读的内容。全文不塞进回执：派活人按同一行末尾的指针自取。
- */
 function conclusionLine(conclusion: string | undefined, sessionId: string, mark: string): string {
   const line = firstContentLine(conclusion)
   const text = line === '' ? mark : clipConclusionLine(line)
@@ -1553,7 +1587,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     if (record === undefined) return
     // 幂等（跨实例）：notifiedAt 是上次投递的时刻，落在这一段静默期之内就不再投。
     if (typeof record.notifiedAt === 'number' && record.notifiedAt >= endTime) return
-    const dispatcher = record.dispatcherSessionId
+    let dispatcher = record.dispatcherSessionId
     if (dispatcher === undefined || dispatcher === '') {
       log(`${sessionId} went quiet, but its ledger line has no dispatcherSessionId (it was dispatched before this feature), so no receipt was sent.`)
       return
@@ -1595,7 +1629,18 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       return
     }
     // 派活方会话已销毁（被关掉/归档）：没地方投，跳过 —— 这不是错误。
-    const target = await resolveQuietly(controller, dispatcher)
+    let target = await resolveQuietly(controller, dispatcher)
+    if ((target === undefined || target.error !== undefined || target.agent === undefined) && record.returnTo) {
+      try {
+        const reResolved = await resolveReturnTo(record.returnTo, { env: deps.env, home: deps.home })
+        if (reResolved.sessionId && reResolved.sessionId !== dispatcher) {
+          dispatcher = reResolved.sessionId
+          target = await resolveQuietly(controller, dispatcher)
+        }
+      } catch {
+        // ignore re-resolve failure
+      }
+    }
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
       log(`${sessionId} went quiet, but the dispatching Session ${dispatcher} is gone, so there is nowhere to send the receipt.`)
       return

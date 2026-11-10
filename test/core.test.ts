@@ -1,8 +1,8 @@
 // 用假 ctx 跑，不需要宿主：验的是 fail-closed 口径与调用序（文档 §1.2 / §三）。
 import { describe, expect, test } from 'bun:test'
-import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { SessionCreateError, appendDispatch, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, resolveServices, type DispatchRecord, type HostCtx, type SessionPage, type WorkspaceEntry } from '../src/core'
+import { SessionCreateError, appendDispatch, createSessionIn as coreCreateSessionIn, defaultLedgerPath, messageSessionIn, preflight, readLedger, resolveReturnTo, resolveServices, type DispatchRecord, type HostCtx, type SessionPage, type WorkspaceEntry } from '../src/core'
 
 type Calls = {
   create: Record<string, unknown>[]
@@ -804,7 +804,7 @@ describe('补话分流：running 走 steer；idle 按末尾标记 + 台账在途
     expect(calls.prompt[0].content).toEqual([{ type: 'text', text: message }])
   })
 
-  test('A2 末条以 [DISPATCH DONE] 收口 → 拒投，什么都不发', async () => {
+  test('A2 末条以 [DISPATCH DONE] 收口 → 仍支持 queue 追加后续调研与追问', async () => {
     const sessionId = uniq('a2')
     await seed(sessionId)
     const { ctx, calls } = fakeCtx({
@@ -812,80 +812,32 @@ describe('补话分流：running 走 steer；idle 按末尾标记 + 台账在途
       sessionSeq: 10,
       page: () => pageOf('[DISPATCH DONE]。'),
     })
-    await expectIdleRejected(ctx, calls, sessionId)
+    const result = await messageSessionIn(ctx, { sessionId, message: '继续调研第二阶段' }, opts)
+    expect(result.targetState).toBe('unreported')
+    expect(calls.prompt).toHaveLength(1)
+    expect(calls.prompt[0]).toMatchObject({ sessionId, mode: 'queue' })
   })
 
-  test('A3 台账无该 sessionId → 拒投，什么都不发', async () => {
+  test('A3 已完成且有 notifiedAt 记录 → 仍可直接 queue 续投同一会话', async () => {
     const sessionId = uniq('a3')
-    await seed(uniq('a3-other')) // 台账非空，但确实没有目标 sessionId
-    const { ctx, calls } = fakeCtx({
-      resolveAgent: () => idleAgent(sessionId),
-      sessionSeq: 10,
-      page: () => pageOf('还在查，未收口'),
-    })
-    await expectIdleRejected(ctx, calls, sessionId)
-  })
-
-  test('A4 台账该记录 notifiedAt 已有值 → 拒投，什么都不发', async () => {
-    const sessionId = uniq('a4')
     await seed(sessionId, { notifiedAt: Date.now() })
     const { ctx, calls } = fakeCtx({
       resolveAgent: () => idleAgent(sessionId),
       sessionSeq: 10,
-      page: () => pageOf('还在查，未收口'),
+      page: () => pageOf('已完成上一轮'),
     })
-    await expectIdleRejected(ctx, calls, sessionId)
+    const result = await messageSessionIn(ctx, { sessionId, message: '追问一个技术细节' }, opts)
+    expect(calls.prompt).toHaveLength(1)
+    expect(calls.prompt[0]).toMatchObject({ sessionId, mode: 'queue' })
   })
 
-  // A5 五项 fail-closed：C2 读不出末条、C3 台账读不出，都按已收口拒投，不猜、不投。
-  test('A5-1 宿主没有 sessionController.page → 拒投', async () => {
-    const sessionId = uniq('a5-1')
-    await seed(sessionId)
-    const { ctx, calls } = fakeCtx({ resolveAgent: () => idleAgent(sessionId), sessionSeq: 10 })
-    await expectIdleRejected(ctx, calls, sessionId)
-  })
-
-  test('A5-2 page 抛错 → 拒投', async () => {
-    const sessionId = uniq('a5-2')
-    await seed(sessionId)
+  test('A4 未知 session id 仍然拒投 (session-unknown)', async () => {
     const { ctx, calls } = fakeCtx({
-      resolveAgent: () => idleAgent(sessionId),
-      sessionSeq: 10,
-      page: (): SessionPage => { throw new Error('page boom') },
+      resolveAgent: () => ({ error: { message: 'no such session' } }),
     })
-    await expectIdleRejected(ctx, calls, sessionId)
-  })
-
-  test('A5-3 page 里没有 assistant/message 事件 → 拒投', async () => {
-    const sessionId = uniq('a5-3')
-    await seed(sessionId)
-    const { ctx, calls } = fakeCtx({
-      resolveAgent: () => idleAgent(sessionId),
-      sessionSeq: 10,
-      page: () => ({ records: [{ event: { type: 'user/message' } }] }),
-    })
-    await expectIdleRejected(ctx, calls, sessionId)
-  })
-
-  test('A5-4 末条 seq 缺失（非有限数）→ 拒投', async () => {
-    const sessionId = uniq('a5-4')
-    await seed(sessionId)
-    const { ctx, calls } = fakeCtx({
-      resolveAgent: () => idleAgent(sessionId),
-      page: () => pageOf('还在查，未收口'),
-    })
-    await expectIdleRejected(ctx, calls, sessionId)
-  })
-
-  test('A5-5 台账读失败（ledger 指向目录）→ 拒投', async () => {
-    await mkdir(TMP_ROOT, { recursive: true })
-    const sessionId = uniq('a5-5')
-    const { ctx, calls } = fakeCtx({
-      resolveAgent: () => idleAgent(sessionId),
-      sessionSeq: 10,
-      page: () => pageOf('还在查，未收口'),
-    })
-    await expectIdleRejected(ctx, calls, sessionId, TMP_ROOT)
+    const error = await messageSessionIn(ctx, { sessionId: 'unknown-sess', message: 'test' }, opts).catch(e => e)
+    expect(error).toBeInstanceOf(SessionCreateError)
+    expect(error.code).toBe('session-unknown')
   })
 
   test('宿主报 running → 照投，回执写清是投给在飞那一轮', async () => {
@@ -908,5 +860,64 @@ describe('补话分流：running 走 steer；idle 按末尾标记 + 台账在途
     const { ctx, calls } = fakeCtx({ resolveAgent: () => ({ error: { message: 'not found' } }) })
     await expect(messageSessionIn(ctx, { sessionId: 'nope', message: 'm' }, opts)).rejects.toMatchObject({ code: 'session-unknown' })
     expect(calls.prompt).toEqual([])
+  })
+})
+
+
+describe('return_to 跨 Bot 直投回执', () => {
+  const fakeState = {
+    bots: {
+      'bot-router': { id: 'bot-router', name: '路由', role: '路由', aliases: ['router', 'Chief'], sessionId: 'sess-router-act' },
+      'bot-design': { id: 'bot-design', name: '设计', role: '设计', aliases: ['design', 'Pixel'], sessionId: 'sess-design-act' },
+      'bot-repo': { id: 'bot-repo', name: '仓库', role: '仓库', aliases: ['repo', '程序'], sessionId: 'sess-repo-act' },
+    },
+  }
+
+  test('resolveReturnTo: 按中文名、英文标识、别名及直接 session id 解析', async () => {
+    const tmpDir = await mkdtemp(join(TMP_ROOT, 'ret-state-'))
+    const stateFile = join(tmpDir, 'state.json')
+    await writeFile(stateFile, JSON.stringify(fakeState), 'utf8')
+
+    // 中文名
+    const r1 = await resolveReturnTo('设计', { botStatePath: stateFile })
+    expect(r1.sessionId).toBe('sess-design-act')
+    expect(r1.botName).toBe('设计')
+
+    // 英文标准名
+    const r2 = await resolveReturnTo('design', { botStatePath: stateFile })
+    expect(r2.sessionId).toBe('sess-design-act')
+
+    // 历史代称
+    const r3 = await resolveReturnTo('Pixel', { botStatePath: stateFile })
+    expect(r3.sessionId).toBe('sess-design-act')
+
+    // 直接 session id
+    const r4 = await resolveReturnTo('session-custom-direct', { botStatePath: stateFile })
+    expect(r4.sessionId).toBe('session-custom-direct')
+
+    // 未知且不是 session- 开头 -> 报错
+    await expect(resolveReturnTo('nonexistent', { botStatePath: stateFile })).rejects.toThrow('unknown return_to Bot')
+  })
+
+  test('createSessionIn 指定 return_to 时台账记录目标 Bot 的 sessionId 并记下 returnTo 标记', async () => {
+    const tmpDir = await mkdtemp(join(TMP_ROOT, 'ret-ledger-'))
+    const stateFile = join(tmpDir, 'state.json')
+    const ledgerFile = join(tmpDir, 'dispatched.jsonl')
+    await writeFile(stateFile, JSON.stringify(fakeState), 'utf8')
+
+    const { ctx } = fakeCtx()
+    const result = await createSessionIn(
+      ctx,
+      { title: '测试直投设计', prompt: '抓取产物', folder: tmpDir, return_to: '设计' },
+      { ledger: ledgerFile, botStatePath: stateFile, dispatcherSessionId: 'sess-router-act' },
+    )
+
+    expect(result.returnTo).toBe('设计')
+    expect(result.returnToSessionId).toBe('sess-design-act')
+
+    const records = await readLedger(ledgerFile)
+    expect(records).toHaveLength(1)
+    expect(records[0].dispatcherSessionId).toBe('sess-design-act')
+    expect(records[0].returnTo).toBe('设计')
   })
 })

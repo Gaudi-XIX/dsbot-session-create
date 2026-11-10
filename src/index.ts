@@ -9,6 +9,9 @@ import {
   SessionCreateError,
   createSessionIn,
   deadlineSamples,
+  defaultBotStatePath,
+  resolveReturnTo,
+  type CreateSessionOptions,
   dispatcherSessionOf,
   installDispatchNotify,
   listDispatchedIn,
@@ -177,6 +180,7 @@ export function apply(ctx: HostCtx): void {
         preset: { type: 'string', description: 'Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default.' },
         permission: { type: 'string', description: 'Permission mode for the new Session, set with the host\'s own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit it and the Session is opened at `danger-full-access` — a preset is chosen only when this is given. `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session\'s approval policy to `never`: the host\'s auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness lists no `auto` preset at all (auto review off or not installed), an explicit `auto` fails and starts nothing.' },
         model: { type: 'string', description: 'Model for the new Session, written `provider/model`. Omit it and the Session is pinned to the model the dispatching Bot\'s own Session runs on — never the host\'s global default. A string without one slash, or with an empty side, is refused and no Session is made.' },
+        return_to: { type: 'string', description: 'Name, alias, or id of the Bot to receive the completion receipt (e.g. "设计" or "design"). If omitted, returns to the dispatching Session.' },
       },
       output,
       async execute(args: CreateArgs, exec?: unknown) {
@@ -193,6 +197,9 @@ export function apply(ctx: HostCtx): void {
             result.permission === undefined ? '' : `permission ${result.permission}`,
             result.model === undefined ? '' : `model ${result.model}`,
           ].filter(part => part !== '')
+          const returnToNote = result.returnTo === undefined
+            ? ''
+            : `- receipt target: Bot "${result.returnTo}"${result.returnToSessionId ? ` (session ${result.returnToSessionId})` : ''}`
           const overrideNote = result.permissionOverriddenFrom === undefined
             ? ''
             : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`
@@ -227,6 +234,7 @@ export function apply(ctx: HostCtx): void {
             ...(overrideNote === '' ? [] : [overrideNote]),
             ...(permissionNote === '' ? [] : [permissionNote]),
             ...(modelNote === '' ? [] : [modelNote]),
+            ...(returnToNote === '' ? [] : [returnToNote]),
             'The prompt is queued in the Session.',
             ledgerNote,
             ...(deadlineNote === undefined ? [] : [deadlineNote]),

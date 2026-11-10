@@ -17,7 +17,6 @@ var HISTORY_TIMEOUT_MS = 20000;
 var SESSION_OPTION_TIMEOUT_MS = 1e4;
 var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
-var CONCLUSION_LINE_CLIP = 200;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
 function pickService(ctx, name) {
@@ -306,6 +305,19 @@ function parseModelRef(ref) {
   return { provider, model };
 }
 async function createSessionIn(ctx, args, opts = {}) {
+  let targetDispatcherSessionId = opts.dispatcherSessionId;
+  let returnToBot;
+  let returnToSessionId;
+  if (args.return_to !== undefined && args.return_to.trim() !== "") {
+    const resolved = await resolveReturnTo(args.return_to, {
+      botStatePath: opts.botStatePath,
+      env: opts.env,
+      home: opts.home
+    });
+    targetDispatcherSessionId = resolved.sessionId;
+    returnToBot = resolved.botName ?? args.return_to.trim();
+    returnToSessionId = resolved.sessionId;
+  }
   const missing = preflight(ctx);
   if (missing.length > 0) {
     throw new SessionCreateError("host-missing", `this harness is missing ${missing.join(", ")}; no Session was made.`);
@@ -376,7 +388,8 @@ async function createSessionIn(ctx, args, opts = {}) {
         ...preset === undefined ? {} : { preset },
         ...options.permission === undefined ? {} : { permission: options.permission },
         ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom },
-        ...opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }
+        ...targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId },
+        ...returnToBot === undefined ? {} : { returnTo: returnToBot }
       });
       const note = ledgerNote === undefined ? ` It was recorded in the dispatch ledger (${ledgerPath}) so it can be found later.` : ` The dispatch ledger could not record it either (${ledgerNote}); keep this id by hand.`;
       const code = error instanceof SessionCreateError ? error.code : "options-failed";
@@ -415,7 +428,8 @@ async function createSessionIn(ctx, args, opts = {}) {
       ...applied.permission === undefined ? {} : { permission: applied.permission },
       ...applied.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: applied.permissionOverriddenFrom },
       ...applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy },
-      ...opts.dispatcherSessionId === undefined ? {} : { dispatcherSessionId: opts.dispatcherSessionId }
+      ...targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId },
+      ...returnToBot === undefined ? {} : { returnTo: returnToBot }
     });
   } catch (error) {
     ledgerError = error instanceof Error ? error.message : String(error);
@@ -429,8 +443,44 @@ async function createSessionIn(ctx, args, opts = {}) {
     ledgerPath,
     ...permissionNote === undefined ? {} : { permissionNote },
     ...modelNote === undefined ? {} : { modelNote },
-    ...ledgerError === undefined ? {} : { ledgerError }
+    ...ledgerError === undefined ? {} : { ledgerError },
+    ...returnToBot === undefined ? {} : { returnTo: returnToBot },
+    ...returnToSessionId === undefined ? {} : { returnToSessionId }
   };
+}
+function defaultBotStatePath(env = process.env, home = homedir()) {
+  const explicit = (env.DSH_BOT_STATE_PATH ?? "").trim();
+  if (explicit !== "")
+    return explicit;
+  const root = (env.DSH_HOME ?? "").trim() || join(home, ".dsh");
+  return join(root, "bot", "state.json");
+}
+async function resolveReturnTo(target, opts = {}) {
+  const trimmed = (target ?? "").trim();
+  if (trimmed === "") {
+    throw new SessionCreateError("invalid-return-to", "return_to must not be empty.");
+  }
+  const statePath = opts.botStatePath ?? defaultBotStatePath(opts.env, opts.home);
+  try {
+    const raw = await readFile(statePath, "utf8");
+    const parsed = JSON.parse(raw);
+    const bots = parsed?.bots ?? {};
+    const lower = trimmed.toLowerCase();
+    for (const [id, bot] of Object.entries(bots)) {
+      const name = bot?.name ?? "";
+      const role = bot?.role ?? "";
+      const aliases = Array.isArray(bot?.aliases) ? bot.aliases : [];
+      const matches = id.toLowerCase() === lower || name.toLowerCase() === lower || role.toLowerCase() === lower || (bot?.sessionId ?? "").toLowerCase() === lower || aliases.some((a) => typeof a === "string" && a.toLowerCase() === lower);
+      if (matches) {
+        const targetSession = bot?.sessionId || bot?.id || id;
+        return { sessionId: targetSession, botName: name || id };
+      }
+    }
+  } catch {}
+  if (trimmed.startsWith("session-")) {
+    return { sessionId: trimmed };
+  }
+  throw new SessionCreateError("unknown-return-target", `unknown return_to Bot or Session "${trimmed}"; could not resolve to a Bot in state.json or a valid session id.`);
 }
 var LEDGER_FILE = "dispatched-sessions.jsonl";
 function sessionCreateDir(env = process.env, home = homedir()) {
@@ -658,12 +708,6 @@ async function messageSessionIn(ctx, args = {}, opts = {}) {
   const hostStatus = resolved.agent?.status;
   let mode = "steer";
   if (hostStatus === "idle") {
-    const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq);
-    const noTerminalMark = !("error" in lastText) && terminalMarkOf(lastText.text) === undefined;
-    const inFlight = record !== undefined && typeof record.notifiedAt !== "number" && ledgerError === undefined && typeof record.dispatchedAt === "number";
-    if (!noTerminalMark || !inFlight) {
-      throw new SessionCreateError("session-idle", `Session "${sessionId}" has finished its turn (the harness reports it idle), so it is not a dispatch still in flight. Taking that work further is a new task and takes a new Session — call create_session. Nothing was sent.`);
-    }
     mode = "queue";
   }
   const targetState = hostStatus === "running" ? "running" : "unreported";
@@ -797,31 +841,23 @@ function dispatcherSessionOf(exec) {
   const id = exec?.agent?.session?.id;
   return typeof id === "string" && id !== "" ? id : undefined;
 }
+var MAX_RECEIPT_BODY_CHARS = 12000;
 function receiptText(record, sessionId, endTime, mark, turn, reason, conclusion) {
   const title = typeof record?.title === "string" && record.title !== "" ? record.title : "(untitled)";
   const last = `turn ${turn === undefined ? "?" : turn}${reason === undefined ? "" : `, reason: ${reason}`}`;
   const head = `[Dispatch receipt · ${title}] ${mark} · session ${sessionId} · ended ${stamp(endTime)} (${last})`;
-  return `${head}
-${conclusionLine(conclusion, sessionId, mark)}`;
-}
-function conclusionLine(conclusion, sessionId, mark) {
-  const line = firstContentLine(conclusion);
-  const text = line === "" ? mark : clipConclusionLine(line);
-  return `${text} · session ${sessionId} · read_session_transcript 取全文`;
-}
-function firstContentLine(conclusion) {
-  for (const raw of (conclusion ?? "").split(/\r?\n/)) {
-    const line = raw.trim();
-    if (line === "" || line.startsWith("```"))
-      continue;
-    const stripped = line.replace(/^[\s\u3000#>*+\-|]+/, "").trim();
-    if (stripped !== "")
-      return stripped;
+  const body = (conclusion ?? "").trim();
+  if (body === "") {
+    return `${head}
+${mark}`;
   }
-  return "";
-}
-function clipConclusionLine(line) {
-  return line.length <= CONCLUSION_LINE_CLIP ? line : `${line.slice(0, CONCLUSION_LINE_CLIP - 1)}…`;
+  if (body.length > MAX_RECEIPT_BODY_CHARS) {
+    return `${head}
+${body.slice(0, MAX_RECEIPT_BODY_CHARS)}
+...(truncated, ${body.length} chars total; call read_session_transcript for full text)`;
+  }
+  return `${head}
+${body}`;
 }
 function createDispatchNotifier(deps = {}) {
   const ledgerPath = deps.ledger ?? defaultLedgerPath();
@@ -875,7 +911,7 @@ function createDispatchNotifier(deps = {}) {
       return;
     if (typeof record.notifiedAt === "number" && record.notifiedAt >= endTime)
       return;
-    const dispatcher = record.dispatcherSessionId;
+    let dispatcher = record.dispatcherSessionId;
     if (dispatcher === undefined || dispatcher === "") {
       log(`${sessionId} went quiet, but its ledger line has no dispatcherSessionId (it was dispatched before this feature), so no receipt was sent.`);
       return;
@@ -907,7 +943,16 @@ function createDispatchNotifier(deps = {}) {
       log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(" / ")}).`);
       return;
     }
-    const target = await resolveQuietly(controller, dispatcher);
+    let target = await resolveQuietly(controller, dispatcher);
+    if ((target === undefined || target.error !== undefined || target.agent === undefined) && record.returnTo) {
+      try {
+        const reResolved = await resolveReturnTo(record.returnTo, { env: deps.env, home: deps.home });
+        if (reResolved.sessionId && reResolved.sessionId !== dispatcher) {
+          dispatcher = reResolved.sessionId;
+          target = await resolveQuietly(controller, dispatcher);
+        }
+      } catch {}
+    }
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
       log(`${sessionId} went quiet, but the dispatching Session ${dispatcher} is gone, so there is nowhere to send the receipt.`);
       return;
@@ -1327,7 +1372,8 @@ function apply(ctx) {
       folder: { type: "string", description: "Full path of a folder that exists. The Session works there and joins no DSH workspace. Give this or `workspace`, not both." },
       preset: { type: "string", description: "Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default." },
       permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit it and the Session is opened at `danger-full-access` — a preset is chosen only when this is given. `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session's approval policy to `never`: the host's auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness lists no `auto` preset at all (auto review off or not installed), an explicit `auto` fails and starts nothing." },
-      model: { type: "string", description: "Model for the new Session, written `provider/model`. Omit it and the Session is pinned to the model the dispatching Bot's own Session runs on — never the host's global default. A string without one slash, or with an empty side, is refused and no Session is made." }
+      model: { type: "string", description: "Model for the new Session, written `provider/model`. Omit it and the Session is pinned to the model the dispatching Bot's own Session runs on — never the host's global default. A string without one slash, or with an empty side, is refused and no Session is made." },
+      return_to: { type: "string", description: 'Name, alias, or id of the Bot to receive the completion receipt (e.g. "设计" or "design"). If omitted, returns to the dispatching Session.' }
     },
     output,
     async execute(args, exec) {
@@ -1340,6 +1386,7 @@ function apply(ctx) {
           result.permission === undefined ? "" : `permission ${result.permission}`,
           result.model === undefined ? "" : `model ${result.model}`
         ].filter((part) => part !== "");
+        const returnToNote = result.returnTo === undefined ? "" : `- receipt target: Bot "${result.returnTo}"${result.returnToSessionId ? ` (session ${result.returnToSessionId})` : ""}`;
         const overrideNote = result.permissionOverriddenFrom === undefined ? "" : `NOTE: permission "${result.permissionOverriddenFrom}" was overridden to "${result.permission}"; restrictive permissions are switched off in this plugin so a dispatched Session cannot stall on an approval. Set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one.`;
         const permissionNote = result.permissionNote === undefined ? "" : `NOTE: ${result.permissionNote}`;
         const modelNote = result.modelNote === undefined ? "" : `NOTE: ${result.modelNote}`;
@@ -1367,6 +1414,7 @@ function apply(ctx) {
           ...overrideNote === "" ? [] : [overrideNote],
           ...permissionNote === "" ? [] : [permissionNote],
           ...modelNote === "" ? [] : [modelNote],
+          ...returnToNote === "" ? [] : [returnToNote],
           "The prompt is queued in the Session.",
           ledgerNote,
           ...deadlineNote === undefined ? [] : [deadlineNote]

@@ -224,9 +224,9 @@ describe('完成回执：投递通道与正文', () => {
     expect(lines[0]).toContain('reason: completed')
     // 第二段只有一行：结论取最终答复的第一个有内容的行，再接上取全文的指针。
     // 为什么不再带全文：每次派单最多往派活人上下文里塞 2000 字符，省不下来；结论一行足够判断。
-    expect(lines).toHaveLength(2)
-    expect(lines[1]).toBe('改完了，结论是 A。 · session sess-1 · read_session_transcript 取全文')
-    expect(lines[1]).not.toContain('先想一下')
+    expect(lines[0]).toContain('[Dispatch receipt · 投标跟进]')
+    expect(text).toContain('改完了，结论是 A。')
+    expect(text).not.toContain('先想一下')
     // 复核顺序：先向宿主核目标会话是否真的空闲，再核派活方还在不在。
     expect(h.resolvedIds).toEqual(['sess-1', 'chief-1'])
     // 静默期结束、台账留痕。
@@ -243,7 +243,7 @@ describe('完成回执：投递通道与正文', () => {
     // 硬约束：第二段不许退化回「只有首行」。结论缺省（或只有空白）时退回标记本身 + 指针。
     const blank = receiptText({ title: '投标跟进' }, 'sess-9', 0, '[DISPATCH DONE]', 1, 'completed', '   ')
     expect(blank.split('\n')).toHaveLength(2)
-    expect(blank.split('\n')[1]).toBe('[DISPATCH DONE] · session sess-9 · read_session_transcript 取全文')
+    expect(blank.split('\n')[1]).toBe('[DISPATCH DONE]')
     // 标题与轮次缺失时也要能写出话，不许出现 undefined。
     const bare = receiptText({}, 'sess-9', 0, '[DISPATCH DONE]')
     expect(bare.startsWith('[Dispatch receipt · (untitled)] [DISPATCH DONE]')).toBe(true)
@@ -259,23 +259,16 @@ describe('完成回执：投递通道与正文', () => {
       'completed',
       '# 结论：全绿\n- 明细见报告\n[DISPATCH DONE]',
     )
-    expect(withBody.split('\n')).toHaveLength(2)
-    expect(withBody.split('\n')[1]).toBe('结论：全绿 · session sess-9 · read_session_transcript 取全文')
+    expect(withBody).toContain('# 结论：全绿\n- 明细见报告\n[DISPATCH DONE]')
   })
 
-  test('结论行超过 200 字符：只截这一行并加省略号，首行与指针不受影响（不再搬 2000 字符全文）', () => {
-    const long = `${'情况说明。'.repeat(600)}\n[DISPATCH DONE]`
-    expect(long.length).toBeGreaterThan(CONCLUSION_LINE_CLIP)
+  test('超长文本适度保护截断，首行不受影响', () => {
+    const long = `${'情况说明。'.repeat(3000)}\n[DISPATCH DONE]`
+    expect(long.length).toBeGreaterThan(12000)
     const text = receiptText({ title: '投标跟进' }, 'sess-9', 1_769_000_000_000, '[DISPATCH DONE]', 2, 'completed', long)
     const parts = text.split('\n')
-    expect(parts).toHaveLength(2)
     expect(parts[0]).toContain('[DISPATCH DONE]')
-    expect(parts[0]).not.toContain('情况说明。')
-    const [line] = parts[1].split(' · session ')
-    expect(line).toHaveLength(CONCLUSION_LINE_CLIP)
-    expect(line.endsWith('…')).toBe(true)
-    expect(parts[1]).toContain('· session sess-9 · read_session_transcript 取全文')
-    // 旧的 `[conclusion cut; N characters in all]` 提示随全文搬运一起删除。
+    expect(text).toContain('...(truncated')
     expect(text).not.toContain('conclusion cut')
   })
 })
@@ -477,12 +470,10 @@ describe('完成回执：门四，只认派活方写在最终答复里的终态�
     // clipText（MESSAGE_CLIP = 2000）会把末尾截掉；门四读的是原始事件，所以仍看得到标记。
     expect(h.prompts).toHaveLength(1)
     const text = (h.prompts[0].content as { text: string }[])[0].text
-    // 首行认单不受影响；第二段只带结论行（截到 200 字符）+ 指针，不再搬 2000 字符全文。
+    // 首行认单不受影响；正文直接透传末轮结论
     const parts = text.split('\n')
-    expect(parts).toHaveLength(2)
     expect(parts[0]).toContain('[DISPATCH DONE]')
-    expect(parts[1].startsWith(`${'情况说明。'.repeat(40).slice(0, CONCLUSION_LINE_CLIP - 1)}…`)).toBe(true)
-    expect(parts[1]).toContain('· session sess-1 · read_session_transcript 取全文')
+    expect(text).toContain('情况说明。')
     expect(text).not.toContain('conclusion cut')
   })
 

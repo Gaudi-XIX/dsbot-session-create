@@ -104,7 +104,7 @@ describe('插件清单', () => {
   test('create_session 参数齐全且必填项正确', () => {
     const { spec } = load()
     expect(spec.name).toBe('create_session')
-    expect(Object.keys(spec.parameters).sort()).toEqual(['folder', 'model', 'permission', 'preset', 'prompt', 'title', 'workspace'])
+    expect(Object.keys(spec.parameters).sort()).toEqual(['folder', 'model', 'permission', 'preset', 'prompt', 'return_to', 'title', 'workspace'])
     expect(spec.parameters.title.required).toBe(true)
     expect(spec.parameters.prompt.required).toBe(true)
     expect(spec.parameters.workspace.required).toBeUndefined()
