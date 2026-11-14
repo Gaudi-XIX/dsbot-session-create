@@ -141,8 +141,16 @@ function fakeCtx(options: {
       },
     },
     workspaceRegistry: {
-      get: (id: string) => options.workspaces?.[id],
-      resolveByPath: (path: string) => options.paths?.[path],
+      get: (id: string) => {
+        const entry = options.workspaces?.[id]
+        if (!entry) return undefined
+        return { id, path: entry.path ?? `F:\\workspaces\\${id}`, title: entry.title ?? id, ...entry }
+      },
+      resolveByPath: (path: string) => {
+        const entry = options.paths?.[path]
+        if (!entry) return undefined
+        return { path, id: entry.id ?? 'ws-path', title: entry.title ?? 'ws-title', ...entry }
+      },
       async archiveSession(id: string, o: unknown) {
         calls.archive.push([id, o])
         if (options.archiveThrows) throw options.archiveThrows
@@ -240,7 +248,8 @@ describe('服务获取（ctx.get 宽容路径 · 不写 inject 硬声明）', ()
     const host = resolveServices(ctx)
     expect(preflight(host)).toEqual([])
     const result = await createSessionIn(host, { title: 't', prompt: 'p', workspace: 'w' })
-    expect(calls.create).toEqual([{ workspaceId: 'w' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\w', agentPreset: 'standard' }])
+    expect(calls.create[0]).not.toHaveProperty('workspaceId')
     expect(result.sessionId).toBe('sess-1')
   })
 
@@ -292,7 +301,7 @@ describe('folder 落位', () => {
     try {
       const { ctx, calls } = fakeCtx()
       const result = await createSessionIn(ctx, { title: '工作线', prompt: '干活', folder: dir })
-      expect(calls.create).toEqual([{ cwd: dir }])
+      expect(calls.create).toEqual([{ cwd: dir, agentPreset: 'standard' }])
       expect(calls.rename).toHaveLength(1)
       expect(calls.rename[0][1]).toBe('工作线')
       expect(calls.prompt).toHaveLength(1)
@@ -371,14 +380,16 @@ describe('workspace 落位', () => {
   test('按 id 命中 → workspaceId 落位', async () => {
     const { ctx, calls } = fakeCtx({ workspaces: { 'ws-1': { id: 'ws-1', title: '投标' } } })
     const result = await createSessionIn(ctx, { title: 't', prompt: 'p', workspace: 'ws-1' })
-    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\ws-1', agentPreset: 'standard' }])
+    expect(calls.create[0]).not.toHaveProperty('workspaceId')
     expect(result.placement).toContain('投标')
   })
 
   test('按路径命中（id 未命中时回退 resolveByPath）', async () => {
     const { ctx, calls } = fakeCtx({ paths: { 'F:\\proj': { id: 'ws-9', title: 'proj' } } })
     await createSessionIn(ctx, { title: 't', prompt: 'p', workspace: 'F:\\proj' })
-    expect(calls.create).toEqual([{ workspaceId: 'ws-9' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\proj', agentPreset: 'standard' }])
+    expect(calls.create[0]).not.toHaveProperty('workspaceId')
   })
 
   test('workspace 认不出 → 报错，不回落默认工作区', async () => {

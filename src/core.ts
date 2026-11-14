@@ -368,12 +368,11 @@ export async function resolvePlacement(ctx: HostCtx, folder?: string, workspace?
   if (!found) {
     throw new SessionCreateError('workspace-unknown', `no DSH workspace matches "${wanted}"; no Session was made.`)
   }
-  const id = found.id ?? (direct === undefined ? undefined : wanted)
-  if (typeof id !== 'string' || id === '') {
-    // 不能拿「路径」当 workspaceId 传下去：ds-bot 对未知 id 的处置正是静默换到团队工作区。
-    throw new SessionCreateError('workspace-unknown', `the DSH workspace matched "${wanted}" but gave no id; no Session was made.`)
+  const targetPath = found.path
+  if (typeof targetPath !== 'string' || targetPath === '') {
+    throw new SessionCreateError('workspace-unknown', `the DSH workspace matched "${wanted}" but gave no path; no Session was made.`)
   }
-  return { placement: { workspaceId: id }, text: `workspace ${found.title ?? id}` }
+  return { placement: { cwd: targetPath }, text: `workspace ${found.title ?? found.id ?? wanted}` }
 }
 
 // 归档是尽力而为，但**结果必须如实回报**：失败时不能对外说「已归档」。
@@ -618,6 +617,7 @@ export async function createSessionIn(
   // preset 在建会话之前就要定好：它写进会话 header，会话一开跑就不能再换。
   // 名字错、预设坏了都在这拦下，不建会话（比建完再归档干净）。
   const preset = options.preset === undefined ? undefined : await resolvePreset(ctx, options.preset)
+  const effectivePreset = preset ?? 'standard'
   // 权限那一路缺服务也在建会话之前拦下：check 在 applyPermission 里也有，但那时会话已经建了，
   // 只能建完再归档，白留一个空会话。
   if (options.permission !== undefined && typeof ctx.commands?.execute !== 'function') {
@@ -645,7 +645,7 @@ export async function createSessionIn(
       `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? '' : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`,
     )
   }
-  const created = await controller.create?.({ ...placement, ...(preset === undefined ? {} : { agentPreset: preset }) })
+  const created = await controller.create?.({ ...placement, agentPreset: effectivePreset })
   const sessionId = created?.sessionId
   if (typeof sessionId !== 'string' || sessionId === '') {
     throw new SessionCreateError('no-session-id', 'the host returned no session id; nothing was written.')
@@ -700,7 +700,7 @@ export async function createSessionIn(
         placement: text,
         promptHead: headOf(prompt, 200),
         failure,
-        ...(preset === undefined ? {} : { preset }),
+        ...(effectivePreset === 'standard' && options.preset === undefined ? {} : { preset: effectivePreset }),
         ...(options.permission === undefined ? {} : { permission: options.permission }),
         ...(options.permissionOverriddenFrom === undefined
           ? {}

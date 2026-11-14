@@ -178,11 +178,11 @@ async function resolvePlacement(ctx, folder, workspace) {
   if (!found) {
     throw new SessionCreateError("workspace-unknown", `no DSH workspace matches "${wanted}"; no Session was made.`);
   }
-  const id = found.id ?? (direct === undefined ? undefined : wanted);
-  if (typeof id !== "string" || id === "") {
-    throw new SessionCreateError("workspace-unknown", `the DSH workspace matched "${wanted}" but gave no id; no Session was made.`);
+  const targetPath = found.path;
+  if (typeof targetPath !== "string" || targetPath === "") {
+    throw new SessionCreateError("workspace-unknown", `the DSH workspace matched "${wanted}" but gave no path; no Session was made.`);
   }
-  return { placement: { workspaceId: id }, text: `workspace ${found.title ?? id}` };
+  return { placement: { cwd: targetPath }, text: `workspace ${found.title ?? found.id ?? wanted}` };
 }
 async function archiveQuietly(ctx, sessionId) {
   try {
@@ -333,6 +333,7 @@ async function createSessionIn(ctx, args, opts = {}) {
   const options = readOptions(args);
   const permissionNote = resolveDefaultPermission(ctx, options);
   const preset = options.preset === undefined ? undefined : await resolvePreset(ctx, options.preset);
+  const effectivePreset = preset ?? "standard";
   if (options.permission !== undefined && typeof ctx.commands?.execute !== "function") {
     throw new SessionCreateError("host-missing", "this harness has no commands.execute, so `permission` could not be applied. No Session was made.");
   }
@@ -346,7 +347,7 @@ async function createSessionIn(ctx, args, opts = {}) {
   if (pinned === undefined) {
     throw new SessionCreateError("dispatcher-model-unknown", `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? "" : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`);
   }
-  const created = await controller.create?.({ ...placement, ...preset === undefined ? {} : { agentPreset: preset } });
+  const created = await controller.create?.({ ...placement, agentPreset: effectivePreset });
   const sessionId = created?.sessionId;
   if (typeof sessionId !== "string" || sessionId === "") {
     throw new SessionCreateError("no-session-id", "the host returned no session id; nothing was written.");
@@ -392,7 +393,7 @@ async function createSessionIn(ctx, args, opts = {}) {
         placement: text,
         promptHead: headOf(prompt, 200),
         failure,
-        ...preset === undefined ? {} : { preset },
+        ...effectivePreset === "standard" && options.preset === undefined ? {} : { preset: effectivePreset },
         ...options.permission === undefined ? {} : { permission: options.permission },
         ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom },
         ...targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId },
