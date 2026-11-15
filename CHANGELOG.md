@@ -2,6 +2,17 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.11.0 · 2026-11-15
+
+**行为变更：不传 `preset` 时兜底 `standard`；`workspace` 落位由 `workspaceId` 收敛为物理路径 `cwd`，新会话一律进未分组**
+
+- **成因**：两处都来自 2026-11-15 pocket client 收口。① 宿主全局默认预设 `ops-ptc` 拦截直接工具调用并强制 `run_code`，而 `dsh-agy-cli` 只暴露直接工具、没注册 `run_code`；调用方不显式传 `preset` 时 `create` 不带 `agentPreset`，子会话继承全局默认后工具塌缩死锁。兜底 `standard` 是根治，不是绕开。② `resolvePlacement` 的 `workspace` 分支原返回 `{ workspaceId: id }`，会话挂进对应 DSH 工作区、出现在用户项目里，主会话列表膨胀并触发 Pocket 预读；收敛成 `cwd` 后新会话全落未分组。
+- **改动**：`src/core.ts:617` 新增 `const effectivePreset = preset ?? 'standard'`，`src/core.ts:645` 改为 `controller.create?.({ ...placement, agentPreset: effectivePreset })`；台账 `preset` 字段同步为「未显式传且兜底为 standard 时不写」。`src/core.ts:355-378` 的 `resolvePlacement` 在 workspace 分支改取 `found.path` 为 `targetPath`、校验其为非空 `string`，返回 `{ placement: { cwd: targetPath }, text: ... }`，彻底剥离 `workspaceId`；找不到、或命中项没给 path，仍抛 `workspace-unknown`。测试侧：`test/core.test.ts` 落位断言由 `workspaceId` 改为 `cwd` + `not.toHaveProperty('workspaceId')`，缺省派单断言 `agentPreset: 'standard'`；`fakeCtx` 的 `workspaceRegistry.get` / `resolveByPath` mock 补齐 `path`；`test/notify.test.ts`、`test/plugin.test.ts`、`test/read.test.ts` 的 workspace mock 与断言同步（1958bbc / e7e3462 / 06d0d31 / 163f74a）。`index.js` 是生成产物，重建后与源码一致。
+- **边界**：模型钉死、权限档、回执门一~门四、终态标记、`return_to`、`session_message`、autoresume、台账追加式读写一律不动。**已知遗留（本单未改，发版定稿已如实标注）**：`README.md:49-54`「两者的区别」仍按 `workspaceId` 落位描述，`README.md:21` 仍写 `create({ cwd | workspaceId })`，`README.md:43` 的 `preset` 行未提缺省兜底；`test/core.test.ts:380`、`:401`、`:496` 三条测试名仍写旧行为，断言已对齐。这些属实现方文档与命名同步，不在发版单内。
+- **测试实测读数**（2026-11-15 东八区，本地独立复跑）：`bun test` = 212 pass / 0 fail / 766 expect() calls / 212 tests across 5 files [526.00ms；改动后复跑 539.00ms，两次 TEST_EXIT=0]；`bun run build`（bun 1.3.13 bf2e2cec）重建 `index.js` 74.31 KB，sha256 `2359443ea977486ea64570aed2a5137da80b7c38a6e66f5254d5acc1f1717c5b`，与 HEAD 逐字一致、CR 计数 0；`npm pack --dry-run` 载荷 5 文件，无本机绝对路径与凭据。本包没有 `typecheck` 脚本、本机 PATH 无 `tsc`，未做静态类型检查，以 build + 全量测试替代。**未验**：真机端到端（宿主重启装载 0.11.0 后新派一单，验「未分组落位 + standard 兜底生效」）按红线不重启宿主，留作装载后首验。
+
+**发布口径**：npm registry 此前最新为 0.6.0（2026-11-03）；本文件 0.7.0–0.10.1 六条都是本地条目、从未推到 npm。0.11.0 是 0.6.0 之后首个 npm 版本，一次带出这期间的全部代码改动。版本号按本仓库惯例升 minor（行为变更），没有选 patch 0.10.2。
+
 ## 0.10.1 · 2026-11-11
 
 **修复：被派会话跑完写出结论、派活窗口却静默收不到回执（终态标记要求没送到被派会话）**
