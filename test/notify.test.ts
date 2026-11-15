@@ -810,7 +810,7 @@ describe('完成回执：接线', () => {
       },
       sessionTitle: { async rename() {} },
       workspaceRegistry: {
-        get: () => ({ id: 'ws-1', title: '投标' }),
+        get: () => ({ id: 'ws-1', title: '投标', path: 'F:\\workspaces\\ws-1' }),
         async archiveSession() {},
       },
     }

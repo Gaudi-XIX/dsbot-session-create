@@ -226,7 +226,7 @@ describe('端到端（构建产物）', () => {
       },
       sessionTitle: { async rename() { return undefined } },
       workspaceRegistry: {
-        get: (id: string) => ({ id, title: 'w' }),
+        get: (id: string) => ({ id, title: 'w', path: 'F:\\workspaces\\w' }),
         resolveByPath: () => undefined,
         async archiveSession(id: string, o: unknown) { archived.push([id, o]) },
       },
