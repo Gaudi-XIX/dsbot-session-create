@@ -58,7 +58,7 @@ function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: bool
     sessionTitle: { async rename(session: unknown, title: string) { calls.rename.push([session, title]) } },
     commands: { async execute(_agent: unknown, _line: string) { return { result: { kind: 'success' } } } },
     workspaceRegistry: {
-      get: (id: string) => (id === 'ws-1' ? { id: 'ws-1', title: '投标' } : undefined),
+      get: (id: string) => (id === 'ws-1' ? { id: 'ws-1', title: '投标', path: 'F:\\workspaces\\ws-1' } : undefined),
       resolveByPath: () => undefined,
       async archiveSession(id: string, o: unknown) { calls.archive.push([id, o]) },
     },
@@ -118,7 +118,7 @@ describe('端到端（构建产物）', () => {
     try {
       const { spec, calls } = load()
       const text = await spec.execute({ title: '投标跟进', prompt: '把 XX 做完', folder: dir })
-      expect(calls.create).toEqual([{ cwd: dir }])
+      expect(calls.create).toEqual([{ cwd: dir, agentPreset: 'standard' }])
       expect(calls.rename[0][1]).toBe('投标跟进')
       expect(calls.prompt[0]).toMatchObject({ sessionId: 'sess-9', mode: 'queue' })
       expect(text).toContain('sess-9')
@@ -148,7 +148,7 @@ describe('端到端（构建产物）', () => {
   test('workspace 落位', async () => {
     const { spec, calls } = load()
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1' })
-    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\ws-1', agentPreset: 'standard' }])
     expect(text).toContain('投标')
   })
 
@@ -157,13 +157,13 @@ describe('端到端（构建产物）', () => {
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1', permission: 'workspace-write' })
     expect(text).toContain('permission danger-full-access')
     expect(text).toContain('"workspace-write" was overridden to "danger-full-access"')
-    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\ws-1', agentPreset: 'standard' }])
   })
 
   test('服务只挂 ctx.get 时照样注册并跑通（真实第三方插件形态）', async () => {
     const { spec, calls } = load({ viaGetOnly: true })
     const text = await spec.execute({ title: 't', prompt: 'p', workspace: 'ws-1' })
-    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\ws-1', agentPreset: 'standard' }])
     expect(calls.prompt).toHaveLength(1)
     expect(text).toContain('sess-9')
   })
@@ -180,7 +180,7 @@ describe('端到端（构建产物）', () => {
       },
       sessionTitle: { async rename() { return undefined } },
       workspaceRegistry: {
-        get: (id: string) => (id === 'ws-1' ? { id: 'ws-1', title: '投标' } : undefined),
+        get: (id: string) => (id === 'ws-1' ? { id: 'ws-1', title: '投标', path: 'F:\\workspaces\\ws-1' } : undefined),
         resolveByPath: () => undefined,
         async archiveSession(id: string, o: unknown) { calls.archive.push([id, o]) },
       },
@@ -194,7 +194,7 @@ describe('端到端（构建产物）', () => {
     apply(ctx as never)
     ready = true
     const text = await (tools.get('create_session') as Spec).execute({ title: 't', prompt: 'p', workspace: 'ws-1' }, DISPATCHER_EXEC)
-    expect(calls.create).toEqual([{ workspaceId: 'ws-1' }])
+    expect(calls.create).toEqual([{ cwd: 'F:\\workspaces\\ws-1', agentPreset: 'standard' }])
     expect(calls.prompt).toHaveLength(1)
     expect(text).toContain('sess-late')
   })

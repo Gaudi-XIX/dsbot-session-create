@@ -149,7 +149,7 @@ function fakeCtx(options: {
       resolveByPath: (path: string) => {
         const entry = options.paths?.[path]
         if (!entry) return undefined
-        return { path, id: entry.id ?? 'ws-path', title: entry.title ?? 'ws-title', ...entry }
+        return { id: entry.id ?? 'ws-path', title: entry.title ?? 'ws-title', ...entry }
       },
       async archiveSession(id: string, o: unknown) {
         calls.archive.push([id, o])
@@ -386,7 +386,7 @@ describe('workspace 落位', () => {
   })
 
   test('按路径命中（id 未命中时回退 resolveByPath）', async () => {
-    const { ctx, calls } = fakeCtx({ paths: { 'F:\\proj': { id: 'ws-9', title: 'proj' } } })
+    const { ctx, calls } = fakeCtx({ paths: { 'F:\\proj': { id: 'ws-9', title: 'proj', path: 'F:\\proj' } } })
     await createSessionIn(ctx, { title: 't', prompt: 'p', workspace: 'F:\\proj' })
     expect(calls.create).toEqual([{ cwd: 'F:\\proj', agentPreset: 'standard' }])
     expect(calls.create[0]).not.toHaveProperty('workspaceId')
@@ -500,7 +500,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     // 缺省档＝全权限（2026-11-03 定）：不再看名单里有没有 auto，也不再碰审批策略。
     expect(calls.command.map(c => c[1])).toEqual(['/permission danger-full-access'])
     expect(calls.approval).toHaveLength(0)
-    expect(calls.create[0].agentPreset).toBeUndefined()
+    expect(calls.create[0].agentPreset).toBe('standard')
     expect(result.preset).toBeUndefined()
     expect(result.permission).toBe('danger-full-access')
     expect(result.approvalPolicy).toBeUndefined()
@@ -510,7 +510,7 @@ describe('会话选项：agent preset 与权限模式', () => {
   test('preset 走 create 的 agentPreset 字段，且先查过宿主有没有这个预设', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc' })
-    expect(calls.create[0]).toMatchObject({ workspaceId: 'w', agentPreset: 'ptc' })
+    expect(calls.create[0]).toMatchObject({ cwd: 'F:\\workspaces\\w', agentPreset: 'ptc' })
     expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'prompt'])
     expect(result.preset).toBe('ptc')
   })
