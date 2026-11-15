@@ -256,7 +256,7 @@ describe('台账', () => {
         async resolveAgent() { return { agent: { session: { seq: 0, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) } } } },
       }
       services.sessionTitle = { async rename() { return undefined } }
-      services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w' }), async archiveSession() { return undefined } }
+      services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w', path: 'F:\\workspaces\\w' }), async archiveSession() { return undefined } }
       const result = await createSessionIn(services, { title: '派送一单', prompt: '把结果写出来', workspace: 'w' }, { ledger, signal: new AbortController().signal, dispatcherSessionId: 'session-bot-1' })
       expect(result.sessionId).toBe('sess-77')
       expect(result.ledgerError).toBeUndefined()
@@ -278,7 +278,7 @@ describe('台账', () => {
       async resolveAgent() { return { agent: { session: { seq: 0, requestHeader: () => ({ config: { provider: 'magpie-gateway', model: 'group/pool' } }) } } } },
     }
     services.sessionTitle = { async rename() { return undefined } }
-    services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w' }), async archiveSession() { return undefined } }
+    services.workspaceRegistry = { get: (id: string) => ({ id, title: 'w', path: 'F:\\workspaces\\w' }), async archiveSession() { return undefined } }
     const dir = await tempDir()
     try {
       // 把台账路径指到一个「父级是文件」的位置，mkdir 必失败。
