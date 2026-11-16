@@ -4,13 +4,13 @@
 
 ## 0.11.1 · 2026-11-16
 
-**文档补正：README 的 `workspace` 落位说明与实现对齐（未分组二等会话）**
+**文档补正：README 的 `workspace` 落位说明与 `preset` 缺省兜底说明与实现对齐；README 行尾恢复 LF**
 
-- **成因**：0.11.0 把 `resolvePlacement` 的 `workspace` 分支由 `{ workspaceId: id }` 收敛为 `{ cwd: found.path }`（行为变更），README 仍按旧实现写「会话挂在那个工作区下，会出现在用户的对应项目里」。0.11.0 的 CHANGELOG 已把它列为已知遗留；2026-11-15 外部用户 `Cppbq` 在 `Gaudi-XIX/dsbot-session-create#1` 报告同一现象（新会话不进工作区分组、`~/.dsh/storages/workspace.json` 的 `sessionIds` 不变），该 issue 已回复并关闭。
-- **改动**：`README.md:51` 的 `workspace` 一条改为「会话使用目标工作区路径进行解析（按工作区标识），解析后与 folder 一样创建未分组（二等）会话，不加入任何 DSH 工作区项目列表」。**仅此一行**，无源码、无行为改动。
-- **边界**：`src/` 与 `index.js` 逐字未动（重建后 `index.js` sha256 `2359443ea977486ea64570aed2a5137da80b7c38a6e66f5254d5acc1f1717c5b`，与 0.11.0 一致）；`package.json` 只改 `version`。
-- **测试实测读数**（2026-11-16 东八区，本地独立复跑）：`bun test` = 212 pass / 0 fail / 766 expect() calls / 212 tests across 5 files [462.00ms，TEST_EXIT=0]；`bun run build`（bun 1.3.13）重建 `index.js` 与 HEAD 逐字一致。
-- **已知遗留（本单未改）**：`README.md:43` 的 `preset` 行仍未提「不传时兜底 `standard`」，与落位说明同属 0.11.0 标注的遗留；`test/core.test.ts:380`、`:401`、`:496` 三条测试名仍写旧落位行为（断言已对齐）。
+- **成因**：0.11.0 把 `resolvePlacement` 的 `workspace` 分支由 `{ workspaceId: id }` 收敛为 `{ cwd: found.path }`、新增 `preset` 缺省兜底 `standard`（均为行为变更），README 仍按旧实现写「会话挂在那个工作区下，会出现在用户的对应项目里」、`preset` 行未提缺省兜底。0.11.0 的 CHANGELOG 已把两处列为已知遗留；2026-11-15 外部用户 `Cppbq` 在 `Gaudi-XIX/dsbot-session-create#1` 报告落位漂移同一现象（新会话不进工作区分组、`~/.dsh/storages/workspace.json` 的 `sessionIds` 不变），该 issue 已回复并关闭。另：补正落位说明的提交 `2d0882d` 把 `README.md` 行尾由 LF 误翻为 CRLF（279 行全量 CR），本单一并恢复。
+- **改动**：① `README.md:51` 的 `workspace` 一条改为「会话使用目标工作区路径进行解析（按工作区标识），解析后与 folder 一样创建未分组（二等）会话，不加入任何 DSH 工作区项目列表」（`2d0882d`）；② `README.md:43` 的 `preset` 行补「不传时兜底 `standard`（`src/core.ts:619`）」；③ `README.md` 行尾 CRLF→LF 恢复（与仓库其余文件一致；本仓无 `.gitattributes`、无 autocrlf 设置）。仅文档，无源码、无行为改动。
+- **边界**：`src/` 与 `index.js` 逐字未动（重建后 `index.js` sha256 `2359443ea977486ea64570aed2a5137da80b7c38a6e66f5254d5acc1f1717c5b`，与 0.11.0 一致，CR 计数 0）；`package.json` 只改 `version`。
+- **测试实测读数**（2026-11-16 东八区，本地独立复跑）：`bun test` = 212 pass / 0 fail / 766 expect() calls / 212 tests across 5 files [502.00ms，退出码 0]；`bun run build`（bun 1.3.13）重建 `index.js` 与 0.11.0 逐字一致；`npm pack --dry-run` 载荷 5 文件 39.8 kB / unpacked 125.7 kB，shasum `939ddef163cebeee95024fe5f6c4aaf8ce4ab6f2`。
+- **已知遗留（本单未改）**：`test/core.test.ts:380`、`:401`、`:496` 三条测试名仍写旧落位行为（断言已对齐）。
 
 ## 0.11.0 · 2026-11-15
 
