@@ -40,7 +40,7 @@ list_dispatched_sessions(limit?, all?)
 | `prompt` | 是 | 投进新会话的那段话（排队投放，`mode: 'queue'`） |
 | `workspace` | 二选一 | 工作区 id，或它的完整文件夹路径 |
 | `folder` | 二选一 | 任意一个存在的文件夹的完整路径 |
-| `preset` | 否 | agent 预设（`standard` / `minimal` / `ptc` / `creator`），不传时兜底 `standard`（`src/core.ts:619`）；建会话时写进 header，开跑后不能换；名字错就整单不建 |
+| `preset` | 否 | agent 预设（`standard` / `minimal` / `ptc` / `creator`），不传时兜底 `standard`（`src/core.ts:620`）；建会话时写进 header，开跑后不能换；名字错就整单不建 |
 | `permission` | 否 | 权限档，见下面「权限档」 |
 | `model` | 否 | 写成 `provider/model`；不写就与派活的那个 Bot 一致 |
 
