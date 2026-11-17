@@ -160,6 +160,8 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 - **还在等自己派的活就不算收口**：台账里 `dispatcherSessionId` 指向它、宿主又报着没停的子会话，说明它是在等它们（`firstBusyChild`，门三）。等的时候不投；子会话停下、它被叫醒再跑一轮、这一轮没有在跑的子会话，才投。
 - **无标记一律不投**：既包括「这一轮干完了、还在等自己派出去的活」，也包括「忘了写标记」；正文中间引用标记同样不算（只认末尾）。另外，`page` 不在宿主服务面、`page` 抛错或超时、拿不到 `seq`、末条 `assistant` 正文为空——都发声一行日志后**不投**。宁可漏一条，也不投一条假回执。
 
+- **派活方已读过终态就不再重投**：投回执前先比对台账里这一单的 `lastReadSeq`（派活方上次读到的事件序号）与子会话终态位置（headSeq）。若派活方在子会话运行期间已主动调用 `read_session_transcript` 读到了终态（`lastReadSeq >= headSeq`），说明它已经看到结论，插件随即跳过这一次重复回执、不再往派活方队列塞旁路通知，并记下 `notifiedAt` 收口——堵住「先手动读到结论、稍后又收一遍回执」的双重事故。只有读到终态位置才算数，只读到中间过程仍照常投递。
+
 回执走 `queue` 不走 `steer`：它是给派活人的旁路通报，排到下一轮，不去打断他手头正在跑的那一轮。
 
 #### 一次性 deadline 兜底
@@ -238,7 +240,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 ```bash
 bun run build   # src/*.ts → index.js（@deepseek-ai/dsh-tools 保持 external）
-bun test        # 190 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
+bun test        # 214 个测试、5 个文件；plugin.test.ts 测的是构建产物，跑前先 build
 ```
 
 类型检查（本仓不带 `typescript` 与 `@types/node` 依赖，用现成的那份就行）：

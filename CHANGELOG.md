@@ -9,6 +9,7 @@
 - **成因**：派活方在子会话运行或收工等待期间若手动调用 `read_session_transcript` 读回了终态结论，后续完成回执（`deliver`）仍会往派活方队列塞入旁路回执，导致下一轮次派活方重复接收已读结论（双重事故）。
 - **改动**：`src/core.ts:deliver` 在核验终态标记后新增 seq 比对；若 `typeof record.lastReadSeq === 'number'` 且 `record.lastReadSeq >= targetHeadSeq`，则向内存集合置 `notified.add(sessionId)` 并追加台账 `markNotified`，抑制重复 prompt 投递并打印日志。`test/notify.test.ts` 补齐已读免推与未读正常投递两条单元测试。
 - **实测读数**：`bun test` = 214 pass / 0 fail / 771 expect() calls across 5 files [退出码 0]；`bun run build` 重建 `index.js` 75.00 KB。
+- **文档同步（发布前补正）**：`README.md` 的「派完自动回执」节补「派活方已读过终态就不再重投」的机制说明（`lastReadSeq >= headSeq` 即跳过本次回执并记 `notifiedAt`）；「开发」节 `bun test` 示例数由 190 更正为 214。`package.json` 的 `description`（四工具定位）与 `keywords` 复核后与现役能力一致，未改。
 
 ## 0.11.1 · 2026-11-16
 
