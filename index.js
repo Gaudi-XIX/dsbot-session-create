@@ -951,6 +951,18 @@ function createDispatchNotifier(deps = {}) {
       log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(" / ")}).`);
       return;
     }
+    const targetSeq = Number(resolved?.agent?.session?.seq);
+    const targetHeadSeq = Number.isFinite(targetSeq) ? Math.max(0, targetSeq - 1) : undefined;
+    if (typeof record.lastReadSeq === "number" && targetHeadSeq !== undefined && record.lastReadSeq >= targetHeadSeq) {
+      notified.add(sessionId);
+      try {
+        await markNotified(ledgerPath, sessionId, now());
+      } catch (error) {
+        log(`the receipt for ${sessionId} was suppressed (already read), but the ledger could not record notifiedAt (${reasonOf(error)}).`);
+      }
+      log(`${sessionId} completed, but its transcript was already read (lastReadSeq=${record.lastReadSeq} >= headSeq=${targetHeadSeq}); receipt suppressed.`);
+      return;
+    }
     let target = await resolveQuietly(controller, dispatcher);
     if ((target === undefined || target.error !== undefined || target.agent === undefined) && record.returnTo) {
       try {

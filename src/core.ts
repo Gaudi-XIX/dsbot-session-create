@@ -1645,6 +1645,20 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(' / ')}).`)
       return
     }
+    // 终态已读免推：派活方若在等待期间已读过转录（台账 lastReadSeq >= 终态 headSeq），
+    // 说明结论已被派活方拿到，不再往派活方队列里重复塞回执（防提前读后延后重推的双重事故）。
+    const targetSeq = Number(resolved?.agent?.session?.seq)
+    const targetHeadSeq = Number.isFinite(targetSeq) ? Math.max(0, targetSeq - 1) : undefined
+    if (typeof record.lastReadSeq === 'number' && targetHeadSeq !== undefined && record.lastReadSeq >= targetHeadSeq) {
+      notified.add(sessionId)
+      try {
+        await markNotified(ledgerPath, sessionId, now())
+      } catch (error) {
+        log(`the receipt for ${sessionId} was suppressed (already read), but the ledger could not record notifiedAt (${reasonOf(error)}).`)
+      }
+      log(`${sessionId} completed, but its transcript was already read (lastReadSeq=${record.lastReadSeq} >= headSeq=${targetHeadSeq}); receipt suppressed.`)
+      return
+    }
     // 派活方会话已销毁（被关掉/归档）：没地方投，跳过 —— 这不是错误。
     let target = await resolveQuietly(controller, dispatcher)
     if ((target === undefined || target.error !== undefined || target.agent === undefined) && record.returnTo) {

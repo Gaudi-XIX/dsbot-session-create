@@ -662,6 +662,36 @@ describe('完成回执：防刷屏', () => {
     expect(h.prompts).toHaveLength(1)
   })
 
+  test('终态已读免推：派活方若在等待期间已读过终态（lastReadSeq >= headSeq）→ 跳过投递，不塞 prompt，且记 notifiedAt', async () => {
+    const h = harness('already-read-suppressed', { seq: 11 })
+    // headSeq 是 seq - 1 = 10，台账已读到 10
+    await seed(h.ledgerPath, { lastReadSeq: 10 })
+    await endTurn(h.notifier, 1)
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+
+    // 没有往派活方塞 prompt
+    expect(h.prompts).toHaveLength(0)
+    // 日志明确说明被抑制
+    expect(h.logs.some(line => line.includes('receipt suppressed') && line.includes('lastReadSeq=10'))).toBe(true)
+    // 台账已记上 notifiedAt
+    const records = await readLedger(h.ledgerPath)
+    expect(typeof records[0]?.notifiedAt).toBe('number')
+  })
+
+  test('终态已读免推：派活方只读到中间状态（lastReadSeq < headSeq）→ 仍正常投递回执', async () => {
+    const h = harness('unread-delivered', { seq: 11 })
+    // headSeq 是 seq - 1 = 10，台账只读到 9（落后于终态）
+    await seed(h.ledgerPath, { lastReadSeq: 9 })
+    await endTurn(h.notifier, 1)
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+
+    // 正常投递回执
+    expect(h.prompts).toHaveLength(1)
+    expect(h.prompts[0].sessionId).toBe('chief-1')
+  })
+
   test('新一轮跑完可以再投一条（turn/start 清掉「已投过」）', async () => {
     const h = harness('next-turn')
     await seed(h.ledgerPath)

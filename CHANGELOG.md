@@ -2,6 +2,14 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.11.2 · 2026-11-17
+
+**回执投递优化：派活方若在等待期已读过终态（lastReadSeq >= headSeq），跳过重复回执并记 notifiedAt**
+
+- **成因**：派活方在子会话运行或收工等待期间若手动调用 `read_session_transcript` 读回了终态结论，后续完成回执（`deliver`）仍会往派活方队列塞入旁路回执，导致下一轮次派活方重复接收已读结论（双重事故）。
+- **改动**：`src/core.ts:deliver` 在核验终态标记后新增 seq 比对；若 `typeof record.lastReadSeq === 'number'` 且 `record.lastReadSeq >= targetHeadSeq`，则向内存集合置 `notified.add(sessionId)` 并追加台账 `markNotified`，抑制重复 prompt 投递并打印日志。`test/notify.test.ts` 补齐已读免推与未读正常投递两条单元测试。
+- **实测读数**：`bun test` = 214 pass / 0 fail / 771 expect() calls across 5 files [退出码 0]；`bun run build` 重建 `index.js` 75.00 KB。
+
 ## 0.11.1 · 2026-11-16
 
 **文档补正：README 的 `workspace` 落位说明与 `preset` 缺省兜底说明与实现对齐；README 行尾恢复 LF**
