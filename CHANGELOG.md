@@ -8,8 +8,9 @@
 
 - **成因**：派活方在子会话运行或收工等待期间若手动调用 `read_session_transcript` 读回了终态结论，后续完成回执（`deliver`）仍会往派活方队列塞入旁路回执，导致下一轮次派活方重复接收已读结论（双重事故）。
 - **改动**：`src/core.ts:deliver` 在核验终态标记后新增 seq 比对；若 `typeof record.lastReadSeq === 'number'` 且 `record.lastReadSeq >= targetHeadSeq`，则向内存集合置 `notified.add(sessionId)` 并追加台账 `markNotified`，抑制重复 prompt 投递并打印日志。`test/notify.test.ts` 补齐已读免推与未读正常投递两条单元测试。
-- **实测读数**：`bun test` = 214 pass / 0 fail / 771 expect() calls across 5 files [退出码 0]；`bun run build` 重建 `index.js` 75.00 KB。
+- **实测读数**：`bun test` = 214 pass / 0 fail / 771 expect() calls across 5 files [退出码 0]；`bun run build` 重建 `index.js` 75.22 KB（sha256 `936e8f3579a011ce612b890f701790b9fb7a66d1d77d13bc390edae05b2dcba8`）。
 - **文档同步（发布前补正）**：`README.md` 的「派完自动回执」节补「派活方已读过终态就不再重投」的机制说明（`lastReadSeq >= headSeq` 即跳过本次回执并记 `notifiedAt`）；「开发」节 `bun test` 示例数由 190 更正为 214。`package.json` 的 `description`（四工具定位）与 `keywords` 复核后与现役能力一致，未改。
+- **合并项（外派禁弹窗提示 + 跨 Bot 显式回执去向规则 + 文档）**：`TERMINAL_MARK_INSTRUCTION` 开头新增「严禁调用任何向用户弹出交互卡片或等待输入的工具」一句，并在「这一行只写标记本身」前补「若需拍板，在正文写明理由与选项，末行打 [NEEDS USER]」；`test/core.test.ts:329` 与 `test/plugin.test.ts:134` 两份 `R1_INSTRUCTION` 副本同步，`index.js:22` 重建后逐字一致。规则层并入 `AGENTS.md:23`／`:27` 两条现有条目（只写能力位，不钉工具名，不新增硬判据条目），工具名与参数名落工作区文档 `docs/ops-message-bot-reply-to-and-no-popup.md`（不在本包内）；`README.md`「派完自动回执」节补「提示词层提醒、非硬拦截，模型可以不遵守」。
 
 ## 0.11.1 · 2026-11-16
 

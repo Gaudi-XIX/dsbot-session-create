@@ -19,7 +19,7 @@ var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
-var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
+var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。若需拍板，在正文写明理由与选项，末行打 [NEEDS USER]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
 function withTerminalMarkInstruction(prompt) {
   return `${prompt}
 

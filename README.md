@@ -132,6 +132,8 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`、**它自己派出去的活都已经停下来**，并且**它的最终答复里写了终态标记**，插件才用 `controller.prompt(mode: 'queue')` 投一条回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。终态标记的写法要求由插件在 `create_session` 投递时自动追加到 prompt 末尾（`withTerminalMarkInstruction`），派活人不必自己转述——工具说明只对派活人可见，被派会话看不到。
 
+**这是提示词层面的提醒，不是硬拦截**：投给被派会话的要求段（`TERMINAL_MARK_INSTRUCTION`）开头明确要求它不调用任何向用户弹出交互卡片或等待输入的工具，遇未决事项在答复正文写明理由与选项、末行打 `[NEEDS USER]` 交回派单方。插件并不拦截工具调用，**模型可以不遵守**；要硬拦得由插件注册工具守卫，本版未做。
+
 投不投由**派活方在最终答复里写的标记**决定，插件只认标记：
 
 | 最终答复里的标记 | 回执 | 含义 |
