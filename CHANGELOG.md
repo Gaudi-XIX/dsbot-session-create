@@ -2,6 +2,14 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.11.4 · 2026-11-20
+
+**文案更正：session_message 的 idle 续投不再以终态标记或台账在途为门——idle 一律可续投**
+
+- **成因**：`src/index.ts` 的 `MESSAGE_DESCRIPTION`、`src/core.ts` 的 `messageSessionIn` 注释、`README.md` 的工具要点／硬规则第 3 条／`session_message` 节／失败表，以及 `package.json` 的 `description`，仍写 0.9.0 的「idle 看末尾终态标记 + 台账在途决定 queue 续投或拒投」口径；0.10.0 已解除这道硬拦截，现行 `src/core.ts:1226-1231` 只看宿主状态：`idle` 一律 `mode: 'queue'`，无终态标记门、无台账门。终态标记只表示这一轮要向派活方回一条特定消息，不构成「会话已关闭、不能再续投」的判据。照旧文案调用会误判拒投，也违背「保持插件是纯粹的桥」这条原则。
+- **改动**：`src/index.ts` 的 `MESSAGE_DESCRIPTION` 重写为 running→steer、idle→queue 一律可续投，写明终态标记只管回执；`src/core.ts` 注释同步；`README.md` 三处说明改写、失败表删掉已不存在的 `session-idle` 拒投行，标题下新增 ≤140 字精简版（101 字），新增 `ABOUT.txt` 作第二正本；`test/core.test.ts` 的 describe 标题与注释同步（断言未动）；`package.json` 版本 `0.11.3` → `0.11.4`、`description` 去掉过时的 "no terminal mark" 短语。`index.js` 由 `bun run build` 从 `src/index.ts` 重建，不手改产物。0.10.0 之前的历史条目原样保留。
+- **实测读数**：`bun test` = 214 pass / 0 fail / 774 expect() calls / 214 tests across 5 files [1294.00ms，退出码 0]；`bun run build`（bun 1.3.13）重建 `index.js` 75.37 KB（75,368 字节，sha256 `da00d80a03d9fcdf82ac4ca86f9721092eedad6e8413918aa2eac860760cbf25`），产物内 session_message 的终态标记门命中 0，回执门保留 1 处（`index.js:951`，合法）。
+
 ## 0.11.3 · 2026-11-20
 
 **文案修复：两处派单提示不再教 `after_seconds` 与 `schedule_delete`，改为真实可调通的 rrule 两行 + `schedule_edit` 删除形态**
