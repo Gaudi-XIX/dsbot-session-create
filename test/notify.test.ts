@@ -877,7 +877,7 @@ describe('完成回执：接线', () => {
     }
   })
 
-  test('构建产物：台账够 5 条有效样本时，create_session 的返回里给出 deadline 分钟数与 after_seconds', async () => {
+  test('构建产物：台账够 5 条有效样本时，create_session 的返回里给出 deadline 分钟数与真实可调的调度形态', async () => {
     const ledgerPath = ledgerFor('built-deadline')
     const previous = process.env.DSH_SESSION_CREATE_LEDGER
     try {
@@ -896,8 +896,11 @@ describe('完成回执：接线', () => {
       )
       // p95 = 88 分钟 → ×1.2 = 105.6 → ceil = 106 分钟 = 6360 秒。
       expect(text).toContain('- Suggested one-shot deadline: 106 minutes')
-      expect(text).toContain('schedule_create(after_seconds=6360)')
-      expect(text).toContain('schedule_delete once its terminal receipt arrives')
+      expect(spec.description).toContain('schedule_create, using the minutes this tool returns')
+      expect(text).toContain('RRULE:FREQ=DAILY;COUNT=1')
+      expect(text).toContain('schedule_edit(action="delete", id=<task id>) once its terminal receipt arrives')
+      expect(text).not.toContain('after_seconds')
+      expect(spec.description).not.toContain('after_seconds')
     } finally {
       if (previous === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
       else process.env.DSH_SESSION_CREATE_LEDGER = previous

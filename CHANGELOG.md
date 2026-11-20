@@ -2,6 +2,15 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.11.3 · 2026-11-20
+
+**文案修复：两处派单提示不再教 `after_seconds` 与 `schedule_delete`，改为真实可调通的 rrule 两行 + `schedule_edit` 删除形态**
+
+- **成因**：`src/index.ts:53`（`CREATE_DESCRIPTION` 末条）与 `:220`（`deadlineNote`）教了本机并不存在的调度调用——`schedule_create` 没有 `after_seconds` 参数（只有 `rrule` / `prompt` / `target` / `title`），也不存在 `schedule_delete` 这个工具（删除走 `schedule_edit(action="delete", id=…)`）。派活方照现文案调，第一次调用就因参数不存在而失败，而这条一次性 deadline 正是「回执永远不来」时唯一的兜底，文案指错等于兜底链条在最关键的一步断掉。算法没错，错的是说明书。
+- **改动**：`src/index.ts:53` / `:209` / `:220` 三处同步为真实形态——`rrule` 传两行（首行 `DTSTART;TZID=<IANA 时区>:<YYYYMMDDTHHMMSS>` 取当前本地时间加插件给出的分钟数，次行 `RRULE:FREQ=DAILY;COUNT=1`），删除用 `schedule_edit(action="delete", id=<task id>)`；「一次性、绝不周期巡检」「终态回执到达即删」「数值取自本工具返回」「`standard`/`ptc` 挂载、`minimal` 没有」四条原意逐条保留。`README.md:173` / `:175` 同口径改写（`:182` 只提工具名，复核后不改）；`test/notify.test.ts:880` 测试名与 `:893-903` 断言随新文案改写，并补 `expect(text).not.toContain('after_seconds')` 负向断言。`suggestDeadlineSeconds` 算法、台账读写、回执门一字未动；本文件历史条目里的旧串原样保留（历史记录，不是现役说明书）。
+- **实测读数**：`bun test` = 214 pass / 0 fail / 774 expect() calls / 214 tests across 5 files [578.00ms，退出码 0]；`bun run build`（bun 1.3.13）重建 `index.js` 75.62 KB（75,623 字节，sha256 `bcd88ebddab5e62b5d91933af6ce5ce01a2804545e086793a6e06a11a5c80388`），产物内 `after_seconds` 与 `schedule_delete` 命中数均为 0，`RRULE:FREQ=DAILY;COUNT=1` 命中 2。
+- **文档同步**：`README.md` 的「一次性 deadline 兜底」节两条改为 rrule 两行 + `schedule_edit(action="delete", id=<task id>)`；`package.json` 版本 `0.11.2` → `0.11.3`。
+
 ## 0.11.2 · 2026-11-17
 
 **回执投递优化：派活方若在等待期已读过终态（lastReadSeq >= headSeq），跳过重复回执并记 notifiedAt**

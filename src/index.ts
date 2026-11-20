@@ -50,7 +50,7 @@ const CREATE_DESCRIPTION = [
   'The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.',
   'Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot.',
   'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched". The plugin appends that requirement to the prompt automatically, so you do not need to repeat it; if your prompt already names a specific mark, the Session follows yours.',
-  'After dispatching, arm one one-shot deadline for it with schedule_create(after_seconds=…) using the value this tool returns, and delete it with schedule_delete once its terminal receipt arrives (one-shot only; never a periodic check).',
+  'After dispatching, arm one one-shot deadline for it with schedule_create, using the minutes this tool returns: pass rrule as two lines — DTSTART;TZID=<IANA zone>:<YYYYMMDDTHHMMSS> set to the current local time plus those minutes, then RRULE:FREQ=DAILY;COUNT=1, which fires exactly once (one-shot only; never a periodic check) — and delete it with schedule_edit(action="delete", id=<task id>) once its terminal receipt arrives.',
 ].join(' ') + '\n' + [
   '派会话前先自问三句：',
   '① 要落盘还是回传？落盘就在 prompt 里写死输出路径，只回摘要+路径。',
@@ -206,7 +206,7 @@ export function apply(ctx: HostCtx): void {
           const permissionNote = result.permissionNote === undefined ? '' : `NOTE: ${result.permissionNote}`
           const modelNote = result.modelNote === undefined ? '' : `NOTE: ${result.modelNote}`
           // 一次性 deadline 的建议值（2026-11-03）：插件只算这个数，不碰调度系统 ——
-          // 建与删都由派活方在会话里调 schedule_create / schedule_delete 完成。
+          // 建与删都由派活方在会话里调 schedule_create（rrule 两行、COUNT=1）/ schedule_edit(action="delete") 完成。
           // 口径＝台账近 30 条有效样本派活时长的 p95 × 1.2（core.suggestDeadlineSeconds）。
           let deadlineNote: string | undefined
           if (result.ledgerError === undefined && result.ledgerPath !== undefined) {
@@ -217,7 +217,7 @@ export function apply(ctx: HostCtx): void {
                 deadlineNote = `- No one-shot deadline suggested: only ${deadlineSamples(records).length} completed ledger records carry both timestamps (need 5).`
               } else {
                 const minutes = seconds / 60
-                deadlineNote = `- Suggested one-shot deadline: ${minutes} minutes — if this Session has the schedule tool (standard/ptc presets mount it; minimal does not), call schedule_create(after_seconds=${minutes * 60}) for this dispatch and schedule_delete once its terminal receipt arrives.`
+                deadlineNote = `- Suggested one-shot deadline: ${minutes} minutes — if this Session has the schedule tool (standard/ptc presets mount it; minimal does not), arm it once for this dispatch and delete it with schedule_edit(action="delete", id=<task id>) once its terminal receipt arrives; pass rrule as two lines — DTSTART;TZID=<IANA zone>:<YYYYMMDDTHHMMSS> set to the current local time plus ${minutes} minutes, then RRULE:FREQ=DAILY;COUNT=1 (fires exactly once; never a periodic check).`
               }
             } catch (error) {
               // 台账刚落过一条又读不出来：不新增第三种用户可见文案（同一处失败上面那行

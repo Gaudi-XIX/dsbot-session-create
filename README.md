@@ -170,9 +170,9 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 回执永远不来时，兜底靠**派活方自己建的一次性提醒**，插件只给数值、不碰调度系统（不写 `schedule.json`、不取 `ctx.schedule`、不新增任何常驻定时器）。
 
-- **谁建谁删**：派活方在派单那一轮调 `schedule_create`，收到那一单的终态回执后调 `schedule_delete`。
+- **谁建谁删**：派活方在派单那一轮调 `schedule_create`（`rrule` 传两行，见下条），收到那一单的终态回执后调 `schedule_edit(action="delete", id=<task id>)` 删掉那一单。
 - **数值哪来**：`create_session` 的结果里多一行 `Suggested one-shot deadline: <N> minutes`；算法是台账里**近 30 条**「派送时刻与首次回执时刻都有」的有效样本，取派活时长的 **p95 × 1.2**，线性插值后向上取整到分钟。样本不足 5 条时不出数，改说 `No one-shot deadline suggested: only <k> completed ledger records carry both timestamps (need 5).`
-- **怎么建**：`schedule_create(after_seconds = N × 60)`，`after_seconds` 形态只响一次，没有周期巡检。
+- **怎么建**：`schedule_create` 的 `rrule` 传两行——首行 `DTSTART;TZID=<IANA 时区>:<YYYYMMDDTHHMMSS>` 取当前本地时间加 N 分钟，次行 `RRULE:FREQ=DAILY;COUNT=1`；`COUNT=1` 表示只响一次，没有周期巡检。
 - **前提**：`schedule` 工具由 `standard` / `ptc` 预设挂载，`minimal` 没有——建议行里写明这一点，插件不做检测。
 
 #### 残余四条
