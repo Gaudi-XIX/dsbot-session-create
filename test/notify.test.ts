@@ -18,6 +18,7 @@ import {
   type DispatchRecord,
   type HostCtx,
 } from '../src/core'
+import { RECEIPT_BACKOFF_MS, RECEIPT_MAX_ATTEMPTS, enqueueEntry, readOutbox, receiptIdOf, writeOutbox } from '../src/outbox'
 import { apply as applyBuilt } from '../index.js'
 
 const TMP_ROOT = join(import.meta.dir, '..', '.tmp')
@@ -51,10 +52,17 @@ type Scenario = {
   windowWithoutAssistant?: boolean
   /** resolveAgent 回的 session.seq（缺省 1；给 undefined 造「拿不到 seq」）。 */
   seq?: unknown
+  /** 前 N 次 prompt 被宿主丢掉（造「这一轮投不出去、账上留债」的场面）。 */
+  promptFails?: number
 }
 
 function ledgerFor(name: string): string {
   return join(TMP_ROOT, `notify-${name}.jsonl`)
+}
+
+/** 回执落盘账的落点：与台账同目录（真实环境里跟 DSH_SESSION_CREATE_LEDGER 走，见 design D12）。 */
+function outboxFor(name: string): string {
+  return join(TMP_ROOT, `notify-${name}.outbox.json`)
 }
 
 /** 一条台账记录：默认是本插件派出去、且记着派活人的形态。 */
@@ -131,14 +139,20 @@ function harness(name: string, scenario: Scenario = {}) {
     },
     async prompt(options: Record<string, unknown>) {
       if (scenario.promptThrows === true) throw new Error('the host refused the prompt')
+      if (typeof scenario.promptFails === 'number' && scenario.promptFails > 0) {
+        scenario.promptFails -= 1
+        throw new Error('the host dropped the prompt')
+      }
       prompts.push(options)
       return true
     },
     ...(scenario.pageMissing === true ? {} : { page }),
   }
 
+  const outboxPath = outboxFor(name)
   const notifier = createDispatchNotifier({
     ledger: ledgerPath,
+    outboxPath,
     controllerOf: () => controller as unknown as HostCtx['sessionController'],
     now: () => clock,
     setTimer: (fn, ms) => {
@@ -156,6 +170,7 @@ function harness(name: string, scenario: Scenario = {}) {
 
   return {
     ledgerPath,
+    outboxPath,
     notifier,
     timers,
     prompts,
@@ -174,6 +189,18 @@ async function fire(timer: Timer | undefined): Promise<void> {
   if (timer === undefined) throw new Error('no timer was set')
   if (timer.cancelled) throw new Error('this timer was cancelled')
   await timer.fn()
+}
+
+/**
+ * 记账（capture）在 turn/end 里是 fire-and-forget——宿主事件面没人 await 它。
+ * 断言盘上的账之前，等它真的落地（轮询到条件成立，最多 1 秒）。
+ */
+async function waitFor(check: () => Promise<boolean>, label: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (await check()) return
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  throw new Error(`timed out waiting for ${label}`)
 }
 
 async function endTurn(notifier: ReturnType<typeof harness>['notifier'], turn: number, kind = 'completed'): Promise<void> {
@@ -228,7 +255,9 @@ describe('完成回执：投递通道与正文', () => {
     expect(text).toContain('改完了，结论是 A。')
     expect(text).not.toContain('先想一下')
     // 复核顺序：先向宿主核目标会话是否真的空闲，再核派活方还在不在。
-    expect(h.resolvedIds).toEqual(['sess-1', 'chief-1'])
+    // 2026-11-21 起多一次 sess-1：turn/end 记账（capture）要先取目标会话的 seq 才能算出 receiptId，
+    // 所以目标会话被解析两次（记账一次、投递一次），顺序仍是「目标 → 派活方」。
+    expect(h.resolvedIds).toEqual(['sess-1', 'sess-1', 'chief-1'])
     // 静默期结束、台账留痕。
     expect(h.notifier.pending()).toEqual([])
     expect(typeof (await readLedger(h.ledgerPath))[0].notifiedAt).toBe('number')
@@ -598,6 +627,7 @@ describe('完成回执：只认台账里本插件派出去的会话', () => {
     const prompts: unknown[] = []
     const notifier = createDispatchNotifier({
       ledger: dirAsLedger,
+      outboxPath: outboxFor('dir-as-ledger'),
       controllerOf: () => ({ resolveAgent: async () => ({ agent: { status: 'idle' } }), prompt: async () => true }) as never,
       setTimer: () => ({}),
       clearTimer: () => {},
@@ -645,6 +675,7 @@ describe('完成回执：防刷屏', () => {
     const timers: Timer[] = []
     const second = createDispatchNotifier({
       ledger: h.ledgerPath,
+      outboxPath: h.outboxPath,
       controllerOf: () => h.controller as unknown as HostCtx['sessionController'],
       now: h.clock,
       setTimer: (fn, ms) => {
@@ -746,6 +777,7 @@ describe('完成回执：投不出去的情形都不许抛', () => {
     const timers: Timer[] = []
     const notifier = createDispatchNotifier({
       ledger: ledgerPath,
+      outboxPath: outboxFor('no-controller'),
       controllerOf: () => undefined,
       setTimer: (fn, ms) => {
         const timer: Timer = { ms, fn, cancelled: false }
@@ -758,6 +790,146 @@ describe('完成回执：投不出去的情形都不许抛', () => {
     await endTurn(notifier, 1)
     await fire(timers[0])
     expect(logs.some(line => line.includes('no sessionController.resolveAgent/prompt'))).toBe(true)
+  })
+})
+
+describe('完成回执：落盘与重启补投（receipt outbox）', () => {
+  test('收工即记账：turn/end 当场把一条 pending 写进盘上的收件箱，投出去之后在同一份账上收口成 delivered', async () => {
+    const h = harness('outbox-capture')
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the receipt to be captured')
+    const captured = await readOutbox(h.outboxPath)
+    // 去重键认的是终态消息的 seq（不是 endTime：重启重扫拿不到同一个 endTime）。
+    expect(captured[0].receiptId).toBe('sess-1@10')
+    expect(captured[0].headSeq).toBe(10)
+    expect(captured[0].mark).toBe('[DISPATCH DONE]')
+    expect(captured[0].status).toBe('pending')
+    expect(captured[0].attempts).toBe(0)
+    expect(captured[0].dispatcherSessionId).toBe('chief-1')
+
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+    const after = await readOutbox(h.outboxPath)
+    // 销账是就地更新，不是另记一条。
+    expect(after).toHaveLength(1)
+    expect(after[0].receiptId).toBe('sess-1@10')
+    expect(after[0].status).toBe('delivered')
+    expect(typeof after[0].deliveredAt).toBe('number')
+  })
+
+  test('末条没有终态标记 → 不记账（账上只放「确实欠着、只差送」的那一条）', async () => {
+    const h = harness('outbox-no-mark', { lastText: '改完了，结论是 A。' })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await new Promise(resolve => setTimeout(resolve, 50))
+    expect(await readOutbox(h.outboxPath)).toHaveLength(0)
+    expect(h.logs.some(line => line.includes('nothing was written to the receipt outbox'))).toBe(true)
+  })
+
+  test('投递失败：账上留 pending，按退避排重试；重试再失败累加 attempts、退避升档；成功即销账', async () => {
+    const h = harness('outbox-retry', { promptFails: 2 })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the receipt to be captured')
+
+    // 安静窗口到点：宿主拒收 ⇒ 欠着，排第一档退避（30 秒）。
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+    expect((await readOutbox(h.outboxPath))[0].status).toBe('pending')
+    expect(h.timers).toHaveLength(2)
+    expect(h.timers[1].ms).toBe(RECEIPT_BACKOFF_MS[0])
+
+    // 第一次重试又被拒收 ⇒ attempts 记 1 次，退避升到第二档（60 秒）。
+    await fire(h.timers[1])
+    expect(h.prompts).toHaveLength(0)
+    const bumped = await readOutbox(h.outboxPath)
+    expect(bumped[0].status).toBe('pending')
+    expect(bumped[0].attempts).toBe(1)
+    expect(typeof bumped[0].lastAttemptAt).toBe('number')
+    expect(h.timers).toHaveLength(3)
+    expect(h.timers[2].ms).toBe(RECEIPT_BACKOFF_MS[1])
+
+    // 第三次投出去了 ⇒ 销账，且重试定时器被摘掉（不常驻）。
+    await fire(h.timers[2])
+    expect(h.prompts).toHaveLength(1)
+    const done = await readOutbox(h.outboxPath)
+    expect(done[0].status).toBe('delivered')
+    expect(h.timers).toHaveLength(3)
+  })
+
+  test('派活方已销毁 → 当场弃账（dispatcher-gone），不留着重试', async () => {
+    const h = harness('outbox-dispatcher-gone', { dispatcherGone: true })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the receipt to be captured')
+
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+    const entries = await readOutbox(h.outboxPath)
+    expect(entries[0].status).toBe('abandoned')
+    expect(entries[0].abandonedReason).toBe('dispatcher-gone')
+    // 没有排重试：对已销毁的会话重试只是空转。
+    expect(h.timers).toHaveLength(1)
+  })
+
+  test('重启后补投：新进程内存里什么都没有，reconcile() 照样把上一轮欠的回执投出去', async () => {
+    const h = harness('outbox-restart', { promptFails: 1 })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the receipt to be captured')
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(0)
+
+    // 下一个宿主：同一个台账、同一个收件箱，只有内存是空的（installDispatchNotify 挂完监听就调这一步）。
+    const again = harness('outbox-restart')
+    const report = await again.notifier.reconcile()
+    expect(again.prompts).toHaveLength(1)
+    expect(report.delivered).toBe(1)
+    expect((await readOutbox(h.outboxPath))[0].status).toBe('delivered')
+  })
+
+  test('重试次数用尽 → 弃账（max-attempts），不再排定时器', async () => {
+    const h = harness('outbox-max-attempts')
+    await seed(h.ledgerPath)
+    await writeOutbox(
+      h.outboxPath,
+      enqueueEntry([], {
+        receiptId: receiptIdOf('sess-1', 10),
+        sessionId: 'sess-1',
+        headSeq: 10,
+        dispatcherSessionId: 'chief-1',
+        mark: '[DISPATCH DONE]',
+        endTime: 2_000_000,
+        status: 'pending',
+        attempts: RECEIPT_MAX_ATTEMPTS,
+        createdAt: 2_000_000,
+      }),
+    )
+
+    const report = await h.notifier.reconcile()
+    expect(h.prompts).toHaveLength(0)
+    expect(report.abandoned).toBe(1)
+    const entries = await readOutbox(h.outboxPath)
+    expect(entries[0].status).toBe('abandoned')
+    expect(entries[0].abandonedReason).toBe('max-attempts')
+    expect(h.timers).toHaveLength(0)
+  })
+
+  test('末行写 [NEEDS USER]（兼容别名）→ 照投，回执正文带这个标记', async () => {
+    const h = harness('alias-needs-user', { lastText: '这事要你拍板。\n[NEEDS USER]' })
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the receipt to be captured')
+    expect((await readOutbox(h.outboxPath))[0].mark).toBe('[NEEDS USER]')
+
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[0])
+    expect(h.prompts).toHaveLength(1)
+    expect((h.prompts[0].content as { text: string }[])[0].text).toContain('[NEEDS USER]')
   })
 })
 
@@ -778,6 +950,10 @@ describe('完成回执：接线', () => {
 
   test('installDispatchNotify：挂上 session/event，到点真的投一条（真定时器，窗口压到 1ms）', async () => {
     const ledgerPath = ledgerFor('installed')
+    const previousOutbox = process.env.DSH_SESSION_CREATE_OUTBOX
+    // 挂监听即补投一次盘上欠账（installDispatchNotify 里那次 reconcile）——指到本用例自己的账上，
+    // 免得读到别人留下的收件箱。
+    process.env.DSH_SESSION_CREATE_OUTBOX = outboxFor('installed')
     await seed(ledgerPath)
     const prompts: Record<string, unknown>[] = []
     const handlers: { name: string; handler: (session: unknown, event: unknown) => void }[] = []
@@ -820,6 +996,8 @@ describe('完成回执：接线', () => {
     await handlers[0].handler({ id: 'sess-1' }, { type: 'turn/end', data: { turn: 3, reason: { kind: 'completed' } } })
     // 监听器是 fire-and-forget（宿主事件面没人接返回值），只能等窗口到点后再断言投递结果。
     await new Promise(resolve => setTimeout(resolve, 50))
+    if (previousOutbox === undefined) delete process.env.DSH_SESSION_CREATE_OUTBOX
+    else process.env.DSH_SESSION_CREATE_OUTBOX = previousOutbox
     expect(prompts).toHaveLength(1)
     expect((prompts[0].content as { text: string }[])[0].text).toContain('turn 3')
   })
@@ -856,8 +1034,10 @@ describe('完成回执：接线', () => {
   test('构建产物：create_session 把派活人的会话 id 记进台账，并把回执监听挂上 ctx', async () => {
     const ledgerPath = ledgerFor('built')
     const previous = process.env.DSH_SESSION_CREATE_LEDGER
+    const previousOutbox = process.env.DSH_SESSION_CREATE_OUTBOX
     try {
       process.env.DSH_SESSION_CREATE_LEDGER = ledgerPath
+      process.env.DSH_SESSION_CREATE_OUTBOX = outboxFor('built')
       const { tools, events } = builtArtifact()
       expect(events).toEqual(['session/event'])
 
@@ -874,14 +1054,18 @@ describe('完成回执：接线', () => {
     } finally {
       if (previous === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
       else process.env.DSH_SESSION_CREATE_LEDGER = previous
+      if (previousOutbox === undefined) delete process.env.DSH_SESSION_CREATE_OUTBOX
+      else process.env.DSH_SESSION_CREATE_OUTBOX = previousOutbox
     }
   })
 
   test('构建产物：台账够 5 条有效样本时，create_session 的返回里给出 deadline 分钟数与真实可调的调度形态', async () => {
     const ledgerPath = ledgerFor('built-deadline')
     const previous = process.env.DSH_SESSION_CREATE_LEDGER
+    const previousOutbox = process.env.DSH_SESSION_CREATE_OUTBOX
     try {
       process.env.DSH_SESSION_CREATE_LEDGER = ledgerPath
+      process.env.DSH_SESSION_CREATE_OUTBOX = outboxFor('built-deadline')
       const minutes = [10, 20, 30, 40, 100]
       for (const [index, value] of minutes.entries()) {
         const at = 1_000_000 + index * 1_000
@@ -904,6 +1088,8 @@ describe('完成回执：接线', () => {
     } finally {
       if (previous === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
       else process.env.DSH_SESSION_CREATE_LEDGER = previous
+      if (previousOutbox === undefined) delete process.env.DSH_SESSION_CREATE_OUTBOX
+      else process.env.DSH_SESSION_CREATE_OUTBOX = previousOutbox
     }
   })
 })

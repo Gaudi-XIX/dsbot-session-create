@@ -3,15 +3,120 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 
 // src/autoresume.ts
 import { randomUUID as randomUUID2 } from "node:crypto";
-import { mkdir as mkdir2, readFile as readFile2, rename, writeFile } from "node:fs/promises";
+import { mkdir as mkdir3, readFile as readFile3, rename as rename2, writeFile as writeFile2 } from "node:fs/promises";
 import { homedir as homedir2 } from "node:os";
-import { dirname as dirname2, join as join2 } from "node:path";
+import { dirname as dirname3, join as join3 } from "node:path";
 
 // src/core.ts
 import { randomUUID } from "node:crypto";
-import { appendFile, mkdir, readFile, stat } from "node:fs/promises";
+import { appendFile, mkdir as mkdir2, readFile as readFile2, stat } from "node:fs/promises";
 import { homedir } from "node:os";
+import { dirname as dirname2, join as join2 } from "node:path";
+
+// src/outbox.ts
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+var RECEIPT_OUTBOX_FILE = "receipt-outbox.json";
+var RECEIPT_OUTBOX_ENV = "DSH_SESSION_CREATE_OUTBOX";
+var RECEIPT_OUTBOX_DISABLE_ENV = "DSH_SESSION_CREATE_OUTBOX_DISABLE";
+var RECEIPT_BACKOFF_MS = [30000, 60000, 120000, 300000, 600000];
+var RECEIPT_MAX_ATTEMPTS = 40;
+var RECEIPT_RETENTION_MS = 86400000;
+function receiptIdOf(sessionId, headSeq) {
+  return `${sessionId}@${headSeq}`;
+}
+function defaultOutboxPath(env, home, ledgerPath) {
+  const override = (env[RECEIPT_OUTBOX_ENV] ?? "").trim();
+  if (override !== "")
+    return override;
+  if (ledgerPath !== "")
+    return join(dirname(ledgerPath), RECEIPT_OUTBOX_FILE);
+  const dshHome = (env.DSH_HOME ?? "").trim() === "" ? join(home, ".dsh") : env.DSH_HOME;
+  return join(dshHome, "bot", "session-create", RECEIPT_OUTBOX_FILE);
+}
+function isReceiptEntry(value) {
+  if (typeof value !== "object" || value === null)
+    return false;
+  const entry = value;
+  const status = entry.status;
+  return typeof entry.receiptId === "string" && typeof entry.sessionId === "string" && typeof entry.headSeq === "number" && typeof entry.endTime === "number" && (status === "pending" || status === "delivered" || status === "abandoned");
+}
+async function readOutbox(path) {
+  let text;
+  try {
+    text = await readFile(path, "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT")
+      return [];
+    throw error;
+  }
+  if (text.trim() === "")
+    return [];
+  const parsed = JSON.parse(text);
+  if (!Array.isArray(parsed))
+    throw new Error(`${path} is not a receipt outbox (expected a JSON array of entries)`);
+  return parsed.filter(isReceiptEntry);
+}
+async function writeOutbox(path, entries) {
+  await mkdir(dirname(path), { recursive: true });
+  const tmp = `${path}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(entries, null, 2)}
+`, "utf8");
+  await rename(tmp, path);
+}
+var writing = new Map;
+async function mutateOutbox(path, mutate, now = Date.now()) {
+  const previous = writing.get(path) ?? Promise.resolve();
+  const next = previous.then(async () => {
+    const current = await readOutbox(path);
+    const updated = pruneEntries(mutate(current), now);
+    if (JSON.stringify(updated) !== JSON.stringify(current))
+      await writeOutbox(path, updated);
+    return updated;
+  });
+  writing.set(path, next.then(() => {
+    return;
+  }, () => {
+    return;
+  }));
+  return next;
+}
+function enqueueEntry(entries, entry) {
+  const found = entries.find((item) => item.receiptId === entry.receiptId);
+  if (found === undefined)
+    return [...entries, entry];
+  return entries.map((item) => item.receiptId === entry.receiptId ? { ...item, attempts: item.attempts + 1, lastAttemptAt: item.lastAttemptAt ?? entry.createdAt } : item);
+}
+function closeEntry(entries, sessionId, patch, options = {}) {
+  return entries.map((entry) => {
+    if (entry.sessionId !== sessionId || entry.status !== "pending")
+      return entry;
+    if (options.only !== undefined && entry.receiptId !== options.only)
+      return entry;
+    if (options.keep !== undefined && entry.receiptId === options.keep)
+      return entry;
+    return { ...entry, ...patch };
+  });
+}
+function pruneEntries(entries, now) {
+  return entries.filter((entry) => {
+    if (entry.status === "pending")
+      return true;
+    if (typeof entry.closedAt !== "number")
+      return true;
+    return now - entry.closedAt < RECEIPT_RETENTION_MS;
+  });
+}
+function retryDelayOf(attempts, backoff = RECEIPT_BACKOFF_MS) {
+  const table = backoff.length === 0 ? RECEIPT_BACKOFF_MS : backoff;
+  const index = Math.min(Math.max(Math.trunc(attempts), 0), table.length - 1);
+  return table[index];
+}
+function pendingOf(entries, sessionId) {
+  return entries.filter((entry) => entry.status === "pending" && (sessionId === undefined || entry.sessionId === sessionId));
+}
+
+// src/core.ts
 var PROMPT_TIMEOUT_MS = 30000;
 var HISTORY_TIMEOUT_MS = 20000;
 var SESSION_OPTION_TIMEOUT_MS = 1e4;
@@ -19,7 +124,7 @@ var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
-var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。若需拍板，在正文写明理由与选项，末行打 [NEEDS USER]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
+var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
 function withTerminalMarkInstruction(prompt) {
   return `${prompt}
 
@@ -460,8 +565,8 @@ function defaultBotStatePath(env = process.env, home = homedir()) {
   const explicit = (env.DSH_BOT_STATE_PATH ?? "").trim();
   if (explicit !== "")
     return explicit;
-  const root = (env.DSH_HOME ?? "").trim() || join(home, ".dsh");
-  return join(root, "bot", "state.json");
+  const root = (env.DSH_HOME ?? "").trim() || join2(home, ".dsh");
+  return join2(root, "bot", "state.json");
 }
 async function resolveReturnTo(target, opts = {}) {
   const trimmed = (target ?? "").trim();
@@ -470,7 +575,7 @@ async function resolveReturnTo(target, opts = {}) {
   }
   const statePath = opts.botStatePath ?? defaultBotStatePath(opts.env, opts.home);
   try {
-    const raw = await readFile(statePath, "utf8");
+    const raw = await readFile2(statePath, "utf8");
     const parsed = JSON.parse(raw);
     const bots = parsed?.bots ?? {};
     const lower = trimmed.toLowerCase();
@@ -492,14 +597,14 @@ async function resolveReturnTo(target, opts = {}) {
 }
 var LEDGER_FILE = "dispatched-sessions.jsonl";
 function sessionCreateDir(env = process.env, home = homedir()) {
-  const root = (env.DSH_HOME ?? "").trim() || join(home, ".dsh");
-  return join(root, "bot", "session-create");
+  const root = (env.DSH_HOME ?? "").trim() || join2(home, ".dsh");
+  return join2(root, "bot", "session-create");
 }
 function defaultLedgerPath(env = process.env, home = homedir()) {
   const explicit = (env.DSH_SESSION_CREATE_LEDGER ?? "").trim();
   if (explicit !== "")
     return explicit;
-  return join(sessionCreateDir(env, home), LEDGER_FILE);
+  return join2(sessionCreateDir(env, home), LEDGER_FILE);
 }
 function headOf(text, max) {
   if (text.length <= max)
@@ -507,14 +612,14 @@ function headOf(text, max) {
   return text.slice(0, /[\uD800-\uDBFF]/.test(text[max - 1] ?? "") ? max - 1 : max);
 }
 async function appendDispatch(ledgerPath, record) {
-  await mkdir(dirname(ledgerPath), { recursive: true });
+  await mkdir2(dirname2(ledgerPath), { recursive: true });
   await appendFile(ledgerPath, `${JSON.stringify(record)}
 `, "utf8");
 }
 async function readLedger(ledgerPath) {
   let text;
   try {
-    text = await readFile(ledgerPath, "utf8");
+    text = await readFile2(ledgerPath, "utf8");
   } catch (error) {
     if (error?.code === "ENOENT")
       return [];
@@ -795,7 +900,7 @@ function terminalMarkOf(text) {
   }
   return;
 }
-async function lastAssistantText(controller, sessionId, seq) {
+async function lastAssistantReply(controller, sessionId, seq) {
   if (typeof controller.page !== "function") {
     return { error: "this harness has no sessionController.page, so its last assistant message cannot be read" };
   }
@@ -819,10 +924,16 @@ async function lastAssistantText(controller, sessionId, seq) {
       continue;
     const message = event.data?.message;
     const text = blockText(message?.content);
-    if (text !== "")
-      return { text };
+    if (text === "")
+      continue;
+    const messageSeq = Number(event.seq);
+    return { text, seq: Number.isFinite(messageSeq) ? messageSeq : Math.max(0, at - 1) };
   }
   return { error: "no assistant message with text was found among its last events" };
+}
+async function lastAssistantText(controller, sessionId, seq) {
+  const reply = await lastAssistantReply(controller, sessionId, seq);
+  return "error" in reply ? reply : { text: reply.text };
 }
 function deadlineSamples(records) {
   const minutes = [];
@@ -876,8 +987,49 @@ function createDispatchNotifier(deps = {}) {
   }, ms));
   const clearTimer = deps.clearTimer ?? ((handle2) => clearTimeout(handle2));
   const log = deps.log ?? ((line) => console.warn(`[dsbot-session-create] ${line}`));
+  const outboxPath = deps.outboxPath ?? defaultOutboxPath(deps.env ?? process.env, deps.home ?? homedir(), ledgerPath);
+  const outboxOff = ((deps.env ?? process.env)[RECEIPT_OUTBOX_DISABLE_ENV] ?? "").trim() === "1";
+  const backoff = deps.backoffMs ?? RECEIPT_BACKOFF_MS;
+  const maxAttempts = deps.maxAttempts ?? RECEIPT_MAX_ATTEMPTS;
   const pending = new Map;
   const notified = new Set;
+  let retryHandle;
+  async function closeOutbox(sessionId, patch, options = {}) {
+    try {
+      await mutateOutbox(outboxPath, (entries) => closeEntry(entries, sessionId, patch, options), now());
+    } catch (error) {
+      log(`the receipt outbox could not be updated while closing the receipt for ${sessionId} (${reasonOf(error)}).`);
+    }
+  }
+  function disarmRetry() {
+    if (retryHandle === undefined)
+      return;
+    clearTimer(retryHandle);
+    retryHandle = undefined;
+  }
+  function armRetry(delay) {
+    if (retryHandle !== undefined)
+      return;
+    retryHandle = setTimer(async () => {
+      retryHandle = undefined;
+      await reconcile();
+    }, delay);
+  }
+  async function armRetryFromOutbox() {
+    let owed;
+    try {
+      owed = pendingOf(await readOutbox(outboxPath));
+    } catch (error) {
+      log(`the receipt outbox could not be read, so no retry was scheduled (${reasonOf(error)}).`);
+      return;
+    }
+    if (owed.length === 0) {
+      disarmRetry();
+      return;
+    }
+    const attempts = owed.reduce((most, entry) => Math.max(most, entry.attempts), 0);
+    armRetry(retryDelayOf(attempts, backoff));
+  }
   async function recordOf(sessionId) {
     try {
       return (await readLedger(ledgerPath)).find((record) => record.sessionId === sessionId);
@@ -913,43 +1065,49 @@ function createDispatchNotifier(deps = {}) {
   }
   async function deliver(sessionId, endTime, turn, reason) {
     if (notified.has(sessionId))
-      return;
+      return "closed";
     const record = await recordOf(sessionId);
     if (record === undefined)
-      return;
-    if (typeof record.notifiedAt === "number" && record.notifiedAt >= endTime)
-      return;
+      return "pending";
+    if (typeof record.notifiedAt === "number" && record.notifiedAt >= endTime) {
+      await closeOutbox(sessionId, { status: "delivered", closedAt: now(), deliveredAt: record.notifiedAt });
+      return "closed";
+    }
     let dispatcher = record.dispatcherSessionId;
     if (dispatcher === undefined || dispatcher === "") {
       log(`${sessionId} went quiet, but its ledger line has no dispatcherSessionId (it was dispatched before this feature), so no receipt was sent.`);
-      return;
+      await closeOutbox(sessionId, { status: "abandoned", abandonedReason: "dispatcher-gone", closedAt: now() });
+      return "closed";
     }
-    if (dispatcher === sessionId)
-      return;
+    if (dispatcher === sessionId) {
+      await closeOutbox(sessionId, { status: "abandoned", abandonedReason: "dispatcher-gone", closedAt: now() });
+      return "closed";
+    }
     const controller = deps.controllerOf?.();
     if (typeof controller?.resolveAgent !== "function" || typeof controller?.prompt !== "function") {
       log(`${sessionId} went quiet, but this harness has no sessionController.resolveAgent/prompt, so no receipt was sent.`);
-      return;
+      return "pending";
     }
     const resolved = await resolveQuietly(controller, sessionId);
     if (resolved?.agent?.status !== "idle") {
       log(`${sessionId} went quiet, but the harness does not report it idle (status=${shortOf(resolved?.agent?.status)}), so no receipt was sent.`);
-      return;
+      return "pending";
     }
     const waitingOn = await firstBusyChild(sessionId, controller);
     if (waitingOn !== undefined) {
       log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`);
-      return;
+      return "pending";
     }
     const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq);
     if ("error" in lastText) {
       log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`);
-      return;
+      return "pending";
     }
     const mark = terminalMarkOf(lastText.text);
     if (mark === undefined) {
       log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(" / ")}).`);
-      return;
+      await closeOutbox(sessionId, { status: "abandoned", abandonedReason: "superseded", closedAt: now() });
+      return "closed";
     }
     const targetSeq = Number(resolved?.agent?.session?.seq);
     const targetHeadSeq = Number.isFinite(targetSeq) ? Math.max(0, targetSeq - 1) : undefined;
@@ -961,7 +1119,8 @@ function createDispatchNotifier(deps = {}) {
         log(`the receipt for ${sessionId} was suppressed (already read), but the ledger could not record notifiedAt (${reasonOf(error)}).`);
       }
       log(`${sessionId} completed, but its transcript was already read (lastReadSeq=${record.lastReadSeq} >= headSeq=${targetHeadSeq}); receipt suppressed.`);
-      return;
+      await closeOutbox(sessionId, { status: "delivered", closedAt: now(), deliveredAt: now() });
+      return "closed";
     }
     let target = await resolveQuietly(controller, dispatcher);
     if ((target === undefined || target.error !== undefined || target.agent === undefined) && record.returnTo) {
@@ -975,7 +1134,8 @@ function createDispatchNotifier(deps = {}) {
     }
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
       log(`${sessionId} went quiet, but the dispatching Session ${dispatcher} is gone, so there is nowhere to send the receipt.`);
-      return;
+      await closeOutbox(sessionId, { status: "abandoned", abandonedReason: "dispatcher-gone", closedAt: now() });
+      return "closed";
     }
     try {
       await controller.prompt({
@@ -986,7 +1146,7 @@ function createDispatchNotifier(deps = {}) {
       }, AbortSignal.timeout(NOTIFY_TIMEOUT_MS));
     } catch (error) {
       log(`the receipt for ${sessionId} did not go through (${reasonOf(error)}); the next turn to end will try again.`);
-      return;
+      return "pending";
     }
     notified.add(sessionId);
     try {
@@ -995,6 +1155,107 @@ function createDispatchNotifier(deps = {}) {
       log(`the receipt for ${sessionId} was delivered, but the ledger could not record notifiedAt (${reasonOf(error)}).`);
     }
     log(`receipt for ${sessionId} delivered to the dispatching Session ${dispatcher}.`);
+    await closeOutbox(sessionId, { status: "delivered", closedAt: now(), deliveredAt: endTime });
+    return "delivered";
+  }
+  async function capture(sessionId, turn, reason, endTime) {
+    if (outboxOff)
+      return;
+    const record = await recordOf(sessionId);
+    if (record === undefined)
+      return;
+    const dispatcher = record.dispatcherSessionId;
+    if (dispatcher === undefined || dispatcher === "" || dispatcher === sessionId)
+      return;
+    const controller = deps.controllerOf?.();
+    if (typeof controller?.resolveAgent !== "function" || typeof controller.page !== "function")
+      return;
+    const resolved = await resolveQuietly(controller, sessionId);
+    const reply = await lastAssistantReply(controller, sessionId, resolved?.agent?.session?.seq);
+    if ("error" in reply) {
+      log(`${sessionId} finished, but ${reply.error}; nothing was written to the receipt outbox.`);
+      return;
+    }
+    const mark = terminalMarkOf(reply.text);
+    if (mark === undefined) {
+      log(`${sessionId} finished, but its last message has no terminal mark; nothing was written to the receipt outbox (expected one of ${TERMINAL_MARKS.join(" / ")}).`);
+      return;
+    }
+    const entry = {
+      receiptId: receiptIdOf(sessionId, reply.seq),
+      sessionId,
+      headSeq: reply.seq,
+      dispatcherSessionId: dispatcher,
+      ...record.returnTo === undefined ? {} : { returnTo: record.returnTo },
+      mark,
+      ...turn === undefined ? {} : { turn },
+      ...reason === undefined ? {} : { reason },
+      endTime,
+      status: "pending",
+      attempts: 0,
+      createdAt: endTime
+    };
+    try {
+      await mutateOutbox(outboxPath, (entries) => {
+        const kept = closeEntry(entries, sessionId, { status: "abandoned", abandonedReason: "superseded", closedAt: endTime }, { keep: entry.receiptId });
+        return enqueueEntry(kept, entry);
+      }, now());
+    } catch (error) {
+      log(`the receipt for ${sessionId} could not be written to the receipt outbox (${reasonOf(error)}); it will only be delivered while this host keeps running.`);
+    }
+  }
+  async function reconcile() {
+    const report = { pending: 0, delivered: 0, closed: 0, abandoned: 0 };
+    let owed;
+    try {
+      owed = pendingOf(await readOutbox(outboxPath));
+    } catch (error) {
+      log(`the receipt outbox could not be read, so no deferred receipt was retried (${reasonOf(error)}).`);
+      return report;
+    }
+    if (owed.length === 0) {
+      disarmRetry();
+      return report;
+    }
+    const newest = new Map;
+    for (const entry of owed) {
+      const current = newest.get(entry.sessionId);
+      if (current === undefined || entry.headSeq > current.headSeq || entry.headSeq === current.headSeq && entry.endTime > current.endTime) {
+        newest.set(entry.sessionId, entry);
+      }
+    }
+    for (const [sessionId, entry] of newest) {
+      try {
+        await mutateOutbox(outboxPath, (entries) => closeEntry(entries, sessionId, { status: "abandoned", abandonedReason: "superseded", closedAt: now() }, { keep: entry.receiptId }), now());
+      } catch (error) {
+        log(`the receipt outbox could not be pruned while retrying the receipt for ${sessionId} (${reasonOf(error)}).`);
+      }
+      if (entry.attempts >= maxAttempts) {
+        log(`the receipt for ${sessionId} was retried ${entry.attempts} times without going through; giving up (max-attempts).`);
+        await closeOutbox(sessionId, { status: "abandoned", abandonedReason: "max-attempts", closedAt: now() }, { only: entry.receiptId });
+        report.abandoned += 1;
+        continue;
+      }
+      const outcome = await deliver(sessionId, entry.endTime, entry.turn, entry.reason);
+      if (outcome === "delivered")
+        report.delivered += 1;
+      else if (outcome === "closed")
+        report.closed += 1;
+      else {
+        report.pending += 1;
+        const attemptAt = now();
+        try {
+          await mutateOutbox(outboxPath, (entries) => entries.map((item) => item.receiptId === entry.receiptId && item.status === "pending" ? { ...item, attempts: item.attempts + 1, lastAttemptAt: attemptAt } : item), attemptAt);
+        } catch (error) {
+          log(`the receipt outbox could not record the retry for ${sessionId} (${reasonOf(error)}).`);
+        }
+      }
+    }
+    if (report.pending > 0)
+      await armRetryFromOutbox();
+    else
+      disarmRetry();
+    return report;
   }
   async function handle(session, event) {
     const sessionId = typeof session?.id === "string" ? session.id : undefined;
@@ -1027,9 +1288,13 @@ function createDispatchNotifier(deps = {}) {
     const endTime = now();
     const handle2 = setTimer(() => {
       pending.delete(sessionId);
-      return deliver(sessionId, endTime, turn, reason);
+      return deliver(sessionId, endTime, turn, reason).then(async (outcome) => {
+        if (outcome === "pending")
+          await armRetryFromOutbox();
+      });
     }, quietMs);
     pending.set(sessionId, { endTime, handle: handle2 });
+    capture(sessionId, turn, reason, endTime);
   }
   return {
     async onEvent(session, event) {
@@ -1038,6 +1303,13 @@ function createDispatchNotifier(deps = {}) {
       } catch (error) {
         log(`a session event could not be handled (${reasonOf(error)}).`);
       }
+    },
+    reconcile,
+    stop() {
+      for (const quiet of pending.values())
+        clearTimer(quiet.handle);
+      pending.clear();
+      disarmRetry();
     },
     pending: () => [...pending.entries()].map(([sessionId, quiet]) => ({ sessionId, endTime: quiet.endTime }))
   };
@@ -1052,6 +1324,7 @@ function installDispatchNotify(ctx, opts = {}) {
   on.call(ctx, "session/event", (session, event) => {
     notifier.onEvent(session, event);
   });
+  notifier.reconcile();
   return notifier;
 }
 
@@ -1065,8 +1338,8 @@ function resolveAutoresumeStateDir(env = process.env, home = homedir2()) {
   return explicit !== "" ? explicit : sessionCreateDir(env, home);
 }
 var AUTORESUME_STATE_DIR = resolveAutoresumeStateDir();
-var AUTORESUME_PENDING_FILE = join2(AUTORESUME_STATE_DIR, AUTORESUME_PENDING_NAME);
-var AUTORESUME_ACK_FILE = join2(AUTORESUME_STATE_DIR, AUTORESUME_ACK_NAME);
+var AUTORESUME_PENDING_FILE = join3(AUTORESUME_STATE_DIR, AUTORESUME_PENDING_NAME);
+var AUTORESUME_ACK_FILE = join3(AUTORESUME_STATE_DIR, AUTORESUME_ACK_NAME);
 var AUTORESUME_RETRY_DELAYS_MS = [6000, 12000, 20000];
 var AUTORESUME_DELAY_MS = AUTORESUME_RETRY_DELAYS_MS[0];
 var AUTORESUME_TIMEOUT_MS = 1e4;
@@ -1074,11 +1347,11 @@ function reasonOf2(error) {
   return error instanceof Error ? error.message : String(error);
 }
 async function writeAtomicDefault(path, text) {
-  const dir = dirname2(path);
-  await mkdir2(dir, { recursive: true });
+  const dir = dirname3(path);
+  await mkdir3(dir, { recursive: true });
   const tmp = `${path}.${process.pid}.tmp`;
-  await writeFile(tmp, text, "utf8");
-  await rename(tmp, path);
+  await writeFile2(tmp, text, "utf8");
+  await rename2(tmp, path);
 }
 function isStrictlyNewer(candidate, acked) {
   const fresh = Date.parse(candidate);
@@ -1145,9 +1418,9 @@ async function runAutoResume(deps = {}) {
     return { status: "disabled", reason };
   }
   const stateDir = resolveAutoresumeStateDir(env);
-  const pendingFile = deps.pendingFile ?? join2(stateDir, AUTORESUME_PENDING_NAME);
-  const ackFile = deps.ackFile ?? join2(stateDir, AUTORESUME_ACK_NAME);
-  const readText = deps.readText ?? ((path) => readFile2(path, "utf8"));
+  const pendingFile = deps.pendingFile ?? join3(stateDir, AUTORESUME_PENDING_NAME);
+  const ackFile = deps.ackFile ?? join3(stateDir, AUTORESUME_ACK_NAME);
+  const readText = deps.readText ?? ((path) => readFile3(path, "utf8"));
   const writeAtomic = deps.writeAtomic ?? writeAtomicDefault;
   const now = deps.now ?? (() => Date.now());
   let pointer;
@@ -1299,7 +1572,7 @@ var CREATE_DESCRIPTION = [
   "The Session's model is pinned explicitly and is never the host's global default: it is the model the dispatching Bot's own Session runs on, unless `model` names another one as `provider/model`. If neither can be read, no Session is started.",
   "The session id is written to a dispatch ledger, so its result can be collected later with read_session_transcript.",
   "Use it to open a work line in a project without creating a Bot. The Session belongs to the user, not to any Bot.",
-  'When it finishes, that Session must write exactly one terminal mark in its final reply: [DISPATCH DONE] (the whole task is done), [NEEDS USER] (the user must decide something), or [DISPATCH BLOCKED] (stuck and stopped, with the state written down). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched". The plugin appends that requirement to the prompt automatically, so you do not need to repeat it; if your prompt already names a specific mark, the Session follows yours.',
+  'When it finishes, that Session must write exactly one terminal mark in its final reply, and there are only two: [DISPATCH DONE] (the whole task is done) or [DISPATCH BLOCKED] (stopped: stuck, cannot continue, or the user must decide something). A receipt is sent back to you only when that mark is present; without one nothing is sent, so a reply with no mark reads as "this round is over, still waiting on work I dispatched". The receipt is written to disk before it is delivered and retried from there, so a restart or a crash no longer loses it. The plugin appends that requirement to the prompt automatically, so you do not need to repeat it; if your prompt already names a specific mark, the Session follows yours.',
   'After dispatching, arm one one-shot deadline for it with schedule_create, using the minutes this tool returns: pass rrule as two lines — DTSTART;TZID=<IANA zone>:<YYYYMMDDTHHMMSS> set to the current local time plus those minutes, then RRULE:FREQ=DAILY;COUNT=1, which fires exactly once (one-shot only; never a periodic check) — and delete it with schedule_edit(action="delete", id=<task id>) once its terminal receipt arrives.'
 ].join(" ") + `
 ` + [

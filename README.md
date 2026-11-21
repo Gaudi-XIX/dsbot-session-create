@@ -102,7 +102,7 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 | `message` | 是 | 插进去的那段话 |
 
 - 宿主报 `running`：走 `controller.prompt(mode: 'steer')`（宿主 `agent.steer`），**插进正在跑的那一轮**，会话下一步就读到，不等这一轮结束。
-- 宿主报 `idle`：一律用 `controller.prompt(mode: 'queue')` 把原话排回这条会话接着做，不另开会话、不重灌上下文（0.10.0 起解除旧版的「末尾标记 + 台账在途」双条件门）。终态标记（`[DISPATCH DONE]` / `[NEEDS USER]` / `[DISPATCH BLOCKED]`）只用于「派完自动回执」那一节判定这一轮要不要向派活方发回执，与能否续投无关；台账里在不在途、末尾文本读不读得出，同样不参与分流。分流只看宿主状态，不替调用方判断「这条消息算新任务还是纠偏」——那是语义判断。
+- 宿主报 `idle`：一律用 `controller.prompt(mode: 'queue')` 把原话排回这条会话接着做，不另开会话、不重灌上下文（0.10.0 起解除旧版的「末尾标记 + 台账在途」双条件门）。终态标记（`[DISPATCH DONE]` / `[DISPATCH BLOCKED]`）只用于「派完自动回执」那一节判定这一轮要不要向派活方发回执，与能否续投无关；台账里在不在途、末尾文本读不读得出，同样不参与分流。分流只看宿主状态，不替调用方判断「这条消息算新任务还是纠偏」——那是语义判断。
 - 宿主没报状态时按「还在跑」处理，照投，结果里如实标 `targetState: unreported`；`idle` 续投成功时同样标 `unreported`，不冒充宿主说它还在跑。
 - 只说「已插进正在跑的那一轮」，不说「它看过了」——后者只有读回才能证明。
 - 单次投递超时 10 秒（`MESSAGE_TIMEOUT_MS`）。
@@ -134,16 +134,15 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 派送时把派活人的会话 id 记进台账。目标会话**正常收尾**（`turn/end.reason.kind === 'completed'`）、安静满 **120 秒**（`QUIET_WINDOW_MS`）、宿主复核为 `idle`、**它自己派出去的活都已经停下来**，并且**它的最终答复里写了终态标记**，插件才用 `controller.prompt(mode: 'queue')` 投一条回执回派活人（`src/core.ts` 的 `createDispatchNotifier`，`src/index.ts` 的 `installDispatchNotify` 挂到 ctx 上——没人调用工具时也要有东西替我们盯着）。终态标记的写法要求由插件在 `create_session` 投递时自动追加到 prompt 末尾（`withTerminalMarkInstruction`），派活人不必自己转述——工具说明只对派活人可见，被派会话看不到。
 
-**这是提示词层面的提醒，不是硬拦截**：投给被派会话的要求段（`TERMINAL_MARK_INSTRUCTION`）开头明确要求它不调用任何向用户弹出交互卡片或等待输入的工具，遇未决事项在答复正文写明理由与选项、末行打 `[NEEDS USER]` 交回派单方。插件并不拦截工具调用，**模型可以不遵守**；要硬拦得由插件注册工具守卫，本版未做。
+**这是提示词层面的提醒，不是硬拦截**：投给被派会话的要求段（`TERMINAL_MARK_INSTRUCTION`）开头明确要求它不调用任何向用户弹出交互卡片或等待输入的工具，遇未决事项在答复正文写明理由与选项、末行打 `[DISPATCH BLOCKED]` 交回派单方（要人拍板就算「停住了」）。插件并不拦截工具调用，**模型可以不遵守**；要硬拦得由插件注册工具守卫，本版未做。
 
 投不投由**派活方在最终答复里写的标记**决定，插件只认标记：
 
 | 最终答复里的标记 | 回执 | 含义 |
 | --- | --- | --- |
-| `[DISPATCH DONE]` | 投 | 整单完成 |
-| `[NEEDS USER]` | 投 | 需要人拍板 |
-| `[DISPATCH BLOCKED]` | 投 | 受阻停手，要人来救 |
-| 三个都没有 | **不投** | 中间收工，还在等自己派的活 |
+| `[DISPATCH DONE]` | 投 | 搞完了：整单完成 |
+| `[DISPATCH BLOCKED]` | 投 | 停住了：受阻停手、做不到、要人拍板或来救 |
+| 两个都没有 | **不投** | 中间收工，还在等自己派的活 |
 
 判定只读**该会话最后一条 `assistant` 消息的正文**，不看整篇 transcript；大小写敏感，全角括号或错拼一律不算标记。而且只认**正文末尾**：从后往前第一个非空行必须恰好是标记（允许该行前后有空白、行尾少量标点），正文中间引用的标记不算——`session-126369fb-7b6e-47f5-a75b-fa607bc16578` 那单的末条正文只是引用了「末行恰一个 `[DISPATCH DONE]`」，旧的全篇子串扫描据此误判成已结束。插件随 prompt 追加的要求段逐字点明了这条口径（最后一个非空行、只写标记本身、正文开头或段落中间写不算），顺带缓解「要求已送达但把标记写在正文首行」那一类失效面；模型是否照做不在插件保证范围内，门四语义不动。
 
@@ -170,23 +169,38 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 
 #### 一次性 deadline 兜底
 
-回执永远不来时，兜底靠**派活方自己建的一次性提醒**，插件只给数值、不碰调度系统（不写 `schedule.json`、不取 `ctx.schedule`、不新增任何常驻定时器）。
+回执本身由 receipt outbox 保证送达（只要这一单产出过终态标记，见上一节）；这一节只剩**过期待办提醒**——插件只给数值、不碰调度系统（不写 `schedule.json`、不取 `ctx.schedule`、不新增任何常驻定时器）。
 
 - **谁建谁删**：派活方在派单那一轮调 `schedule_create`（`rrule` 传两行，见下条），收到那一单的终态回执后调 `schedule_edit(action="delete", id=<task id>)` 删掉那一单。
 - **数值哪来**：`create_session` 的结果里多一行 `Suggested one-shot deadline: <N> minutes`；算法是台账里**近 30 条**「派送时刻与首次回执时刻都有」的有效样本，取派活时长的 **p95 × 1.2**，线性插值后向上取整到分钟。样本不足 5 条时不出数，改说 `No one-shot deadline suggested: only <k> completed ledger records carry both timestamps (need 5).`
 - **怎么建**：`schedule_create` 的 `rrule` 传两行——首行 `DTSTART;TZID=<IANA 时区>:<YYYYMMDDTHHMMSS>` 取当前本地时间加 N 分钟，次行 `RRULE:FREQ=DAILY;COUNT=1`；`COUNT=1` 表示只响一次，没有周期巡检。
 - **前提**：`schedule` 工具由 `standard` / `ptc` 预设挂载，`minimal` 没有——建议行里写明这一点，插件不做检测。
 
+#### 回执落盘与重启补投（receipt outbox）
+
+「欠派活方一条回执」这件事原先只活在被派会话收工那一刻的进程内存里：静默窗口没到就重启、或宿主当场被杀，这一单的回执就永远丢了，派活方只能靠 deadline 提醒自救。0.12.0 起先把这笔债写到盘上，再由盘上补投（`src/outbox.ts`，接线在 `src/core.ts` 的 `createDispatchNotifier`）。
+
+- **落点**：与派送台账**同目录**的 `receipt-outbox.json`（跟着台账走，见下条两个 env）。整份文件是一个 `ReceiptEntry[]`，原子替换写入（`tmp` + `rename`），不会出现半截账。
+- **两个 env**：`DSH_SESSION_CREATE_OUTBOX` 覆盖落点路径；`DSH_SESSION_CREATE_OUTBOX_DISABLE=1` 关掉记账（投递照旧，只是重启后不再补投）。
+- **记什么**：`receiptId`、`sessionId`、`headSeq`（终态消息的事件序号）、`dispatcherSessionId`、`returnTo`、`mark`、`turn`、`reason`、`endTime`、`status`（`pending` / `delivered` / `abandoned`）、`attempts`、`createdAt`、`lastAttemptAt`、`deliveredAt`、`closedAt`、`abandonedReason`。
+- **去重键 `receiptId = <sessionId>@<headSeq>`**：同一段终态，无论在内存里重试几次、宿主重启后重扫几次，读到的都是同一条 assistant 消息、同一个 seq，天然幂等——不需要额外的时间窗去重。
+- **记账点前移到 `turn/end`**：不等 120 秒静默窗口。崩溃窗口从「整整一个静默期」缩到「一次 page 读取」，并且「欠不欠」与「能不能投」解耦——门四之后的任何一道门失败都不再丢账。
+- **补投触发点只有一处**：`installDispatchNotify()` 挂完 `session/event` 监听立刻 `reconcile()` 扫一遍盘。进程刚起时内存里没有任何待投状态，这是唯一能重建它的时机。
+- **双向销账**：同一个 `receiptId` 上，投出去了就 `delivered`、派活方已读或派活方已销毁就 `abandoned`（`superseded` / `dispatcher-gone` / `max-attempts`），下次不再重投。
+- **退避与上限**：`30s → 60s → 120s → 300s → 600s`，第 6 次起固定 600 秒；单条最多重试 40 次（`RECEIPT_BACKOFF_MS`、`RECEIPT_MAX_ATTEMPTS`）。退避把覆盖期拉到约 6 小时，同时把债务期的开销压到每 10 分钟一次读盘。重试走既有注入面的单槽定时器（`deps.setTimer`），**账上没债就没有定时器**，不是常驻巡检。
+- **保留期**：只清已关闭且超过 24 小时的账（`RECEIPT_RETENTION_MS`）；`pending` 一条都不按时间清——按时间清 pending 等于静默丢债。
+- **fail-open**：账读不出、写不进只记一行日志，不打断当场那次投递。账是可靠性补强，不能反过来变成新的失败点。
+
 #### 残余四条
 
 1. **漏投是刻意的**：末条正文读不到、或正文里没有标记，一律不投；漏一条的代价是派活方多等一次 deadline。
 2. **插件不替派活方建提醒**：只给建议秒数，建和删都由派活方在会话里做；`minimal` 预设下这个工具根本不在。
-3. **宿主重启的缺口**：派单成功到 `schedule_create` 成功之间宿主重启，既没有回执也没有提醒，只能由派活方按台账自查。
-4. **到期不保证补投**：提醒到期而宿主长期不重启时，宿主调度器没有自动重试定时器，补投不可保证。
+3. **「压根没有终态标记」这一类不派回执**：outbox 只保证「产出过终态标记的那一单」必达；被重启掐断、末条正文没写标记的会话，账上不会凭空长出一条回执（要合成得另造一套判据，本版不做）。
+4. **提醒不是回执的保证**：提醒只解决「等太久」，回执由 outbox 保证；提醒到期而宿主长期不重启时，补投仍等下一次启动。
 
 ### 宿主启动自检（重启后自动接续）
 
-宿主重启时在跑的 Bot 会话一并被杀，醒来后没有东西会主动说「刚重启过、盘上有接手指针」。这一段补上它（`src/autoresume.ts`，`src/index.ts:303` 的 `installAutoResume`）：
+宿主重启时在跑的 Bot 会话一并被杀，醒来后没有东西会主动说「刚重启过、盘上有接手指针」。这一段补上它（`src/autoresume.ts`，`src/index.ts:347` 的 `installAutoResume`）：
 
 - **只认两个文件**：指针 `restart-pending.json`，已确认记录 `restart-pending.ack.json`。目录**运行时算**，不写死：`DSH_AUTORESUME_STATE_DIR` > `<DSH_HOME>/bot/session-create`（`DSH_HOME` 缺省 `~/.dsh`，与派送台账同一目录；`src/autoresume.ts` 的 `resolveAutoresumeStateDir`）。要接到别处就设那个 env，不用改代码。
 - **目标只能是指针里的 `notify_session_id`**：缺失或不是字符串就跳过。不猜主会话、不遍历会话列表。

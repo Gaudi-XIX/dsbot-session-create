@@ -17,6 +17,10 @@ type Spec = {
 const TMP_ROOT = join(import.meta.dir, '..', '.tmp')
 const AMBIENT_LEDGER = join(TMP_ROOT, 'plugin-test-ledger.jsonl')
 const previousLedger = process.env.DSH_SESSION_CREATE_LEDGER
+// 回执落盘账（src/outbox.ts）：apply() 挂完监听会补投一次盘上欠着的回执。冒烟测试把它指到自己的空账上，
+// 既不读真宿主留下的收件箱，也不与别的测试共用 .tmp 里同一份账。
+const AMBIENT_OUTBOX = join(TMP_ROOT, 'plugin-test-outbox.json')
+const previousOutbox = process.env.DSH_SESSION_CREATE_OUTBOX
 // 启动自检（src/autoresume.ts）默认会在 apply() 后延迟 6 秒读真盘并投递。冒烟测试不许碰真会话，
 // 整段跑在关闭开关下：apply() 连定时器都不会注册。
 const previousAutoResume = process.env.DSH_AUTORESUME_DISABLE
@@ -78,16 +82,21 @@ function load(options: { viaGetOnly?: boolean; events?: unknown[]; noPage?: bool
 beforeAll(async () => {
   await mkdir(TMP_ROOT, { recursive: true })
   await rm(AMBIENT_LEDGER, { force: true })
+  await rm(AMBIENT_OUTBOX, { force: true })
   process.env.DSH_SESSION_CREATE_LEDGER = AMBIENT_LEDGER
+  process.env.DSH_SESSION_CREATE_OUTBOX = AMBIENT_OUTBOX
   process.env.DSH_AUTORESUME_DISABLE = '1'
 })
 
 afterAll(async () => {
   if (previousLedger === undefined) delete process.env.DSH_SESSION_CREATE_LEDGER
   else process.env.DSH_SESSION_CREATE_LEDGER = previousLedger
+  if (previousOutbox === undefined) delete process.env.DSH_SESSION_CREATE_OUTBOX
+  else process.env.DSH_SESSION_CREATE_OUTBOX = previousOutbox
   if (previousAutoResume === undefined) delete process.env.DSH_AUTORESUME_DISABLE
   else process.env.DSH_AUTORESUME_DISABLE = previousAutoResume
   await rm(AMBIENT_LEDGER, { force: true })
+  await rm(AMBIENT_OUTBOX, { force: true })
 })
 
 describe('插件清单', () => {
@@ -131,7 +140,7 @@ describe('端到端（构建产物）', () => {
 
   // A2：构建产物投递时把要求段随 prompt 一起投出去。字面量写死，
   // 不引 '../src/core' 的常量自证；构建产物漏了这一步就必须变红。
-  const R1_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。若需拍板，在正文写明理由与选项，末行打 [NEEDS USER]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+  const R1_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
 
   test('A2 构建产物投递文本逐字 = 原 prompt 前缀 + 终态标记要求段', async () => {
     const dir = await mkdtemp(join(TMP_ROOT, 'dsc-'))

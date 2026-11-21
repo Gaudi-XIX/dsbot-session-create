@@ -6,6 +6,20 @@ import { randomUUID } from 'node:crypto'
 import { appendFile, mkdir, readFile, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import {
+  RECEIPT_BACKOFF_MS,
+  RECEIPT_MAX_ATTEMPTS,
+  RECEIPT_OUTBOX_DISABLE_ENV,
+  closeEntry,
+  defaultOutboxPath,
+  enqueueEntry,
+  mutateOutbox,
+  pendingOf,
+  readOutbox,
+  receiptIdOf,
+  retryDelayOf,
+  type ReceiptEntry,
+} from './outbox'
 
 export const PROMPT_TIMEOUT_MS = 30_000
 // 读历史是一次本地分页查询，比投递更快，给 20 秒足够。
@@ -31,7 +45,7 @@ export const MESSAGES_DEFAULT = 40
  * 文案逐字点明门四的判定口径（只认最后一个非空行、只写标记本身），顺带缓解「要求已送达
  * 但把标记写在正文首行」那一类失效面；模型是否照做不在插件保证范围内，门四语义不动。
  */
-export const TERMINAL_MARK_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记：[DISPATCH DONE]（整单做完）、[NEEDS USER]（需用户拍板）或 [DISPATCH BLOCKED]（卡住停下）；派单提示词若已指定具体标记，以它为准。若需拍板，在正文写明理由与选项，末行打 [NEEDS USER]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+export const TERMINAL_MARK_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
 
 /**
  * 把要求段追加到 prompt 末尾：prompt 逐字不变作前缀，空一行加分隔线，要求段在全文最末。
@@ -1402,11 +1416,11 @@ export function terminalMarkOf(text: string): string | undefined {
  * 会按 MESSAGE_CLIP 截尾，长答复末尾的标记会被截掉（本设计的头号陷阱）。
  * 读不到就返回原因，由 deliver 出声并不投（宁可漏一条，也不投一条假回执）。
  */
-async function lastAssistantText(
+async function lastAssistantReply(
   controller: NonNullable<HostCtx['sessionController']>,
   sessionId: string,
   seq: unknown,
-): Promise<{ text: string } | { error: string }> {
+): Promise<{ text: string; seq: number } | { error: string }> {
   if (typeof controller.page !== 'function') {
     return { error: 'this harness has no sessionController.page, so its last assistant message cannot be read' }
   }
@@ -1433,9 +1447,23 @@ async function lastAssistantText(
     if (event?.type !== 'assistant/message') continue
     const message = event.data?.message as { content?: unknown } | undefined
     const text = blockText(message?.content)
-    if (text !== '') return { text }
+    if (text === '') continue
+    // 命中那条消息自己的事件序号：它是这一单终态在会话里的位置，既当账上的去重键尾巴，
+    // 也让派活方的 lastReadSeq 能跟它直接比。宿主没给序号时退回 resolveAgent 的头位置下限。
+    const messageSeq = Number(event.seq)
+    return { text, seq: Number.isFinite(messageSeq) ? messageSeq : Math.max(0, at - 1) }
   }
   return { error: 'no assistant message with text was found among its last events' }
+}
+
+/** 只要正文的那一层（门四与回执正文都用它）：导出名与签名保持不变。 */
+async function lastAssistantText(
+  controller: NonNullable<HostCtx['sessionController']>,
+  sessionId: string,
+  seq: unknown,
+): Promise<{ text: string } | { error: string }> {
+  const reply = await lastAssistantReply(controller, sessionId, seq)
+  return 'error' in reply ? reply : { text: reply.text }
 }
 
 /** 台账里「既有 dispatchedAt 又有 notifiedAt」的有效样本，派活时长（分钟），按台账顺序。 */
@@ -1481,13 +1509,31 @@ export type NotifierDeps = {
   log?: (line: string) => void
   env?: Record<string, string | undefined>
   home?: string
+  /** 回执待办账的落点，缺省按 `defaultOutboxPath` 从台账目录算（见 `src/outbox.ts`）。 */
+  outboxPath?: string
+  /** 重试退避表，缺省 `RECEIPT_BACKOFF_MS`。 */
+  backoffMs?: readonly number[]
+  /** 一条账最多试几次，缺省 `RECEIPT_MAX_ATTEMPTS`。 */
+  maxAttempts?: number
 }
+
+/** 一次投递尝试的结局：投出去了 / 没得投也不用再投 / 还欠着，留给下一次。 */
+export type DeliverOutcome = 'delivered' | 'closed' | 'pending'
+
+/** 一次对盘上待办账的清理结果（`reconcile` 的计数）。 */
+export type ReconcileReport = { pending: number; delivered: number; closed: number; abandoned: number }
 
 export type DispatchNotifier = {
   /** 宿主事件入口：`ctx.on('session/event', …)` 的两个实参直接喂进来。 */
   onEvent: (session: NotifySession | undefined, event: NotifyEvent | undefined) => Promise<void>
+  /**
+   * 把盘上「还欠着」的回执再试一遍（宿主启动时调一次；重试定时器到点也走它）。
+   */
+  reconcile: () => Promise<ReconcileReport>
   /** 测试与诊断用：此刻正被合并静默期的会话。 */
   pending: () => { sessionId: string; endTime: number }[]
+  /** 摘掉这个实例排下的所有定时器（静默窗口 + 重试）。不落盘、不改台账。 */
+  stop: () => void
 }
 
 /**
@@ -1552,9 +1598,62 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
   const clearTimer = deps.clearTimer ?? ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>))
   const log = deps.log ?? ((line: string) => console.warn(`[dsbot-session-create] ${line}`))
 
+  // 回执待办账：宿主重启后仍然知道欠谁一条回执（`src/outbox.ts`）。读写全程 fail-open ——
+  // 盘上出问题只出一行声，进程内的回执照旧投；不许因为记账失败把回执本身也拦下。
+  const outboxPath = deps.outboxPath ?? defaultOutboxPath(deps.env ?? process.env, deps.home ?? homedir(), ledgerPath)
+  const outboxOff = ((deps.env ?? process.env)[RECEIPT_OUTBOX_DISABLE_ENV] ?? '').trim() === '1'
+  const backoff = deps.backoffMs ?? RECEIPT_BACKOFF_MS
+  const maxAttempts = deps.maxAttempts ?? RECEIPT_MAX_ATTEMPTS
+
   const pending = new Map<string, PendingQuiet>()
   // 同一实例内「这一段静默期已经投过」的会话。turn/start 时清掉：新一轮跑完允许再投一条。
   const notified = new Set<string>()
+  // 重试定时器：一次只排一个（不同的账按当时最大的 attempts 取一档退避）。
+  let retryHandle: unknown
+
+  /** 收口账上这一单（还欠着的那些）。盘上失败只出声。 */
+  async function closeOutbox(
+    sessionId: string,
+    patch: { status: 'delivered' | 'abandoned'; closedAt: number; deliveredAt?: number; abandonedReason?: 'superseded' | 'dispatcher-gone' | 'max-attempts' },
+    options: { only?: string; keep?: string } = {},
+  ): Promise<void> {
+    try {
+      await mutateOutbox(outboxPath, entries => closeEntry(entries, sessionId, patch, options), now())
+    } catch (error) {
+      log(`the receipt outbox could not be updated while closing the receipt for ${sessionId} (${reasonOf(error)}).`)
+    }
+  }
+
+  function disarmRetry(): void {
+    if (retryHandle === undefined) return
+    clearTimer(retryHandle)
+    retryHandle = undefined
+  }
+
+  function armRetry(delay: number): void {
+    if (retryHandle !== undefined) return
+    retryHandle = setTimer(async () => {
+      retryHandle = undefined
+      await reconcile()
+    }, delay)
+  }
+
+  /** 按账上还欠着的那些的 attempts 取退避档；账已清空就把重试定时器摘掉（不常驻）。 */
+  async function armRetryFromOutbox(): Promise<void> {
+    let owed: ReceiptEntry[]
+    try {
+      owed = pendingOf(await readOutbox(outboxPath))
+    } catch (error) {
+      log(`the receipt outbox could not be read, so no retry was scheduled (${reasonOf(error)}).`)
+      return
+    }
+    if (owed.length === 0) {
+      disarmRetry()
+      return
+    }
+    const attempts = owed.reduce((most, entry) => Math.max(most, entry.attempts), 0)
+    armRetry(retryDelayOf(attempts, backoff))
+  }
 
   async function recordOf(sessionId: string): Promise<DispatchRecord | undefined> {
     try {
@@ -1597,36 +1696,49 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     return undefined
   }
 
-  async function deliver(sessionId: string, endTime: number, turn: number | undefined, reason: string | undefined): Promise<void> {
-    if (notified.has(sessionId)) return
+  /**
+   * 投一次回执给派活方，并顺带把账上这一单收口。
+   * 返回值分三种（见 `DeliverOutcome`）：`pending` 才值得再试 —— 宿主说它还在跑、它自己派的活还没停、
+   * 读不到正文、宿主拒收；其余情形要么投成了，要么这一条永远不会成（没有派活方、正文里没有标记），
+   * 都在这里把账收掉，免得占着重试的次数。
+   */
+  async function deliver(sessionId: string, endTime: number, turn: number | undefined, reason: string | undefined): Promise<DeliverOutcome> {
+    if (notified.has(sessionId)) return 'closed'
     const record = await recordOf(sessionId)
-    if (record === undefined) return
+    if (record === undefined) return 'pending'
     // 幂等（跨实例）：notifiedAt 是上次投递的时刻，落在这一段静默期之内就不再投。
-    if (typeof record.notifiedAt === 'number' && record.notifiedAt >= endTime) return
+    if (typeof record.notifiedAt === 'number' && record.notifiedAt >= endTime) {
+      await closeOutbox(sessionId, { status: 'delivered', closedAt: now(), deliveredAt: record.notifiedAt })
+      return 'closed'
+    }
     let dispatcher = record.dispatcherSessionId
     if (dispatcher === undefined || dispatcher === '') {
       log(`${sessionId} went quiet, but its ledger line has no dispatcherSessionId (it was dispatched before this feature), so no receipt was sent.`)
-      return
+      await closeOutbox(sessionId, { status: 'abandoned', abandonedReason: 'dispatcher-gone', closedAt: now() })
+      return 'closed'
     }
     // 自己派给自己（不该发生）：不投，免得自己把自己叫醒。
-    if (dispatcher === sessionId) return
+    if (dispatcher === sessionId) {
+      await closeOutbox(sessionId, { status: 'abandoned', abandonedReason: 'dispatcher-gone', closedAt: now() })
+      return 'closed'
+    }
     const controller = deps.controllerOf?.()
     if (typeof controller?.resolveAgent !== 'function' || typeof controller?.prompt !== 'function') {
       log(`${sessionId} went quiet, but this harness has no sessionController.resolveAgent/prompt, so no receipt was sent.`)
-      return
+      return 'pending'
     }
     // 门二（复核空闲）：静默 ≠ 跑完 —— 等人工审批、等用户答问时同样安静。
     // 只认 'idle'，认不出的状态一律不投：宁可漏一条，也不投一条假回执。
     const resolved = await resolveQuietly(controller, sessionId)
     if (resolved?.agent?.status !== 'idle') {
       log(`${sessionId} went quiet, but the harness does not report it idle (status=${shortOf(resolved?.agent?.status)}), so no receipt was sent.`)
-      return
+      return 'pending'
     }
     // 门三（还在等自己派的活）：阶段收工后派了工人、自己先躺下 —— 不是做完了，不投。
     const waitingOn = await firstBusyChild(sessionId, controller)
     if (waitingOn !== undefined) {
       log(`${sessionId} went quiet, but the Session it dispatched (${waitingOn}) is not idle, so it is waiting rather than finished; no receipt was sent.`)
-      return
+      return 'pending'
     }
     // 门四（终态标记）：这一轮收工到底算不算「这一单做完」，最懂的是派活方 —— 只有它在最终答复
     // 的**末尾**写了终态标记才算（判定见 terminalMarkOf：只看最后一个非空行）。判定输入是该会话
@@ -1637,12 +1749,14 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     const lastText = await lastAssistantText(controller, sessionId, resolved?.agent?.session?.seq)
     if ('error' in lastText) {
       log(`${sessionId} went quiet, but ${lastText.error}; no receipt was sent.`)
-      return
+      return 'pending'
     }
     const mark = terminalMarkOf(lastText.text)
     if (mark === undefined) {
       log(`${sessionId} went quiet, but its last message has no terminal mark; receipt withheld (expected one of ${TERMINAL_MARKS.join(' / ')}).`)
-      return
+      // 这一条不是结论（中间收工）：账上这条永远投不出去，收掉；它下一轮真的收工时再记一条新的。
+      await closeOutbox(sessionId, { status: 'abandoned', abandonedReason: 'superseded', closedAt: now() })
+      return 'closed'
     }
     // 终态已读免推：派活方若在等待期间已读过转录（台账 lastReadSeq >= 终态 headSeq），
     // 说明结论已被派活方拿到，不再往派活方队列里重复塞回执（防提前读后延后重推的双重事故）。
@@ -1656,7 +1770,9 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
         log(`the receipt for ${sessionId} was suppressed (already read), but the ledger could not record notifiedAt (${reasonOf(error)}).`)
       }
       log(`${sessionId} completed, but its transcript was already read (lastReadSeq=${record.lastReadSeq} >= headSeq=${targetHeadSeq}); receipt suppressed.`)
-      return
+      // 派活方自己读到了结论 ⇒ 这一单的债已经清了，账上照 delivered 收口（而不是留着重试）。
+      await closeOutbox(sessionId, { status: 'delivered', closedAt: now(), deliveredAt: now() })
+      return 'closed'
     }
     // 派活方会话已销毁（被关掉/归档）：没地方投，跳过 —— 这不是错误。
     let target = await resolveQuietly(controller, dispatcher)
@@ -1673,7 +1789,8 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     }
     if (target === undefined || target.error !== undefined || target.agent === undefined) {
       log(`${sessionId} went quiet, but the dispatching Session ${dispatcher} is gone, so there is nowhere to send the receipt.`)
-      return
+      await closeOutbox(sessionId, { status: 'abandoned', abandonedReason: 'dispatcher-gone', closedAt: now() })
+      return 'closed'
     }
     try {
       await controller.prompt(
@@ -1687,7 +1804,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       )
     } catch (error) {
       log(`the receipt for ${sessionId} did not go through (${reasonOf(error)}); the next turn to end will try again.`)
-      return
+      return 'pending'
     }
     notified.add(sessionId)
     try {
@@ -1696,6 +1813,131 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
       log(`the receipt for ${sessionId} was delivered, but the ledger could not record notifiedAt (${reasonOf(error)}).`)
     }
     log(`receipt for ${sessionId} delivered to the dispatching Session ${dispatcher}.`)
+    await closeOutbox(sessionId, { status: 'delivered', closedAt: now(), deliveredAt: endTime })
+    return 'delivered'
+  }
+
+  /**
+   * 收工那一刻把「欠派活方一条回执」写进盘上账 —— 记账放在 turn/end，不放进 deliver：
+   * 静默窗口还没到就重启、或当场被掐断，账上这条债仍然在，下次启动 `reconcile()` 会补投。
+   * 门与 deliver 同源（台账白名单、有派活方、不是自己派给自己、末条正文末尾有终态标记）；
+   * 读不到正文、末尾没有标记就不记账 —— 账上只放「确实欠着、只差送」的那一条。
+   */
+  async function capture(sessionId: string, turn: number | undefined, reason: string | undefined, endTime: number): Promise<void> {
+    if (outboxOff) return
+    const record = await recordOf(sessionId)
+    if (record === undefined) return
+    const dispatcher = record.dispatcherSessionId
+    if (dispatcher === undefined || dispatcher === '' || dispatcher === sessionId) return
+    const controller = deps.controllerOf?.()
+    if (typeof controller?.resolveAgent !== 'function' || typeof controller.page !== 'function') return
+    const resolved = await resolveQuietly(controller, sessionId)
+    const reply = await lastAssistantReply(controller, sessionId, resolved?.agent?.session?.seq)
+    if ('error' in reply) {
+      log(`${sessionId} finished, but ${reply.error}; nothing was written to the receipt outbox.`)
+      return
+    }
+    const mark = terminalMarkOf(reply.text)
+    if (mark === undefined) {
+      log(`${sessionId} finished, but its last message has no terminal mark; nothing was written to the receipt outbox (expected one of ${TERMINAL_MARKS.join(' / ')}).`)
+      return
+    }
+    const entry: ReceiptEntry = {
+      receiptId: receiptIdOf(sessionId, reply.seq),
+      sessionId,
+      headSeq: reply.seq,
+      dispatcherSessionId: dispatcher,
+      ...(record.returnTo === undefined ? {} : { returnTo: record.returnTo }),
+      mark,
+      ...(turn === undefined ? {} : { turn }),
+      ...(reason === undefined ? {} : { reason }),
+      endTime,
+      status: 'pending',
+      attempts: 0,
+      createdAt: endTime,
+    }
+    try {
+      await mutateOutbox(
+        outboxPath,
+        entries => {
+          // 新的终态顶掉这一单还没投出去的旧账：旧账的结论已经被这一轮取代。
+          const kept = closeEntry(entries, sessionId, { status: 'abandoned', abandonedReason: 'superseded', closedAt: endTime }, { keep: entry.receiptId })
+          return enqueueEntry(kept, entry)
+        },
+        now(),
+      )
+    } catch (error) {
+      log(`the receipt for ${sessionId} could not be written to the receipt outbox (${reasonOf(error)}); it will only be delivered while this host keeps running.`)
+    }
+  }
+
+  /**
+   * 把盘上还欠着的回执再试一遍：宿主启动时一次（`installDispatchNotify` 挂完监听就调），
+   * 以及重试定时器到点。同一单只认最新那条；欠太多次的按 `maxAttempts` 认输并收口。
+   * 每次仍欠着就再排一个定时器 —— 只有账上确实还欠着时才有定时器，清空即摘掉（不常驻）。
+   */
+  async function reconcile(): Promise<ReconcileReport> {
+    const report: ReconcileReport = { pending: 0, delivered: 0, closed: 0, abandoned: 0 }
+    let owed: ReceiptEntry[]
+    try {
+      owed = pendingOf(await readOutbox(outboxPath))
+    } catch (error) {
+      log(`the receipt outbox could not be read, so no deferred receipt was retried (${reasonOf(error)}).`)
+      return report
+    }
+    if (owed.length === 0) {
+      disarmRetry()
+      return report
+    }
+    // 同一单只投最新的一条（headSeq 更大、或同一位置但收工更晚）。
+    const newest = new Map<string, ReceiptEntry>()
+    for (const entry of owed) {
+      const current = newest.get(entry.sessionId)
+      if (current === undefined || entry.headSeq > current.headSeq || (entry.headSeq === current.headSeq && entry.endTime > current.endTime)) {
+        newest.set(entry.sessionId, entry)
+      }
+    }
+    for (const [sessionId, entry] of newest) {
+      try {
+        await mutateOutbox(
+          outboxPath,
+          entries => closeEntry(entries, sessionId, { status: 'abandoned', abandonedReason: 'superseded', closedAt: now() }, { keep: entry.receiptId }),
+          now(),
+        )
+      } catch (error) {
+        log(`the receipt outbox could not be pruned while retrying the receipt for ${sessionId} (${reasonOf(error)}).`)
+      }
+      if (entry.attempts >= maxAttempts) {
+        log(`the receipt for ${sessionId} was retried ${entry.attempts} times without going through; giving up (max-attempts).`)
+        await closeOutbox(sessionId, { status: 'abandoned', abandonedReason: 'max-attempts', closedAt: now() }, { only: entry.receiptId })
+        report.abandoned += 1
+        continue
+      }
+      const outcome = await deliver(sessionId, entry.endTime, entry.turn, entry.reason)
+      if (outcome === 'delivered') report.delivered += 1
+      else if (outcome === 'closed') report.closed += 1
+      else {
+        report.pending += 1
+        const attemptAt = now()
+        try {
+          await mutateOutbox(
+            outboxPath,
+            entries =>
+              entries.map(item =>
+                item.receiptId === entry.receiptId && item.status === 'pending'
+                  ? { ...item, attempts: item.attempts + 1, lastAttemptAt: attemptAt }
+                  : item,
+              ),
+            attemptAt,
+          )
+        } catch (error) {
+          log(`the receipt outbox could not record the retry for ${sessionId} (${reasonOf(error)}).`)
+        }
+      }
+    }
+    if (report.pending > 0) await armRetryFromOutbox()
+    else disarmRetry()
+    return report
   }
 
   async function handle(session: NotifySession | undefined, event: NotifyEvent | undefined): Promise<void> {
@@ -1735,9 +1977,14 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
     const endTime = now()
     const handle = setTimer(() => {
       pending.delete(sessionId)
-      return deliver(sessionId, endTime, turn, reason)
+      // 投不出去（还欠着）就排一次重试，退避档按账上 attempts 取 —— 不再投了就摘掉定时器。
+      return deliver(sessionId, endTime, turn, reason).then(async outcome => {
+        if (outcome === 'pending') await armRetryFromOutbox()
+      })
     }, quietMs)
     pending.set(sessionId, { endTime, handle })
+    // 记账（不 await：宿主事件面不该被一次读盘拖住）。它失败只影响重启后能不能补投，不影响本次投递。
+    void capture(sessionId, turn, reason, endTime)
   }
 
   return {
@@ -1749,6 +1996,12 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
         log(`a session event could not be handled (${reasonOf(error)}).`)
       }
     },
+    reconcile,
+    stop() {
+      for (const quiet of pending.values()) clearTimer(quiet.handle)
+      pending.clear()
+      disarmRetry()
+    },
     pending: () => [...pending.entries()].map(([sessionId, quiet]) => ({ sessionId, endTime: quiet.endTime })),
   }
 }
@@ -1756,6 +2009,7 @@ export function createDispatchNotifier(deps: NotifierDeps = {}): DispatchNotifie
 /**
  * 把完成回执挂上宿主事件面。宿主 ctx 没有 `on` 时如实报一句并返回 undefined
  * （另外三个工具照常工作）—— 不静默降级，也不因此连累 preflight。
+ * 挂完监听立刻补投一次盘上欠着的回执：宿主重启后派活方该收到的那条，靠的就是这一步。
  */
 export function installDispatchNotify(ctx: HostCtx, opts: { quietMs?: number; ledger?: string } = {}): DispatchNotifier | undefined {
   const on = ctx?.on
@@ -1767,5 +2021,7 @@ export function installDispatchNotify(ctx: HostCtx, opts: { quietMs?: number; le
   on.call(ctx, 'session/event', (session: unknown, event: unknown) => {
     void notifier.onEvent(session as NotifySession, event as NotifyEvent)
   })
+  // 上一个宿主欠下的回执：账在盘上，这个进程没有内存记忆也认得出（src/outbox.ts）。
+  void notifier.reconcile()
   return notifier
 }
