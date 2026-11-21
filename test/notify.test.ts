@@ -892,6 +892,49 @@ describe('完成回执：落盘与重启补投（receipt outbox）', () => {
     expect((await readOutbox(h.outboxPath))[0].status).toBe('delivered')
   })
 
+  test('同一会话连跑两轮 turn/end：新终态把旧账顶成 superseded，账上只留 headSeq 最大的一条、且只投一次新结论', async () => {
+    const h = harness('outbox-supersede')
+    await seed(h.ledgerPath)
+    await endTurn(h.notifier, 1)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).length === 1, 'the first receipt to be captured')
+
+    // 第二轮收工：page 读到的是更新一条的末条（seq 20 > 10），旧账该被这一轮取代。
+    h.controller.page = async () => ({
+      records: [
+        {
+          event: {
+            type: 'assistant/message',
+            seq: 20,
+            time: 1,
+            data: { turn: 2, step: 1, message: { role: 'assistant', content: [{ type: 'text', text: '结论变了，是 B。\n[DISPATCH DONE]' }] } },
+          },
+        },
+        { event: { type: 'turn/end', seq: 22, time: 1, data: { turn: 2, reason: { kind: 'completed' } } } },
+      ],
+      hasMore: false,
+    })
+    await endTurn(h.notifier, 2)
+    await waitFor(async () => (await readOutbox(h.outboxPath)).some(entry => entry.headSeq === 20), 'the superseding receipt to be captured')
+
+    // 旧账被 superseded 收口，账上只留 headSeq 最大的一条 pending。
+    const entries = await readOutbox(h.outboxPath)
+    expect(entries.map(item => [item.receiptId, item.status, item.abandonedReason])).toEqual([
+      ['sess-1@10', 'abandoned', 'superseded'],
+      ['sess-1@20', 'pending', undefined],
+    ])
+
+    // 安静窗口到点：只投新结论这一次。
+    h.tick(QUIET_WINDOW_MS)
+    await fire(h.timers[1])
+    expect(h.prompts).toHaveLength(1)
+    expect((h.prompts[0].content as { text: string }[])[0].text).toContain('[DISPATCH DONE]')
+    const done = await readOutbox(h.outboxPath)
+    expect(done.map(item => [item.receiptId, item.status, item.abandonedReason])).toEqual([
+      ['sess-1@10', 'abandoned', 'superseded'],
+      ['sess-1@20', 'delivered', undefined],
+    ])
+  })
+
   test('重试次数用尽 → 弃账（max-attempts），不再排定时器', async () => {
     const h = harness('outbox-max-attempts')
     await seed(h.ledgerPath)

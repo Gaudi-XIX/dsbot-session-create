@@ -22,7 +22,7 @@ export const RECEIPT_OUTBOX_ENV = 'DSH_SESSION_CREATE_OUTBOX'
 export const RECEIPT_OUTBOX_DISABLE_ENV = 'DSH_SESSION_CREATE_OUTBOX_DISABLE'
 /** 重试退避：第 0 次到点的重试等 30 秒，之后逐级拉长，到顶后固定 10 分钟一跳。 */
 export const RECEIPT_BACKOFF_MS = [30_000, 60_000, 120_000, 300_000, 600_000] as const
-/** 一条账最多试这么多次就认输：40 次 × 10 分钟 ≈ 7 小时，够跨过一轮长重启，又不至于永远挂着。 */
+/** 一条账最多试这么多次就认输：退避总和 22,110 秒 ≈ 6.1 小时，够跨过一轮长重启，又不至于永远挂着。 */
 export const RECEIPT_MAX_ATTEMPTS = 40
 /** 已收口的账（delivered / abandoned）留 24 小时：够人工查「昨晚那条到底投没投」，又不让文件无限长。 */
 export const RECEIPT_RETENTION_MS = 86_400_000

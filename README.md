@@ -185,8 +185,8 @@ $DSH_HOME/bot/session-create/dispatched-sessions.jsonl      # 可用 DSH_SESSION
 - **记什么**：`receiptId`、`sessionId`、`headSeq`（终态消息的事件序号）、`dispatcherSessionId`、`returnTo`、`mark`、`turn`、`reason`、`endTime`、`status`（`pending` / `delivered` / `abandoned`）、`attempts`、`createdAt`、`lastAttemptAt`、`deliveredAt`、`closedAt`、`abandonedReason`。
 - **去重键 `receiptId = <sessionId>@<headSeq>`**：同一段终态，无论在内存里重试几次、宿主重启后重扫几次，读到的都是同一条 assistant 消息、同一个 seq，天然幂等——不需要额外的时间窗去重。
 - **记账点前移到 `turn/end`**：不等 120 秒静默窗口。崩溃窗口从「整整一个静默期」缩到「一次 page 读取」，并且「欠不欠」与「能不能投」解耦——门四之后的任何一道门失败都不再丢账。
-- **补投触发点只有一处**：`installDispatchNotify()` 挂完 `session/event` 监听立刻 `reconcile()` 扫一遍盘。进程刚起时内存里没有任何待投状态，这是唯一能重建它的时机。
-- **双向销账**：同一个 `receiptId` 上，投出去了就 `delivered`、派活方已读或派活方已销毁就 `abandoned`（`superseded` / `dispatcher-gone` / `max-attempts`），下次不再重投。
+- **重启补投的触发点只有一处**：`installDispatchNotify()` 挂完 `session/event` 监听立刻 `reconcile()` 扫一遍盘（重试另有独立的单槽定时器回调，不算补投触发点）。进程刚起时内存里没有任何待投状态，这是唯一能重建它的时机。
+- **收口口径**：投出去了就 `delivered`；派活方没了/自派自就 `abandoned (dispatcher-gone)`；同会话来了新终态、旧账被顶掉就 `abandoned (superseded)`；重试 40 次用尽就 `abandoned (max-attempts)`。派活方**已读**不是 abandoned——账上照 `delivered` 收口。
 - **退避与上限**：`30s → 60s → 120s → 300s → 600s`，第 6 次起固定 600 秒；单条最多重试 40 次（`RECEIPT_BACKOFF_MS`、`RECEIPT_MAX_ATTEMPTS`）。退避把覆盖期拉到约 6 小时，同时把债务期的开销压到每 10 分钟一次读盘。重试走既有注入面的单槽定时器（`deps.setTimer`），**账上没债就没有定时器**，不是常驻巡检。
 - **保留期**：只清已关闭且超过 24 小时的账（`RECEIPT_RETENTION_MS`）；`pending` 一条都不按时间清——按时间清 pending 等于静默丢债。
 - **fail-open**：账读不出、写不进只记一行日志，不打断当场那次投递。账是可靠性补强，不能反过来变成新的失败点。
@@ -280,7 +280,7 @@ node <某个 node_modules>/typescript/bin/tsc --noEmit -p . --typeRoots <同一�
 
 **已验证（2026-11-03 实测）**
 
-- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（69,033 B / sha256 cbc2b6c6cd7af2b61f321556007b8953a5837724d158fbf4e7f6089f823ae010）。
+- `bun run build` 之后 `git status` 只见预期改动：`index.js` 与 `src/` 同步（86,897 B / sha256 23e8d5ce9828c5cbeb78bed097485ca9bbc8ef664ea98d016a86fc1d09fd8ce3）。
 - `bun test`：193 pass / 0 fail / 703 次断言，5 个文件（bun 1.3.13）。
 - `tsc --noEmit -p . --typeRoots <现成的 node_modules>/@types`（借一份现成的 `typescript` 与 `@types/node`，见「开发」）：0 个错误。**不带 `--typeRoots` 会报 `error TS2688: Cannot find type definition file for 'node'.` 并退出码 2**——本仓没有自己的 `node_modules`。
 - 0.2.0 那份构建的**描述文本确实在真实宿主里加载过**：宿主会话的工具表里 `create_session` 带上了 `model` 参数与 `auto` 权限段（`never the host's global default`、`DSBOT_ALLOW_RESTRICTIVE_PERMISSION`），说明 profile 挂的就是本仓的 `index.js`。0.4.0、0.5.0 与 0.6.0 的改动都要重启宿主之后才生效（重启只能由用户执行）。
