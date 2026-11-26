@@ -326,7 +326,7 @@ describe('folder 落位', () => {
 
 // 2026-11-11 R1：派送时把终态标记要求随 prompt 投给新会话。
 // 期望文本写死在这里，不用被测常量自己断言自己 —— 源码文案漂移就必须让这些用例变红。
-const R1_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+const R1_INSTRUCTION = '[回执要求] 禁弹窗；最终回复的最后一个非空行只写标记本身：[DISPATCH DONE] 或 [DISPATCH BLOCKED]（派单提示词已指定具体标记时，以它为准）。'
 
 describe('派送时自动追加终态标记要求（R1）', () => {
   test('A1 要求段全文逐字固定；拼接只做「原 prompt + 空行 + 分隔线 + 要求段」', () => {
@@ -357,16 +357,16 @@ describe('派送时自动追加终态标记要求（R1）', () => {
       await createSessionIn(ctx, { title: 'R1', prompt, folder: dir }, { ledger })
       const records = await readLedger(ledger)
       expect(records[0].promptHead).toBe(prompt)
-      expect(records[0].promptHead).not.toContain('[派单回执要求]')
+      expect(records[0].promptHead).not.toContain('[回执要求]')
     } finally {
       await rm(dir, { recursive: true, force: true })
     }
   })
 
-  test('A5 要求段逐字点明门四的判定口径', () => {
+  test('A5 要求段点明门四口径的要点', () => {
+    expect(TERMINAL_MARK_INSTRUCTION).toContain('禁弹窗')
     expect(TERMINAL_MARK_INSTRUCTION).toContain('最后一个非空行')
-    expect(TERMINAL_MARK_INSTRUCTION).toContain('只写标记本身')
-    expect(TERMINAL_MARK_INSTRUCTION).toContain('正文开头或段落中间写、引用、列举这些标记都不算')
+    expect(TERMINAL_MARK_INSTRUCTION).toContain('以它为准')
   })
 
   test('A8 追加段本身不会被误判成终态标记；按它作答则命中；标记写在首行不命中', () => {
@@ -511,7 +511,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc' })
     expect(calls.create[0]).toMatchObject({ cwd: 'F:\\workspaces\\w', agentPreset: 'ptc' })
-    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'execute', 'prompt'])
     expect(result.preset).toBe('ptc')
   })
 
@@ -543,7 +543,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const result = await createSessionIn(ctx, { ...base, permission: 'danger-full-access' })
     expect(calls.command).toHaveLength(1)
     expect(calls.command[0][1]).toBe('/permission danger-full-access')
-    expect(calls.order).toEqual(['create', 'selectModel', 'execute', 'prompt'])
+    expect(calls.order).toEqual(['create', 'execute', 'prompt'])
     expect(result.permission).toBe('danger-full-access')
     expect(result.permissionOverriddenFrom).toBeUndefined()
   })
@@ -576,7 +576,7 @@ describe('会话选项：agent preset 与权限模式', () => {
   test('两项一起给：先 list、再 create（带 preset）、再 execute、最后 prompt', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const result = await createSessionIn(ctx, { ...base, preset: 'ptc', permission: 'danger-full-access' })
-    expect(calls.order).toEqual(['list', 'create', 'selectModel', 'execute', 'prompt'])
+    expect(calls.order).toEqual(['list', 'create', 'execute', 'prompt'])
     expect(result).toMatchObject({ preset: 'ptc', permission: 'danger-full-access' })
   })
 
@@ -588,7 +588,7 @@ describe('会话选项：agent preset 与权限模式', () => {
     const result = await createSessionIn(ctx, { ...base, permission: 'auto' })
     expect(calls.command[0][1]).toBe('/permission auto')
     expect(calls.approval).toEqual([['approval/policy', { policy: 'never' }]])
-    expect(calls.order).toEqual(['create', 'selectModel', 'execute', 'approval', 'prompt'])
+    expect(calls.order).toEqual(['create', 'execute', 'approval', 'prompt'])
     expect(result.permission).toBe('auto')
     expect(result.approvalPolicy).toBe('never')
     expect(result.permissionOverriddenFrom).toBeUndefined()
@@ -743,58 +743,38 @@ describe('会话选项：agent preset 与权限模式', () => {
 // 2026-11-01 该默认一度是按量付费的 deepseek-account/deepseek-flash，派出去的会话因此替用户烧了真钱。
 // 判据：取值＝派活人（bot）正在用的模型，或调用方显式给的 `provider/model`；两者都没有就不建会话。
 // **不写死任何模型名**——provider 或组一改名，写死的兜底会静默失效，等于这条绑定不存在。
-describe('派出去的会话钉死模型（跟派任务的 bot，或有显式指定；不许落到全局默认）', () => {
+describe('派出去的会话绑定模型（默认跟随宿主全局默认，显式指定则调用 selectModel 钉死）', () => {
   const base = { title: 't', prompt: 'p', workspace: 'w' }
   const ws = { workspaces: { w: { id: 'w' } } }
 
-  test('拿不到派活人会话 id → 整单失败，不建会话、不投提示词', async () => {
+  test('未指定 model 且派活人 session 无效时：不抛错，正常创建会话且不调用 selectModel（跟随宿主默认）', async () => {
     const { ctx, calls } = fakeCtx(ws)
-    const error = await createSessionIn(ctx, base, { dispatcherSessionId: undefined }).catch(e => e)
-    expect(error).toBeInstanceOf(SessionCreateError)
-    expect(error.code).toBe('dispatcher-model-unknown')
-    expect(calls.create).toEqual([])
-    expect(calls.prompt).toEqual([])
+    const result = await createSessionIn(ctx, base, { dispatcherSessionId: undefined })
+    expect(result.sessionId).toBe('sess-1')
+    expect(calls.create).toHaveLength(1)
+    expect(calls.selectModel).toHaveLength(0)
+    expect(calls.prompt).toHaveLength(1)
   })
 
-  test('读不到派活人的请求头 → 同样不建会话', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeaderUnreadable: true })
-    const error = await createSessionIn(ctx, base).catch(e => e)
-    expect(error).toBeInstanceOf(SessionCreateError)
-    expect(error.code).toBe('dispatcher-model-unknown')
-    expect(calls.create).toEqual([])
-  })
-
-  test('与派活人一致：它跑什么模型，新会话就钉什么（thinking 档也跟随）', async () => {
+  test('未指定 model 时：从新建会话回读宿主分配的默认模型', async () => {
     const { ctx, calls } = fakeCtx({
       ...ws,
-      dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality', reasoningEffort: 'medium' },
+      dispatcherHeader: { provider: 'magpie-gateway', model: 'group/pool' },
     })
     const result = await createSessionIn(ctx, base)
-    expect(calls.selectModel[0]).toEqual({
-      sessionId: 'sess-1',
-      provider: 'magpie-gateway',
-      model: 'group/high-quality',
-      reasoningEffort: 'medium',
-    })
-    expect(result.model).toBe('magpie-gateway/group/high-quality')
+    expect(calls.selectModel).toHaveLength(0)
+    expect(result.model).toBe('magpie-gateway/group/pool')
     expect(result.modelNote).toBeUndefined()
   })
 
-  test('派活人的模型或 provider 改了名也跟随：不写死名字、不按 provider 过滤', async () => {
-    const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'some-other-gateway', model: 'pool/x' } })
-    const result = await createSessionIn(ctx, base)
-    expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'some-other-gateway', model: 'pool/x' })
-    expect(result.model).toBe('some-other-gateway/pool/x')
-  })
-
-  test('显式给 model → 用它，不去读派活人', async () => {
+  test('显式传 model 时：调用 selectModel 钉死到目标模型', async () => {
     const { ctx, calls } = fakeCtx({ ...ws, dispatcherHeader: { provider: 'magpie-gateway', model: 'group/high-quality' } })
     const result = await createSessionIn(ctx, { ...base, model: 'magpie-gateway/group/pool' })
     expect(calls.selectModel[0]).toEqual({ sessionId: 'sess-1', provider: 'magpie-gateway', model: 'group/pool' })
     expect(result.model).toBe('magpie-gateway/group/pool')
   })
 
-  test('model 写错（没有斜杠／缺半边）→ 整单失败，不建会话', async () => {
+  test('model 格式非法（无斜杠/空侧）时：抛错 model-invalid，不建会话', async () => {
     const { ctx, calls } = fakeCtx(ws)
     const error = await createSessionIn(ctx, { ...base, model: 'group-pool' }).catch(e => e)
     expect(error).toBeInstanceOf(SessionCreateError)
@@ -802,22 +782,22 @@ describe('派出去的会话钉死模型（跟派任务的 bot，或有显式指
     expect(calls.create).toEqual([])
   })
 
-  test('钉模型必须发生在投提示词之前', async () => {
+  test('显式指定 model 时：selectModel 必须发生在投提示词之前', async () => {
     const { ctx, calls } = fakeCtx(ws)
-    await createSessionIn(ctx, base)
+    await createSessionIn(ctx, { ...base, model: 'magpie-gateway/group/pool' })
     expect(calls.order.indexOf('selectModel')).toBeLessThan(calls.order.indexOf('prompt'))
   })
 
-  test('宿主没有 selectModel → 会话照建，但如实报出这一重保护没生效', async () => {
+  test('显式指定 model 但宿主没有 selectModel 时：会话照建，记录 modelNote', async () => {
     const { ctx } = fakeCtx({ ...ws, noSelectModel: true })
-    const result = await createSessionIn(ctx, base)
+    const result = await createSessionIn(ctx, { ...base, model: 'magpie-gateway/group/pool' })
     expect(result.sessionId).toBe('sess-1')
     expect(result.modelNote).toContain('NOT pinned')
   })
 
-  test('selectModel 抛错 → 会话照建，但如实报出原因', async () => {
+  test('显式指定 model 但 selectModel 抛错时：会话照建，记录 modelNote', async () => {
     const { ctx } = fakeCtx({ ...ws, selectModelThrows: new Error('model unavailable') })
-    const result = await createSessionIn(ctx, base)
+    const result = await createSessionIn(ctx, { ...base, model: 'magpie-gateway/group/pool' })
     expect(result.sessionId).toBe('sess-1')
     expect(result.modelNote).toContain('model unavailable')
   })

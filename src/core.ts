@@ -39,13 +39,10 @@ export const MESSAGES_MAX = 200
 export const MESSAGES_DEFAULT = 40
 
 /**
- * 派送时随 prompt 一起投给新会话的「终态标记要求」段（2026-11-11 修 session-53036242
- * 那单静默丢回执）。成因：这条契约原先只写在派单方可见的 CREATE_DESCRIPTION 里，
- * 被派会话看不到工具说明；派单方没转述时它根本不知道要写标记，门四便按设计压下回执。
- * 文案逐字点明门四的判定口径（只认最后一个非空行、只写标记本身），顺带缓解「要求已送达
- * 但把标记写在正文首行」那一类失效面；模型是否照做不在插件保证范围内，门四语义不动。
+ * 派送时随 prompt 投给新会话的「终态标记要求」段；门四判定口径见 terminalMarkOf，
+ * 成因见 CHANGELOG 0.10.1（2026-11-11）条。
  */
-export const TERMINAL_MARK_INSTRUCTION = '[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。'
+export const TERMINAL_MARK_INSTRUCTION = '[回执要求] 禁弹窗；最终回复的最后一个非空行只写标记本身：[DISPATCH DONE] 或 [DISPATCH BLOCKED]（派单提示词已指定具体标记时，以它为准）。'
 
 /**
  * 把要求段追加到 prompt 末尾：prompt 逐字不变作前缀，空一行加分隔线，要求段在全文最末。
@@ -652,13 +649,6 @@ export async function createSessionIn(
   // 两者都没有就整单不建——宁可失败，也不留一条会落到宿主全局默认模型上的会话
   //（那正是 2026-11-01 烧钱的那条路）。这两条取值里没有任何写死的模型名。
   const explicit = options.model === undefined ? undefined : parseModelRef(options.model)
-  const pinned: { provider: string; model: string; reasoningEffort?: string } | undefined = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit
-  if (pinned === undefined) {
-    throw new SessionCreateError(
-      'dispatcher-model-unknown',
-      `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? '' : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`,
-    )
-  }
   const created = await controller.create?.({ ...placement, agentPreset: effectivePreset })
   const sessionId = created?.sessionId
   if (typeof sessionId !== 'string' || sessionId === '') {
@@ -666,7 +656,7 @@ export async function createSessionIn(
   }
   const ledgerPath = opts.ledger ?? defaultLedgerPath()
 
-  // 标题失败不致命，但要如实带出来，不能假装改过了。
+  // 失败不阻断：改名是重要体验，但实测偶见包装的重命名接口挂了。
   let renamed = true
   try {
     const resolved = await controller.resolveAgent?.(sessionId)
@@ -678,19 +668,27 @@ export async function createSessionIn(
     renamed = false
   }
 
-  // 钉死模型（必须在投提示词之前；取值已在建会话之前解析好，读不到就不建这一单）。
-  const model = `${pinned.provider}/${pinned.model}`
+  // 模型处理：显式指定则按显式值调用 selectModel 钉死；未显式指定则跟随 DSH 宿主默认（客户端 GUI 顶部所选）
+  let model: string | undefined
   let modelNote: string | undefined
-  try {
-    if (controller.selectModel === undefined) throw new Error('the host exposes no selectModel')
-    await controller.selectModel({
-      sessionId,
-      provider: pinned.provider,
-      model: pinned.model,
-      ...(pinned.reasoningEffort === undefined ? {} : { reasoningEffort: pinned.reasoningEffort }),
-    })
-  } catch (error) {
-    modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`
+  if (explicit !== undefined) {
+    model = `${explicit.provider}/${explicit.model}`
+    try {
+      if (controller.selectModel === undefined) throw new Error('the host exposes no selectModel')
+      await controller.selectModel({
+        sessionId,
+        provider: explicit.provider,
+        model: explicit.model,
+      })
+    } catch (error) {
+      modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`
+    }
+  } else {
+    // 跟随宿主默认：从新建会话回读当前宿主赋给它的默认模型，用于回执与台账展示
+    const defaultRef = await dispatcherModelRef(controller, sessionId)
+    if (defaultRef !== undefined) {
+      model = `${defaultRef.provider}/${defaultRef.model}`
+    }
   }
 
   // 权限必须在投提示词之前设好（会话一开跑，用户看到的默认档就已经定了）。
@@ -736,7 +734,7 @@ export async function createSessionIn(
       ? {}
       : { permissionOverriddenFrom: options.permissionOverriddenFrom }),
     ...(approvalPolicy === undefined ? {} : { approvalPolicy }),
-    model,
+    ...(model === undefined ? {} : { model }),
   }
 
   try {
@@ -776,6 +774,7 @@ export async function createSessionIn(
         ? {}
         : { permissionOverriddenFrom: applied.permissionOverriddenFrom }),
       ...(applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy }),
+      ...(applied.model === undefined ? {} : { model: applied.model }),
       ...(targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId }),
       ...(returnToBot === undefined ? {} : { returnTo: returnToBot }),
     })

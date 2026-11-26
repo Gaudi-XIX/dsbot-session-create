@@ -124,7 +124,7 @@ var MESSAGE_TIMEOUT_MS = 1e4;
 var MESSAGE_CLIP = 2000;
 var MESSAGES_MAX = 200;
 var MESSAGES_DEFAULT = 40;
-var TERMINAL_MARK_INSTRUCTION = "[派单回执要求] 严禁调用任何向用户弹出交互卡片或等待输入的工具（会阻断回执并打断用户）。你在最终回复的最后一个非空行必须原样写一个终态标记，只有两种：[DISPATCH DONE]（搞完了：整单做完）或 [DISPATCH BLOCKED]（停住了：卡住、做不到、还需用户拍板）；派单提示词若已指定具体标记，以它为准。要用户拍板的事项算停住了：正文写清理由与选项，末行打 [DISPATCH BLOCKED]。这一行只写标记本身，不加粗、不加引号、后面不再写别的字。正文开头或段落中间写、引用、列举这些标记都不算——插件只认最后一个非空行。没有这个标记，派单插件会把这次收工当成中间收工、压下回执，派活窗口收不到你的结论。";
+var TERMINAL_MARK_INSTRUCTION = "[回执要求] 禁弹窗；最终回复的最后一个非空行只写标记本身：[DISPATCH DONE] 或 [DISPATCH BLOCKED]（派单提示词已指定具体标记时，以它为准）。";
 function withTerminalMarkInstruction(prompt) {
   return `${prompt}
 
@@ -448,10 +448,6 @@ async function createSessionIn(ctx, args, opts = {}) {
   const { placement, text } = await resolvePlacement(ctx, folder, workspace);
   const controller = ctx.sessionController;
   const explicit = options.model === undefined ? undefined : parseModelRef(options.model);
-  const pinned = explicit === undefined ? await dispatcherModelRef(controller, opts.dispatcherSessionId) : explicit;
-  if (pinned === undefined) {
-    throw new SessionCreateError("dispatcher-model-unknown", `the model of the dispatching Session${opts.dispatcherSessionId === undefined ? "" : ` "${opts.dispatcherSessionId}"`} could not be read, so a new Session would have to fall back to the host's global default model. No Session was made; name a model explicitly if this dispatch must go out.`);
-  }
   const created = await controller.create?.({ ...placement, agentPreset: effectivePreset });
   const sessionId = created?.sessionId;
   if (typeof sessionId !== "string" || sessionId === "") {
@@ -468,19 +464,26 @@ async function createSessionIn(ctx, args, opts = {}) {
   } catch {
     renamed = false;
   }
-  const model = `${pinned.provider}/${pinned.model}`;
+  let model;
   let modelNote;
-  try {
-    if (controller.selectModel === undefined)
-      throw new Error("the host exposes no selectModel");
-    await controller.selectModel({
-      sessionId,
-      provider: pinned.provider,
-      model: pinned.model,
-      ...pinned.reasoningEffort === undefined ? {} : { reasoningEffort: pinned.reasoningEffort }
-    });
-  } catch (error) {
-    modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`;
+  if (explicit !== undefined) {
+    model = `${explicit.provider}/${explicit.model}`;
+    try {
+      if (controller.selectModel === undefined)
+        throw new Error("the host exposes no selectModel");
+      await controller.selectModel({
+        sessionId,
+        provider: explicit.provider,
+        model: explicit.model
+      });
+    } catch (error) {
+      modelNote = `the Session model was NOT pinned to ${model} (${reasonOf(error)}); it may fall back to the host default model — check its model before it spends anything.`;
+    }
+  } else {
+    const defaultRef = await dispatcherModelRef(controller, sessionId);
+    if (defaultRef !== undefined) {
+      model = `${defaultRef.provider}/${defaultRef.model}`;
+    }
   }
   let approvalPolicy;
   if (options.permission !== undefined) {
@@ -514,7 +517,7 @@ async function createSessionIn(ctx, args, opts = {}) {
     ...options.permission === undefined ? {} : { permission: options.permission },
     ...options.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: options.permissionOverriddenFrom },
     ...approvalPolicy === undefined ? {} : { approvalPolicy },
-    model
+    ...model === undefined ? {} : { model }
   };
   try {
     await controller.prompt?.({
@@ -541,6 +544,7 @@ async function createSessionIn(ctx, args, opts = {}) {
       ...applied.permission === undefined ? {} : { permission: applied.permission },
       ...applied.permissionOverriddenFrom === undefined ? {} : { permissionOverriddenFrom: applied.permissionOverriddenFrom },
       ...applied.approvalPolicy === undefined ? {} : { approvalPolicy: applied.approvalPolicy },
+      ...applied.model === undefined ? {} : { model: applied.model },
       ...targetDispatcherSessionId === undefined ? {} : { dispatcherSessionId: targetDispatcherSessionId },
       ...returnToBot === undefined ? {} : { returnTo: returnToBot }
     });
@@ -1664,7 +1668,7 @@ function apply(ctx) {
       folder: { type: "string", description: "Full path of a folder that exists. The Session works there and joins no DSH workspace. Give this or `workspace`, not both." },
       preset: { type: "string", description: "Agent preset for the new Session, fixed when it is created: `standard`, `minimal`, `ptc` (tools run as code), or `creator`. A name the host does not know is refused and the refusal lists the ones it has. Omit for the host default." },
       permission: { type: "string", description: "Permission mode for the new Session, set with the host's own `/permission` command before the prompt: `read-only`, `workspace-write`, `danger-full-access`, or `auto`. Any other name is refused by the host, which lists the valid ones. Omit it and the Session is opened at `danger-full-access` — a preset is chosen only when this is given. `read-only` and `workspace-write` are currently overridden to `danger-full-access`, so a dispatched Session cannot stall on an approval; set DSBOT_ALLOW_RESTRICTIVE_PERMISSION=1 in the host environment to keep a restrictive one. `auto` additionally pins the Session's approval policy to `never`: the host's auto reviewer still reviews every tool call, but when it denies one the action is refused outright instead of opening an approval prompt nobody is there to answer. If this harness lists no `auto` preset at all (auto review off or not installed), an explicit `auto` fails and starts nothing." },
-      model: { type: "string", description: "Model for the new Session, written `provider/model`. Omit it and the Session is pinned to the model the dispatching Bot's own Session runs on — never the host's global default. A string without one slash, or with an empty side, is refused and no Session is made." },
+      model: { type: "string", description: "Model for the new Session, written `provider/model`. Omit it and the Session follows the host's global default model (selected in the DSH GUI). A string without one slash, or with an empty side, is refused and no Session is made." },
       return_to: { type: "string", description: 'Name, alias, or id of the Bot to receive the completion receipt (e.g. "设计" or "design"). If omitted, returns to the dispatching Session.' }
     },
     output,
