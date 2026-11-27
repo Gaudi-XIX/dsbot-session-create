@@ -2,6 +2,15 @@
 
 按提交日期记。发布到 npm 的版本号以本文件与 `package.json` 一致。
 
+## 0.12.1 · 2026-11-27
+
+**补 npm 包 repository 字段：让 DSH 插件市场认出本包，恢复面板的版本号与下载量显示**
+
+- **成因**：插件市场的探测脚本 `probe-npm.mjs` 读 GitHub 仓 `package.json` 的 name、查 npm 同名包后，还要做一次防 squatting 校验——npm 包 latest 版本的 `repository` 字段必须指回同一 GitHub 仓，否则判为未发布（npm/version 写 null）。本包的 `package.json` 一直缺 `repository` 字段，npm 上 0.3.0～0.12.0 各版也无该元数据，探测核不到回指，market index 与 catalog 里本条 npm/version/download 全为空，DSH 插件面板的卡片因此只显示 star、不显示版本号与下载量。
+- **改动**：仅 `package.json` 增 `"repository": { "type": "git", "url": "git+https://github.com/Gaudi-XIX/dsbot-session-create.git" }`（与 dsh-agy-cli 同格式），`version` 0.12.0 → 0.12.1；CHANGELOG 补本条。`index.js` 未重编（build 产物无变化）。插件功能逻辑零改动。
+- **生效链**：市场探测按 RECHECK_DAYS=1 重查未发布判定时会重新认出本包 → 重生成 market index 与 catalog → DSH 面板下次拉到新快照才显示数字。发布当下用户看到的仍是旧卡，这是上游刷新时延，非插件故障。
+- **实测读数**：`bun test` 230 pass / 0 fail / 839 expect() calls；`bun run build` 重建 `index.js` 85.98 KB，与已提交产物一致；`npm pack --dry-run` 5 文件、无本机绝对路径与凭据。
+
 ## 0.12.0 · 2026-11-21
 
 **终态回执落盘必达：receipt outbox 记账 + 重启补投；回执标记收窄为两种**
